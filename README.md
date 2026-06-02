@@ -50,3 +50,15 @@ ping 192.168.50.1
 sudo batctl n
 sudo batctl o
 ```
+
+## 카메라 + 조종
+
+동글 없는 현재 구성에서는 Head의 `wlan0`를 Mesh 전용으로 쓰고, 카메라 영상과 조종 명령을 먼저 검증합니다.
+
+실행 순서는 [Camera And Control Quickstart](docs/camera_control_quickstart.md)를 따른다.
+
+## 통신 원칙
+
+Base Pi가 명령 내용을 해석해 각 유닛으로 다시 보내는 dispatcher 구조가 아니라, 모든 유닛이 BATMAN-adv 릴레이 노드로 동작합니다.
+
+데이터는 `bat0` 위에서 end-to-end로 흐르고, 중간 node는 BATMAN-adv next-hop으로 프레임을 포워딩합니다.
