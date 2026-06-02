@@ -28,7 +28,23 @@ else
 fi
 
 echo ""
-echo "[4] BATMAN neighbors"
+echo "[4] Supported wireless interface modes"
+if command -v iw >/dev/null 2>&1; then
+    iw list 2>/dev/null | grep -A 40 "Supported interface modes" || echo "[WARN] Could not read supported interface modes."
+else
+    echo "[WARN] iw not installed."
+fi
+
+echo ""
+echo "[5] BATMAN hard interfaces"
+if command -v batctl >/dev/null 2>&1; then
+    sudo batctl if || true
+else
+    echo "[WARN] batctl not installed."
+fi
+
+echo ""
+echo "[6] BATMAN neighbors"
 if command -v batctl >/dev/null 2>&1; then
     sudo batctl n || true
 else
@@ -36,7 +52,7 @@ else
 fi
 
 echo ""
-echo "[5] BATMAN originators"
+echo "[7] BATMAN originators"
 if command -v batctl >/dev/null 2>&1; then
     sudo batctl o || true
 else
@@ -44,8 +60,12 @@ else
 fi
 
 echo ""
-echo "[6] Kernel module"
+echo "[8] Kernel module"
 lsmod | grep batman || echo "[WARN] batman-adv module not loaded."
+
+echo ""
+echo "[9] Route table"
+ip route
 
 echo ""
 echo "========================================"

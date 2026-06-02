@@ -1,0 +1,15 @@
+[Unit]
+Description=HANSEL BATMAN Mesh Network (%i)
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/hansel/HANSEL_MESH
+ExecStart=/home/hansel/HANSEL_MESH/scripts/start_mesh.sh /home/hansel/HANSEL_MESH/configs/%i.env
+ExecStop=/home/hansel/HANSEL_MESH/scripts/stop_mesh.sh
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

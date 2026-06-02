@@ -26,6 +26,9 @@ fi
 echo "[2/4] Resetting Wi-Fi interface..."
 if ip link show "$MESH_IF" >/dev/null 2>&1; then
     ip link set "$MESH_IF" down || true
+    iw dev "$MESH_IF" mesh leave 2>/dev/null || true
+    iw dev "$MESH_IF" ibss leave 2>/dev/null || true
+    ip addr flush dev "$MESH_IF" || true
     iw dev "$MESH_IF" set type managed || true
     ip link set "$MESH_IF" up || true
 else
@@ -33,6 +36,9 @@ else
 fi
 
 echo "[3/4] Restarting networking services if available..."
+if command -v nmcli >/dev/null 2>&1; then
+    nmcli dev set "$MESH_IF" managed yes 2>/dev/null || true
+fi
 systemctl restart NetworkManager 2>/dev/null || true
 systemctl restart dhcpcd 2>/dev/null || true
 
