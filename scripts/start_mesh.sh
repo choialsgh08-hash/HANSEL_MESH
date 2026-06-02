@@ -127,9 +127,6 @@ echo "[3/10] Releasing Wi-Fi from AP/client managers if possible..."
 systemctl stop hostapd 2>/dev/null || true
 systemctl stop dnsmasq 2>/dev/null || true
 systemctl stop "wpa_supplicant@$MESH_IF" 2>/dev/null || true
-if command -v wpa_cli >/dev/null 2>&1; then
-    wpa_cli -i "$MESH_IF" terminate 2>/dev/null || true
-fi
 if command -v nmcli >/dev/null 2>&1; then
     nmcli dev set "$MESH_IF" managed no 2>/dev/null || true
 fi
