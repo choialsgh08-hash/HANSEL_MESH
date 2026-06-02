@@ -11,8 +11,6 @@ Base Pi
    |
 Relay Node Pi
    |
-Relay Node Pi
-   |
 Head Pi / Robot
 ```
 
@@ -22,7 +20,8 @@ Head Pi / Robot
 | head     | 로봇 헤드 / 카메라 / 제어 | configs/head.env  | 192.168.50.10 |
 | node1    | 릴레이 유닛 1            | configs/node1.env | 192.168.50.11 |
 | node2    | 릴레이 유닛 2            | configs/node2.env | 192.168.50.12 |
-| node3    | 릴레이 유닛 3            | configs/node3.env | 192.168.50.13 |
+
+`node3`는 예비 Pi가 생겼을 때 추가할 optional 릴레이입니다.
 
 ## 기본 실행 순서
 
@@ -41,7 +40,7 @@ sudo systemctl enable hansel-mesh@base
 sudo systemctl start hansel-mesh@base
 ```
 
-다른 장치는 `base`를 `head`, `node1`, `node2`, `node3`로 바꿔서 사용합니다.
+다른 장치는 `base`를 `head`, `node1`, `node2`로 바꿔서 사용합니다.
 
 ## 상태 확인
 

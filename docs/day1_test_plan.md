@@ -14,7 +14,8 @@ Day1의 목표는 Base, Head, Node Pi들이 BATMAN-adv Mesh로 연결되고 `bat
 | Head  | head     | configs/head.env  | 192.168.50.10 |
 | Node1 | node1    | configs/node1.env | 192.168.50.11 |
 | Node2 | node2    | configs/node2.env | 192.168.50.12 |
-| Node3 | node3    | configs/node3.env | 192.168.50.13 |
+
+`node3`는 장비가 추가될 때 사용하는 optional 릴레이이며 Day1 필수 성공 기준에는 포함하지 않는다.
 
 ## 3. 테스트 순서
 
@@ -38,14 +39,13 @@ sudo batctl n
 sudo batctl o
 ```
 
-Base와 Head ping이 성공하면 Node1, Node2, Node3를 하나씩 추가한다.
+Base와 Head ping이 성공하면 Node1, Node2를 하나씩 추가한다.
 
 Node:
 
 ```bash
 sudo ./scripts/start_mesh.sh configs/node1.env
 sudo ./scripts/start_mesh.sh configs/node2.env
-sudo ./scripts/start_mesh.sh configs/node3.env
 ```
 
 각 Node에서는 자기 config 하나만 실행한다.
@@ -55,7 +55,6 @@ Base에서 확인:
 ```bash
 ping -c 4 192.168.50.11
 ping -c 4 192.168.50.12
-ping -c 4 192.168.50.13
 sudo batctl n
 sudo batctl o
 ```
@@ -64,7 +63,7 @@ sudo batctl o
 
 - `bat0` 인터페이스가 생성된다.
 - `wlan0`에는 IP가 없고 `bat0`에만 `192.168.50.x/24` IP가 있다.
-- Base에서 Head와 Node1/Node2/Node3로 ping이 된다.
+- Base에서 Head와 Node1/Node2로 ping이 된다.
 - Head에서 Base로 ping이 된다.
 - `sudo batctl n`에서 neighbor가 보인다.
 - `sudo batctl o`에서 originator가 보인다.

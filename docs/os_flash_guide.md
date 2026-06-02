@@ -23,7 +23,8 @@ Raspberry Pi Imager의 OS Customisation에서 아래 값을 설정한다.
 | Head  | head     | hansel   |
 | Node1 | node1    | hansel   |
 | Node2 | node2    | hansel   |
-| Node3 | node3    | hansel   |
+
+`node3`는 장비가 추가될 때 설정한다.
 
 SSH는 Enable 한다. 초기 설치와 GitHub clone을 위해 실험실 Wi-Fi 또는 핫스팟도 설정한다.
 
@@ -38,7 +39,6 @@ ssh hansel@base.local
 ssh hansel@head.local
 ssh hansel@node1.local
 ssh hansel@node2.local
-ssh hansel@node3.local
 ```
 
 `.local` 접속이 안 되면 공유기 관리자 페이지 또는 현재 대역에 맞춘 `nmap`으로 IP를 찾는다.
@@ -82,7 +82,6 @@ sudo ./scripts/pi_first_boot_setup.sh base
 sudo ./scripts/pi_first_boot_setup.sh head
 sudo ./scripts/pi_first_boot_setup.sh node1
 sudo ./scripts/pi_first_boot_setup.sh node2
-sudo ./scripts/pi_first_boot_setup.sh node3
 ```
 
 각 Pi에서는 자기 역할에 맞는 명령 하나만 실행한다.
@@ -114,7 +113,6 @@ sudo ./scripts/start_mesh.sh configs/base.env
 sudo ./scripts/start_mesh.sh configs/head.env
 sudo ./scripts/start_mesh.sh configs/node1.env
 sudo ./scripts/start_mesh.sh configs/node2.env
-sudo ./scripts/start_mesh.sh configs/node3.env
 ```
 
 각 Pi에서는 자기 역할에 맞는 명령 하나만 실행한다.
@@ -130,7 +128,7 @@ sudo systemctl enable hansel-mesh@base
 sudo systemctl start hansel-mesh@base
 ```
 
-다른 장치는 `base`를 `head`, `node1`, `node2`, `node3`로 바꿔서 실행한다.
+다른 장치는 `base`를 `head`, `node1`, `node2`로 바꿔서 실행한다.
 
 상태 확인:
 
@@ -159,12 +157,11 @@ sudo batctl n
 sudo batctl o
 ```
 
-이후 Node1, Node2, Node3를 하나씩 추가하고 Base에서 확인한다.
+이후 Node1, Node2를 하나씩 추가하고 Base에서 확인한다.
 
 ```bash
 ping -c 4 192.168.50.11
 ping -c 4 192.168.50.12
-ping -c 4 192.168.50.13
 sudo batctl n
 sudo batctl o
 ```

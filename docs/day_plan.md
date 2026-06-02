@@ -11,7 +11,7 @@ base Pi ↔ node Pi ↔ head Pi ping 성공
 작업:
 
 - Raspberry Pi OS Lite 64-bit 준비
-- hostname을 `base`, `head`, `node1`, `node2`, `node3`로 설정
+- hostname을 `base`, `head`, `node1`, `node2`로 설정
 - SSH 접속 확인
 - GitHub repo clone
 - `sudo ./scripts/pi_first_boot_setup.sh <role>` 실행
@@ -25,7 +25,7 @@ base Pi ↔ node Pi ↔ head Pi ping 성공
 
 - Base Pi에서 Head Pi ping 성공
 - Head Pi에서 Base Pi ping 성공
-- Base Pi에서 node1/node2/node3 ping 성공
+- Base Pi에서 node1/node2 ping 성공
 - `batctl n`에서 neighbor 확인
 - `batctl o`에서 originator 확인
 
