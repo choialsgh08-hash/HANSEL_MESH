@@ -29,26 +29,29 @@ nmcli radio wifi off
 
 ```bash
 cd ~/Projects/HANSEL_MESH
-scp scripts/setup_base_gateway.sh scripts/setup_laptop_mesh_routes.sh scripts/setup_mesh_route_to_laptop.sh scripts/start_camera_stream.sh scripts/receive_camera_stream.sh hansel@192.168.60.1:~/HANSEL_MESH/scripts/
-scp -r controller robot docs/camera_control_quickstart.md hansel@192.168.60.1:~/HANSEL_MESH/
+ssh hansel@192.168.60.1 'mkdir -p /home/hansel/HANSEL_MESH/scripts /home/hansel/HANSEL_MESH/controller /home/hansel/HANSEL_MESH/robot'
+scp scripts/setup_base_gateway.sh scripts/setup_laptop_mesh_routes.sh scripts/setup_mesh_route_to_laptop.sh scripts/start_camera_stream.sh scripts/receive_camera_stream.sh hansel@192.168.60.1:/home/hansel/HANSEL_MESH/scripts/
+scp -r controller robot docs/camera_control_quickstart.md hansel@192.168.60.1:/home/hansel/HANSEL_MESH/
 ```
 
 Base에서 Head로 필요한 파일을 보낸다.
 
 ```bash
 ssh hansel@192.168.60.1
-mkdir -p ~/HANSEL_MESH/robot ~/HANSEL_MESH/scripts
-scp ~/HANSEL_MESH/scripts/setup_mesh_route_to_laptop.sh ~/HANSEL_MESH/scripts/start_camera_stream.sh hansel@192.168.50.10:~/HANSEL_MESH/scripts/
-scp ~/HANSEL_MESH/robot/mesh_control_server.py hansel@192.168.50.10:~/HANSEL_MESH/robot/
+ssh hansel@192.168.50.10 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts'
+scp /home/hansel/HANSEL_MESH/scripts/setup_mesh_route_to_laptop.sh /home/hansel/HANSEL_MESH/scripts/start_camera_stream.sh hansel@192.168.50.10:/home/hansel/HANSEL_MESH/scripts/
+scp -r /home/hansel/HANSEL_MESH/robot hansel@192.168.50.10:/home/hansel/HANSEL_MESH/
 ```
 
 Node를 직접 제어 대상으로 테스트하려면 Base에서 node1/node2에도 서버 파일과 route script를 보낸다.
 
 ```bash
-scp ~/HANSEL_MESH/scripts/setup_mesh_route_to_laptop.sh hansel@192.168.50.11:~/HANSEL_MESH/scripts/
-scp ~/HANSEL_MESH/scripts/setup_mesh_route_to_laptop.sh hansel@192.168.50.12:~/HANSEL_MESH/scripts/
-scp ~/HANSEL_MESH/robot/mesh_control_server.py hansel@192.168.50.11:~/HANSEL_MESH/robot/
-scp ~/HANSEL_MESH/robot/mesh_control_server.py hansel@192.168.50.12:~/HANSEL_MESH/robot/
+ssh hansel@192.168.50.11 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts'
+ssh hansel@192.168.50.12 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts'
+scp /home/hansel/HANSEL_MESH/scripts/setup_mesh_route_to_laptop.sh hansel@192.168.50.11:/home/hansel/HANSEL_MESH/scripts/
+scp /home/hansel/HANSEL_MESH/scripts/setup_mesh_route_to_laptop.sh hansel@192.168.50.12:/home/hansel/HANSEL_MESH/scripts/
+scp -r /home/hansel/HANSEL_MESH/robot hansel@192.168.50.11:/home/hansel/HANSEL_MESH/
+scp -r /home/hansel/HANSEL_MESH/robot hansel@192.168.50.12:/home/hansel/HANSEL_MESH/
 ```
 
 ## 3. Base Gateway
@@ -87,7 +90,7 @@ node1/node2를 직접 조종 대상으로 테스트하려면 각 node에서도 �
 Head에서:
 
 ```bash
-python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
 ```
 
 노트북에서:

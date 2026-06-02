@@ -57,6 +57,14 @@ sudo batctl o
 
 실행 순서는 [Camera And Control Quickstart](docs/camera_control_quickstart.md)를 따른다.
 
+다음 현장 테스트 시작 순서는 [Next Field Test Checklist](docs/next_field_test_checklist.md)를 따른다.
+
+실제 GPIO 모터/엔코더 제어는 [Motor Control Quickstart](docs/motor_control_quickstart.md)를 따른다.
+
+내일 구동 + 카메라 테스트 전체 순서는 [Tomorrow Drive + Camera Runbook](docs/tomorrow_drive_camera_runbook.md)을 따른다.
+
+팀원 설명용 코드/원리 문서는 [HANSEL_MESH Code And Network Explainer](docs/hansel_mesh_code_explainer.md)를 따른다.
+
 ## 통신 원칙
 
 Base Pi가 명령 내용을 해석해 각 유닛으로 다시 보내는 dispatcher 구조가 아니라, 모든 유닛이 BATMAN-adv 릴레이 노드로 동작합니다.
