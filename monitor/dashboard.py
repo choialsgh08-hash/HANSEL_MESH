@@ -20,6 +20,8 @@ Run it now without any hardware:
     # open http://localhost:8080
 """
 
+from __future__ import annotations  # 3.9(Bullseye) 호환
+
 import argparse
 import json
 import os

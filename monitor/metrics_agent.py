@@ -15,6 +15,8 @@ Typical use on a Pi:
         --send 192.168.50.1:7100
 """
 
+from __future__ import annotations  # 3.9(Bullseye) 호환: str | None 같은 표기 지원
+
 import argparse
 import json
 import re
