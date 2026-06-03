@@ -1,0 +1,30 @@
+Station 02:aa:bb:00:00:01 (on wlan0)
+	inactive time:	120 ms
+	rx bytes:	1048576
+	rx packets:	8000
+	tx bytes:	524288
+	tx packets:	6000
+	tx retries:	12
+	tx failed:	0
+	signal:  	-52 [-54, -56] dBm
+	signal avg:	-53 [-55, -57] dBm
+	tx bitrate:	54.0 MBit/s
+	rx bitrate:	48.0 MBit/s MCS 4
+	expected throughput:	20.000Mbps
+	authorized:	yes
+	authenticated:	yes
+Station 02:aa:bb:00:00:12 (on wlan0)
+	inactive time:	340 ms
+	rx bytes:	262144
+	rx packets:	3000
+	tx bytes:	131072
+	tx packets:	2200
+	tx retries:	88
+	tx failed:	3
+	signal:  	-74 [-76, -78] dBm
+	signal avg:	-72 [-74, -76] dBm
+	tx bitrate:	12.0 MBit/s
+	rx bitrate:	11.0 MBit/s
+	expected throughput:	5.500Mbps
+	authorized:	yes
+	authenticated:	yes

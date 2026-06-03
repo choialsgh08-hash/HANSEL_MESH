@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HANSEL_MESH 모니터</title>
+<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root { --bg:#0e1116; --panel:#171b22; --line:#262c36; --txt:#e6edf3; --dim:#8b949e; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,"Segoe UI",sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; }
+  header h1 { font-size:18px; margin:0; }
+  #status { font-size:13px; color:var(--dim); }
+  #status .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; margin-right:6px; }
+  .grid { display:grid; grid-template-columns:1.3fr 1fr; gap:14px; padding:14px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .panel h2 { font-size:13px; margin:0 0 10px; color:var(--dim); font-weight:600; letter-spacing:.3px; text-transform:uppercase; }
+  #graph { height:420px; border-radius:8px; }
+  .charts { display:grid; grid-template-rows:1fr 1fr; gap:14px; }
+  canvas { max-height:185px; }
+  .legend { display:flex; gap:14px; font-size:12px; color:var(--dim); margin-top:8px; flex-wrap:wrap; }
+  .legend span { display:inline-flex; align-items:center; gap:5px; }
+  .legend i { width:18px; height:4px; border-radius:2px; display:inline-block; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; }
+  .full { grid-column:1 / -1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐝 HANSEL_MESH 실시간 모니터</h1>
+  <span id="status"><span class="dot"></span><span id="status-text">연결 중…</span></span>
+</header>
+
+<div class="grid">
+  <div class="panel">
+    <h2>메시 토폴로지 (선 색 = RSSI, 라벨 = RSSI / TQ)</h2>
+    <div id="graph"></div>
+    <div class="legend">
+      <span><i style="background:#3fb950"></i> 강함 ≥ -60 dBm</span>
+      <span><i style="background:#d29922"></i> 보통 -60 ~ -72</span>
+      <span><i style="background:#f85149"></i> 약함 &lt; -72</span>
+      <span><i style="background:#6e7681"></i> 데이터 없음</span>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="panel">
+      <h2>종단 RTT (ms)</h2>
+      <canvas id="rttChart"></canvas>
+    </div>
+    <div class="panel">
+      <h2>링크 RSSI (dBm)</h2>
+      <canvas id="rssiChart"></canvas>
+    </div>
+  </div>
+
+  <div class="panel full">
+    <h2>링크 상세</h2>
+    <table id="linkTable">
+      <thead><tr><th>링크</th><th>RSSI (dBm)</th><th>TQ (0-255)</th><th>방향</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+const COLORS = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf","#ff7b72"];
+function rssiColor(r){ if(r==null) return "#6e7681"; if(r>=-60) return "#3fb950"; if(r>=-72) return "#d29922"; return "#f85149"; }
+
+// ---- topology graph ----
+const gNodes = new vis.DataSet();
+const gEdges = new vis.DataSet();
+const network = new vis.Network(document.getElementById("graph"),
+  {nodes:gNodes, edges:gEdges}, {
+    physics:{ stabilization:true, barnesHut:{ springLength:140 } },
+    nodes:{ shape:"dot", size:18, font:{ color:"#e6edf3", size:14 },
+            color:{ background:"#1f6feb", border:"#58a6ff" } },
+    edges:{ font:{ color:"#adbac7", size:12, strokeWidth:0, background:"#171b22" },
+            smooth:false, width:3 }
+  });
+
+function updateGraph(state){
+  const seen = new Set();
+  state.nodes.forEach(n=>{
+    seen.add(n.id);
+    const c = n.online ? {background:"#1f6feb",border:"#58a6ff"} : {background:"#30363d",border:"#6e7681"};
+    const item = {id:n.id, label:`${n.id}\n${n.ip||""}`, color:c};
+    if(gNodes.get(n.id)) gNodes.update(item); else gNodes.add(item);
+  });
+  gNodes.getIds().forEach(id=>{ if(!seen.has(id)) gNodes.remove(id); });
+
+  const ekeys = new Set();
+  state.edges.forEach(e=>{
+    const id = [e.from,e.to].sort().join("|");
+    ekeys.add(id);
+    const label = (e.rssi!=null?`${e.rssi}dBm`:"?") + (e.tq!=null?` · TQ ${e.tq}`:"");
+    const item = {id, from:e.from, to:e.to, label, color:{color:rssiColor(e.rssi)},
+                  width: e.rssi==null?2:(e.rssi>=-60?5:e.rssi>=-72?3.5:2.5)};
+    if(gEdges.get(id)) gEdges.update(item); else gEdges.add(item);
+  });
+  gEdges.getIds().forEach(id=>{ if(!ekeys.has(id)) gEdges.remove(id); });
+}
+
+// ---- charts ----
+function mkChart(ctx, yLabel, reverse){
+  return new Chart(ctx, { type:"line",
+    data:{ labels:[], datasets:[] },
+    options:{ animation:false, responsive:true, maintainAspectRatio:false,
+      interaction:{ intersect:false, mode:"index" },
+      scales:{ x:{ ticks:{ color:"#8b949e", maxTicksLimit:6 }, grid:{ color:"#262c36" } },
+               y:{ reverse:!!reverse, title:{ display:true, text:yLabel, color:"#8b949e" },
+                   ticks:{ color:"#8b949e" }, grid:{ color:"#262c36" } } },
+      plugins:{ legend:{ labels:{ color:"#adbac7", boxWidth:12 } } } } });
+}
+const rttChart = mkChart(document.getElementById("rttChart"), "ms", false);
+const rssiChart = mkChart(document.getElementById("rssiChart"), "dBm", false);
+
+function buildDatasets(history, field){
+  const keys = new Set();
+  history.forEach(r=>Object.keys(r[field]||{}).forEach(k=>keys.add(k)));
+  const labels = history.map(r=>{ const d=new Date(r.ts*1000);
+    return d.toLocaleTimeString("ko-KR",{hour12:false}); });
+  let i=0; const datasets=[];
+  keys.forEach(k=>{
+    const color = COLORS[i++ % COLORS.length];
+    datasets.push({ label:k, data:history.map(r=> (r[field]&&r[field][k]!=null)?r[field][k]:null),
+      borderColor:color, backgroundColor:color, tension:0.25, pointRadius:0,
+      borderWidth:2, spanGaps:true });
+  });
+  return {labels, datasets};
+}
+function refreshChart(chart, history, field){
+  const {labels, datasets} = buildDatasets(history, field);
+  chart.data.labels = labels; chart.data.datasets = datasets; chart.update();
+}
+
+function updateTable(edges){
+  const tb = document.querySelector("#linkTable tbody");
+  tb.innerHTML = edges.sort((a,b)=>(a.from+a.to).localeCompare(b.from+b.to)).map(e=>{
+    const c = rssiColor(e.rssi);
+    return `<tr><td>${e.from} ↔ ${e.to}</td>
+      <td style="color:${c}">${e.rssi!=null?e.rssi:"—"}</td>
+      <td>${e.tq!=null?e.tq:"—"}</td><td>${e.directions}</td></tr>`;
+  }).join("");
+}
+
+async function poll(){
+  try{
+    const r = await fetch("/api/state");
+    const s = await r.json();
+    updateGraph(s);
+    updateTable(s.edges);
+    refreshChart(rttChart, s.history, "rtt");
+    refreshChart(rssiChart, s.history, "rssi");
+    const online = s.nodes.filter(n=>n.online).length;
+    document.getElementById("status-text").textContent =
+      `노드 ${online}/${s.nodes.length} 온라인 · 링크 ${s.edges.length}개 · ${new Date(s.updated*1000).toLocaleTimeString("ko-KR",{hour12:false})}`;
+    document.querySelector("#status .dot").style.background = online? "#3fb950":"#f85149";
+  }catch(e){
+    document.getElementById("status-text").textContent = "수집기 연결 끊김";
+    document.querySelector("#status .dot").style.background = "#f85149";
+  }
+}
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
