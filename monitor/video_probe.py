@@ -22,6 +22,7 @@ No display (headless measure only):
 from __future__ import annotations  # 3.9 compatibility
 
 import argparse
+import datetime
 import json
 import re
 import socket
@@ -151,6 +152,7 @@ def make_sample(block: dict, errors_total: int, prev: dict, now: float,
 
     sample = {
         "ts": round(now, 2),
+        "time": datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
         "fps": fps,
         "target_fps": target_fps,
         "fps_ratio": round(fps / target_fps, 3) if (fps and target_fps) else None,

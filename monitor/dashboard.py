@@ -23,6 +23,7 @@ Run it now without any hardware:
 from __future__ import annotations  # 3.9(Bullseye) 호환
 
 import argparse
+import datetime
 import json
 import os
 import random
@@ -123,16 +124,27 @@ def merge_state(now: float) -> dict:
             "video": video, "net_rssi_worst": net_rssi_worst}
 
 
-def sampler_loop(interval: float) -> None:
-    """Append a compact history record at a steady cadence for the charts."""
+def sampler_loop(interval: float, log_path: str = None) -> None:
+    """Append a compact history record at a steady cadence for the charts.
+
+    If log_path is given, also append each record as one JSON line so the full
+    comms + video data (with a human-readable receive time) is saved to disk.
+    """
+    log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
+    if log_fh:
+        print(f"[collector] logging combined metrics to {log_path}")
     while True:
         now = time.time()
         state = merge_state(now)
         vid = state.get("video") or {}
         rec = {
             "ts": round(now, 1),
+            # Human-readable receive time (local clock of the collector).
+            "time": datetime.datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
             "rssi": {_edge_key(e["from"], e["to"]): e["rssi"]
                      for e in state["edges"] if e["rssi"] is not None},
+            "tq": {_edge_key(e["from"], e["to"]): e["tq"]
+                   for e in state["edges"] if e["tq"] is not None},
             "rtt": {k: v.get("rtt_avg_ms")
                     for k, v in state["e2e"].items() if "rtt_avg_ms" in v},
             # Video quality + the network scalar, on the same time axis.
@@ -143,6 +155,9 @@ def sampler_loop(interval: float) -> None:
         }
         with LOCK:
             HISTORY.append(rec)
+        if log_fh:
+            log_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            log_fh.flush()
         time.sleep(interval)
 
 
@@ -294,13 +309,15 @@ def parse_args() -> argparse.Namespace:
                    help="history sampling cadence (s)")
     p.add_argument("--demo", action="store_true",
                    help="generate synthetic data, no agents needed")
+    p.add_argument("--log", default=None,
+                   help="save combined comms+video metrics to this JSONL file")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
 
-    threading.Thread(target=sampler_loop, args=(args.interval,),
+    threading.Thread(target=sampler_loop, args=(args.interval, args.log),
                      daemon=True).start()
     if args.demo:
         threading.Thread(target=demo_loop, args=(args.interval,),
