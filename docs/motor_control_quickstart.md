@@ -94,13 +94,13 @@ cd ~/HANSEL_MESH
 sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2
 ```
 
-Head 고개 서보를 쓰려면 pigpio daemon이 필요할 수 있다.
+Head 고개 서보는 pigpio가 있으면 pigpio를 쓰고, 없으면 RPi.GPIO PWM으로 자동 fallback한다. 더 안정적인 서보 펄스를 쓰려면 pigpio daemon을 켠다.
 
 ```bash
 sudo systemctl enable --now pigpiod
 ```
 
-pigpio가 없어도 주행 모터와 detach servo는 계속 동작한다.
+pigpio가 없어도 주행 모터, detach servo, head 고개 서보 fallback은 계속 동작한다.
 
 ## 6. 조종
 
@@ -132,9 +132,11 @@ Live mode 키:
 | x 또는 space | stop |
 | u | head servo up |
 | j | head servo down |
+| k | head servo center |
 | f | head front motor forward |
 | v | head front motor stop |
 | 1 | detach_press, 단 `--target all`에서는 안전상 전송 안 함 |
+| 2 | detach_rest, 단 `--target all`에서는 안전상 전송 안 함 |
 | Ctrl+C | stop 보내고 종료 |
 
 Line mode도 가능하다.
@@ -148,9 +150,9 @@ Line mode 명령:
 ```text
 w, a, s, d, x
 fl, fr, bl, br
-hu, hd
+hu, hd, hc, hmin, hmax
 front, front_stop
-detach
+detach, detach_rest
 t head
 t node1
 t node2

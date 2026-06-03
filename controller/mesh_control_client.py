@@ -31,6 +31,9 @@ COMMANDS = {
     "sb": "slow_backward",
     "hu": "head_servo_up",
     "hd": "head_servo_down",
+    "hc": "head_servo_center",
+    "hmin": "head_servo_min",
+    "hmax": "head_servo_max",
     "front": "front_motor_forward",
     "front_back": "front_motor_backward",
     "front_stop": "front_motor_stop",
@@ -62,16 +65,24 @@ LIVE_KEYS = {
 ONE_SHOT_LIVE_KEYS = {
     "u": "head_servo_up",
     "j": "head_servo_down",
+    "k": "head_servo_center",
     "f": "front_motor_forward",
     "v": "front_motor_stop",
     "1": "detach_press",
+    "2": "detach_rest",
 }
 
 HEAD_ONLY_COMMANDS = {
     "head_servo_up",
     "head_servo_down",
+    "head_servo_center",
+    "head_servo_min",
+    "head_servo_max",
     "servo_up",
     "servo_down",
+    "servo_center",
+    "servo_min",
+    "servo_max",
     "front_motor_forward",
     "front_motor_backward",
     "front_motor_stop",
@@ -171,7 +182,7 @@ def run_line_mode(args: argparse.Namespace) -> int:
 
     print("End-to-end mesh control client")
     print("commands: w=forward s=backward a=left d=right x=stop quit=quit")
-    print("extra: fl/fr/bl/br, hu/hd, front/front_stop, detach")
+    print("extra: fl/fr/bl/br, hu/hd/hc/hmin/hmax, front/front_stop, detach/detach_rest")
     print("change target: t head | t node1 | t node2 | t all")
 
     while True:
@@ -207,7 +218,7 @@ def run_live_mode(args: argparse.Namespace) -> int:
 
     print("Live mesh control")
     print("drive: w/s, steer head only: a/d/q/e/z/c, stop: x or space, quit: Ctrl-C")
-    print("one-shot: u=head up, j=head down, f=front motor, v=front stop, 1=detach")
+    print("one-shot: u=head up, j=head down, k=head center, f=front motor, v=front stop, 1=detach, 2=detach rest")
     print(f"target={target} speed={args.speed if args.speed is not None else 'role default'}")
 
     try:

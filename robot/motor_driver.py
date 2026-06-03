@@ -224,6 +224,7 @@ class GpioRobotController:
         self.pwm_left = None
         self.pwm_right = None
         self.detach_servo_pwm = None
+        self.head_servo_pwm = None
         self.front_pwm_left = None
         self.front_pwm_right = None
         self.pigpio_pi = None
@@ -331,14 +332,23 @@ class GpioRobotController:
             self._setup_head_servo()
 
     def _setup_head_servo(self) -> None:
+        if self.config.head_servo_pin is None:
+            return
+
         if pigpio is None:
-            print(f"[{self.role}] pigpio module missing; head servo disabled")
+            print(f"[{self.role}] pigpio module missing; using RPi.GPIO PWM for head servo")
+            GPIO.setup(self.config.head_servo_pin, GPIO.OUT)
+            self.head_servo_pwm = GPIO.PWM(self.config.head_servo_pin, self.SERVO_FREQ)
+            self.head_servo_pwm.start(0)
             return
 
         self.pigpio_pi = pigpio.pi()
         if not self.pigpio_pi.connected:
-            print(f"[{self.role}] pigpiod not running; head servo disabled")
+            print(f"[{self.role}] pigpiod not running; using RPi.GPIO PWM for head servo")
             self.pigpio_pi = None
+            GPIO.setup(self.config.head_servo_pin, GPIO.OUT)
+            self.head_servo_pwm = GPIO.PWM(self.config.head_servo_pin, self.SERVO_FREQ)
+            self.head_servo_pwm.start(0)
             return
 
         self.pigpio_pi.set_mode(self.config.head_servo_pin, pigpio.OUTPUT)
@@ -796,7 +806,7 @@ class GpioRobotController:
         return int(self.HEAD_SERVO_MIN_PULSE_US + (angle / 180.0) * span)
 
     def set_head_servo_angle(self, angle: int) -> None:
-        if self.pigpio_pi is None or self.config.head_servo_pin is None:
+        if self.config.head_servo_pin is None:
             print(f"[{self.role}] head servo is not available")
             return
         self.current_head_servo_angle = clamp_angle(
@@ -804,18 +814,41 @@ class GpioRobotController:
             self.HEAD_SERVO_MIN_ANGLE,
             self.HEAD_SERVO_MAX_ANGLE,
         )
-        pulse = self._head_servo_pulse_us(self.current_head_servo_angle)
-        print(f"[{self.role}] head servo angle={self.current_head_servo_angle} pulse={pulse}us")
-        self.pigpio_pi.set_servo_pulsewidth(self.config.head_servo_pin, pulse)
-        if not env_bool("HANSEL_HEAD_SERVO_HOLD", False):
-            time.sleep(0.08)
-            self.pigpio_pi.set_servo_pulsewidth(self.config.head_servo_pin, 0)
+
+        if self.pigpio_pi is not None:
+            pulse = self._head_servo_pulse_us(self.current_head_servo_angle)
+            print(f"[{self.role}] head servo angle={self.current_head_servo_angle} pulse={pulse}us")
+            self.pigpio_pi.set_servo_pulsewidth(self.config.head_servo_pin, pulse)
+            if not env_bool("HANSEL_HEAD_SERVO_HOLD", False):
+                time.sleep(0.08)
+                self.pigpio_pi.set_servo_pulsewidth(self.config.head_servo_pin, 0)
+            return
+
+        if self.head_servo_pwm is not None:
+            duty = self._angle_to_duty(self.current_head_servo_angle)
+            print(f"[{self.role}] head servo angle={self.current_head_servo_angle} duty={duty:.2f}%")
+            self.head_servo_pwm.ChangeDutyCycle(duty)
+            if not env_bool("HANSEL_HEAD_SERVO_HOLD", False):
+                time.sleep(0.12)
+                self.head_servo_pwm.ChangeDutyCycle(0)
+            return
+
+        print(f"[{self.role}] head servo is not available")
 
     def head_servo_up_step(self, message: Optional[dict] = None) -> None:
         self.set_head_servo_angle(self.current_head_servo_angle + self.HEAD_SERVO_STEP_ANGLE)
 
     def head_servo_down_step(self, message: Optional[dict] = None) -> None:
         self.set_head_servo_angle(self.current_head_servo_angle - self.HEAD_SERVO_STEP_ANGLE)
+
+    def head_servo_center(self, message: Optional[dict] = None) -> None:
+        self.set_head_servo_angle(self.HEAD_SERVO_CENTER_ANGLE)
+
+    def head_servo_min(self, message: Optional[dict] = None) -> None:
+        self.set_head_servo_angle(self.HEAD_SERVO_MIN_ANGLE)
+
+    def head_servo_max(self, message: Optional[dict] = None) -> None:
+        self.set_head_servo_angle(self.HEAD_SERVO_MAX_ANGLE)
 
     def handle_command(self, command: str, message: Optional[dict] = None) -> None:
         normalized = command.strip().lower().replace("-", "_").replace(" ", "_")
@@ -845,8 +878,14 @@ class GpioRobotController:
             "detach_rest": self.detach_servo_rest,
             "head_servo_up": self.head_servo_up_step,
             "head_servo_down": self.head_servo_down_step,
+            "head_servo_center": self.head_servo_center,
+            "head_servo_min": self.head_servo_min,
+            "head_servo_max": self.head_servo_max,
             "servo_up": self.head_servo_up_step,
             "servo_down": self.head_servo_down_step,
+            "servo_center": self.head_servo_center,
+            "servo_min": self.head_servo_min,
+            "servo_max": self.head_servo_max,
             "front_motor_forward": self.front_motor_forward,
             "front_motor_backward": self.front_motor_backward,
             "front_motor_stop": self.front_motor_stop,
@@ -899,7 +938,14 @@ class GpioRobotController:
         except Exception:
             pass
 
-        for pwm in (self.pwm_left, self.pwm_right, self.front_pwm_left, self.front_pwm_right, self.detach_servo_pwm):
+        for pwm in (
+            self.pwm_left,
+            self.pwm_right,
+            self.front_pwm_left,
+            self.front_pwm_right,
+            self.detach_servo_pwm,
+            self.head_servo_pwm,
+        ):
             try:
                 if pwm is not None:
                     pwm.ChangeDutyCycle(0)

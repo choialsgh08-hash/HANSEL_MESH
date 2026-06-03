@@ -220,7 +220,7 @@ sudo pkill -f Node3_control.py
 sudo pkill -f mesh_control_server.py
 ```
 
-head에서 head servo를 쓸 경우:
+head 고개 서보는 pigpio가 있으면 pigpio를 쓰고, 없으면 RPi.GPIO PWM으로 자동 fallback한다. 더 안정적인 서보 펄스를 쓰려면 head에서:
 
 ```bash
 sudo systemctl enable --now pigpiod
@@ -312,6 +312,11 @@ python3 controller/mesh_control_client.py --target all --speed 0.4 --live
 | z | head backward_left, node1/node2 slow_backward |
 | c | head backward_right, node1/node2 slow_backward |
 | x 또는 space | stop |
+| u | head servo up |
+| j | head servo down |
+| k | head servo center |
+| 1 | detach_press, target all에서는 안전상 전송 안 함 |
+| 2 | detach_rest, target all에서는 안전상 전송 안 함 |
 | Ctrl+C | stop 보내고 종료 |
 
 현재 기본값은 `w`가 물리 전진, `s`가 물리 후진이 되도록 주행 모터 방향을 reverse 처리한다. 특정 모터가 다시 반대로 돌면 서버 실행 전 환경변수로 보정:

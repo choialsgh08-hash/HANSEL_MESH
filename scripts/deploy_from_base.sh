@@ -73,7 +73,7 @@ test -f controller/mesh_control_client.py
 test -f scripts/start_camera_stream.sh
 test -d monitor
 
-RSYNC_FLAGS="-az --delete"
+RSYNC_FLAGS="-rz --delete --no-times --no-perms --no-owner --no-group --omit-dir-times"
 if [ "$DRY_RUN" = "yes" ]; then
     RSYNC_FLAGS="$RSYNC_FLAGS --dry-run"
 fi
