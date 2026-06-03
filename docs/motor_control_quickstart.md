@@ -160,11 +160,13 @@ quit
 
 ## 7. 튜닝 환경변수
 
-모터가 반대로 돌면 해당 Pi에서 서버 실행 전 환경변수를 준다.
+현재 기본값은 모든 주행 모터와 head front motor가 reverse 상태다. 즉 `w`가 물리 전진, `s`가 물리 후진이 되도록 맞춰져 있다.
+
+특정 모터가 다시 반대로 돌면 해당 Pi에서 서버 실행 전 환경변수를 `no` 또는 `yes`로 바꿔 보정한다.
 
 ```bash
-HANSEL_LEFT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
-HANSEL_RIGHT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_LEFT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_RIGHT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
 ```
 
 속도를 낮춰 시작:

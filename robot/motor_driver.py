@@ -98,7 +98,7 @@ class RoleConfig:
 
 DEFAULT_DRIVE_PINS = MotorPins(18, 23, 24, 13, 27, 22)
 DEFAULT_ENCODER_PINS = EncoderPins(20, 21, 16, 26)
-DEFAULT_FRONT_MOTOR_PINS = MotorPins(12, 4, 25, 19, 5, 7)
+DEFAULT_FRONT_MOTOR_PINS = MotorPins(12, 3, 8, 19, 5, 7)
 
 
 def role_config(role: str) -> RoleConfig:
@@ -192,10 +192,10 @@ class GpioRobotController:
             kd_right=env_float("HANSEL_KD_RIGHT", 0.0),
         )
 
-        self.left_reverse = env_bool("HANSEL_LEFT_REVERSE", False)
-        self.right_reverse = env_bool("HANSEL_RIGHT_REVERSE", False)
-        self.front_left_reverse = env_bool("HANSEL_FRONT_LEFT_REVERSE", False)
-        self.front_right_reverse = env_bool("HANSEL_FRONT_RIGHT_REVERSE", False)
+        self.left_reverse = env_bool("HANSEL_LEFT_REVERSE", True)
+        self.right_reverse = env_bool("HANSEL_RIGHT_REVERSE", True)
+        self.front_left_reverse = env_bool("HANSEL_FRONT_LEFT_REVERSE", True)
+        self.front_right_reverse = env_bool("HANSEL_FRONT_RIGHT_REVERSE", True)
         self.front_follow_drive = env_bool("HANSEL_FRONT_MOTOR_FOLLOW_DRIVE", self.role == "head")
         self.front_speed_ratio = env_float("HANSEL_FRONT_MOTOR_SPEED_RATIO", 1.0)
 

@@ -314,11 +314,11 @@ python3 controller/mesh_control_client.py --target all --speed 0.4 --live
 | x 또는 space | stop |
 | Ctrl+C | stop 보내고 종료 |
 
-방향이 반대면 서버 실행 전 환경변수로 보정:
+현재 기본값은 `w`가 물리 전진, `s`가 물리 후진이 되도록 주행 모터 방향을 reverse 처리한다. 특정 모터가 다시 반대로 돌면 서버 실행 전 환경변수로 보정:
 
 ```bash
-HANSEL_LEFT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
-HANSEL_RIGHT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_LEFT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_RIGHT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
 ```
 
 방향 확인 후 최대속도:
