@@ -1,5 +1,5 @@
-# Next Field Test Checklist
 
+# Next Field Test Checklist
 다음 테스트를 시작할 때 이 순서대로 진행한다.
 
 ## 1. 장비 배치
@@ -181,7 +181,7 @@ sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2
 
 ```bash
 cd ~/Projects/HANSEL_MESH
-python3 controller/mesh_control_client.py --target all --live
+python3 controller/mesh_control_client.py --target all --speed 0.6 --live
 ```
 
 Live mode 입력:
@@ -195,13 +195,6 @@ x
 ```
 
 Head 로그에 `packet from=('192.168.60.2', ...)`가 보이면 노트북에서 Head까지 end-to-end 도착한 것이다.
-
-조향 원칙:
-
-- `w`: head/node1/node2 모두 같은 목표 CPS로 전진
-- `s`: head/node1/node2 모두 같은 목표 CPS로 후진
-- `a/d`: head만 제자리 조향, node1/node2는 정지
-- `q/e/z/c`: head만 RPM 차이로 곡선 조향, node1/node2는 느린 직진/후진
 
 모터 없이 네트워크만 확인하려면 Head에서 서버를 `--dry-run`으로 실행한다.
 

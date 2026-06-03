@@ -348,8 +348,8 @@ head front DC motors:
 | 기능 | GPIO |
 | ---- | ---- |
 | FRONT_ENA | 12 |
-| FRONT_IN1 | 4 |
-| FRONT_IN2 | 25 |
+| FRONT_IN1 | 3 |
+| FRONT_IN2 | 8 |
 | FRONT_ENB | 19 |
 | FRONT_IN3 | 5 |
 | FRONT_IN4 | 7 |
