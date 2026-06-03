@@ -40,6 +40,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Shared state, guarded by LOCK.
 LOCK = threading.Lock()
 LATEST: dict = {}                 # node_name -> {"snap": snapshot, "recv": ts}
+VIDEO: dict = {}                  # {"stats": <sample>, "recv": ts} from video_probe
 HISTORY: deque = deque(maxlen=180)  # merged records for the charts
 NODE_TIMEOUT_S = 12.0             # mark a node offline after this much silence
 
@@ -53,6 +54,13 @@ def ingest(snapshot: dict, now: float) -> None:
     node = snapshot.get("node", "unknown")
     with LOCK:
         LATEST[node] = {"snap": snapshot, "recv": now}
+
+
+def ingest_video(stats: dict, now: float) -> None:
+    """Store the latest video-quality sample from video_probe."""
+    with LOCK:
+        VIDEO["stats"] = stats
+        VIDEO["recv"] = now
 
 
 def merge_state(now: float) -> dict:
@@ -102,7 +110,17 @@ def merge_state(now: float) -> dict:
         for target, stats in info["snap"].get("end_to_end", {}).items():
             e2e[f"{name}->{target}"] = stats
 
-    return {"nodes": nodes, "edges": edges, "e2e": e2e}
+    # Single network scalar for the video<->comms correlation chart: the
+    # weakest (worst) link RSSI is what bottlenecks the video stream.
+    rssis = [e["rssi"] for e in edges if e["rssi"] is not None]
+    net_rssi_worst = min(rssis) if rssis else None
+
+    with LOCK:
+        video = dict(VIDEO.get("stats") or {}) if (
+            VIDEO.get("recv") and (now - VIDEO["recv"]) < NODE_TIMEOUT_S) else None
+
+    return {"nodes": nodes, "edges": edges, "e2e": e2e,
+            "video": video, "net_rssi_worst": net_rssi_worst}
 
 
 def sampler_loop(interval: float) -> None:
@@ -110,12 +128,18 @@ def sampler_loop(interval: float) -> None:
     while True:
         now = time.time()
         state = merge_state(now)
+        vid = state.get("video") or {}
         rec = {
             "ts": round(now, 1),
             "rssi": {_edge_key(e["from"], e["to"]): e["rssi"]
                      for e in state["edges"] if e["rssi"] is not None},
             "rtt": {k: v.get("rtt_avg_ms")
                     for k, v in state["e2e"].items() if "rtt_avg_ms" in v},
+            # Video quality + the network scalar, on the same time axis.
+            "vid_fps": vid.get("fps"),
+            "vid_err": vid.get("err_rate"),
+            "vid_drop": vid.get("drop_rate"),
+            "net_rssi": state.get("net_rssi_worst"),
         }
         with LOCK:
             HISTORY.append(rec)
@@ -133,7 +157,10 @@ def udp_listener(host: str, port: int) -> None:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             print(f"[collector] bad packet: {exc}")
             continue
-        ingest(snap, time.time())
+        if "video" in snap:               # from video_probe.py
+            ingest_video(snap["video"], time.time())
+        else:                             # from metrics_agent.py
+            ingest(snap, time.time())
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +236,20 @@ def demo_loop(interval: float) -> None:
 
             snap = build_snapshot(node, "wlan0", links_text, ping_text, now)
             ingest(snap, now)
+
+        # Synthesize video quality that tracks the weakest link: as the worst
+        # RSSI drops below ~-65 dBm, decode errors climb and fps falls.
+        worst = min(jitter.values())
+        stress = max(0.0, -65 - worst)            # 0 when healthy, grows as link weakens
+        err_rate = round(stress * 1.5 + random.uniform(0, 1), 2)
+        fps = round(max(3.0, 15.0 - stress * 0.45 - random.uniform(0, 0.5)), 1)
+        ingest_video({
+            "fps": fps,
+            "target_fps": 15.0,
+            "err_rate": err_rate,
+            "drop_rate": round(err_rate * 0.25, 2),
+            "bitrate_kbps": round(1200 * fps / 15.0, 1),
+        }, now)
         time.sleep(interval)
 
 

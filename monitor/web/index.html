@@ -58,6 +58,17 @@
     </div>
   </div>
 
+  <div class="panel">
+    <h2>영상 품질 (수신 FPS / 디코드 에러)</h2>
+    <canvas id="videoChart"></canvas>
+    <div class="legend"><span id="vidNow">영상 신호 없음</span></div>
+  </div>
+  <div class="panel">
+    <h2>통신 ↔ 영상 상관 (최저 RSSI vs 에러/초)</h2>
+    <canvas id="corrChart"></canvas>
+    <div class="legend"><span>RSSI가 내려갈 때 에러가 같이 오르면 → 통신이 영상 품질을 좌우</span></div>
+  </div>
+
   <div class="panel full">
     <h2>링크 상세</h2>
     <table id="linkTable">
@@ -119,6 +130,40 @@ function mkChart(ctx, yLabel, reverse){
 const rttChart = mkChart(document.getElementById("rttChart"), "ms", false);
 const rssiChart = mkChart(document.getElementById("rssiChart"), "dBm", false);
 
+// Dual-axis chart: left axis (y) + right axis (y1).
+function mkDualChart(ctx, leftLabel, rightLabel, rightReverse){
+  return new Chart(ctx, { type:"line", data:{ labels:[], datasets:[] },
+    options:{ animation:false, responsive:true, maintainAspectRatio:false,
+      interaction:{ intersect:false, mode:"index" },
+      scales:{
+        x:{ ticks:{ color:"#8b949e", maxTicksLimit:6 }, grid:{ color:"#262c36" } },
+        y:{ position:"left", title:{ display:true, text:leftLabel, color:"#8b949e" },
+            ticks:{ color:"#8b949e" }, grid:{ color:"#262c36" } },
+        y1:{ position:"right", reverse:!!rightReverse,
+            title:{ display:true, text:rightLabel, color:"#8b949e" },
+            ticks:{ color:"#8b949e" }, grid:{ drawOnChartArea:false } } },
+      plugins:{ legend:{ labels:{ color:"#adbac7", boxWidth:12 } } } } });
+}
+const videoChart = mkDualChart(document.getElementById("videoChart"), "FPS", "에러/초", false);
+// RSSI axis reversed: "worse signal" rises, so it tracks errors when correlated.
+const corrChart = mkDualChart(document.getElementById("corrChart"), "에러/초", "최저 RSSI (나쁨↑)", true);
+
+// Build datasets from scalar history fields (one value per record).
+function timeLabels(history){
+  return history.map(r=>{ const d=new Date(r.ts*1000); return d.toLocaleTimeString("ko-KR",{hour12:false}); });
+}
+function scalarSeries(history, specs){
+  return specs.map(sp=>({ label:sp.label, yAxisID:sp.axis||"y",
+    data:history.map(r=> r[sp.key]!=null ? r[sp.key] : null),
+    borderColor:sp.color, backgroundColor:sp.color, tension:0.25,
+    pointRadius:0, borderWidth:2, spanGaps:true }));
+}
+function refreshScalar(chart, history, specs){
+  chart.data.labels = timeLabels(history);
+  chart.data.datasets = scalarSeries(history, specs);
+  chart.update();
+}
+
 function buildDatasets(history, field){
   const keys = new Set();
   history.forEach(r=>Object.keys(r[field]||{}).forEach(k=>keys.add(k)));
@@ -156,6 +201,18 @@ async function poll(){
     updateTable(s.edges);
     refreshChart(rttChart, s.history, "rtt");
     refreshChart(rssiChart, s.history, "rssi");
+    refreshScalar(videoChart, s.history, [
+      {key:"vid_fps", label:"수신 FPS", color:"#3fb950", axis:"y"},
+      {key:"vid_err", label:"에러/초", color:"#f85149", axis:"y1"},
+    ]);
+    refreshScalar(corrChart, s.history, [
+      {key:"vid_err", label:"에러/초", color:"#f85149", axis:"y"},
+      {key:"net_rssi", label:"최저 RSSI", color:"#58a6ff", axis:"y1"},
+    ]);
+    const v = s.video;
+    document.getElementById("vidNow").textContent = v
+      ? `현재: FPS ${v.fps ?? "-"} · 에러/초 ${v.err_rate ?? "-"} · drop/초 ${v.drop_rate ?? "-"} · ${v.bitrate_kbps ?? "-"}kbps`
+      : "영상 신호 없음 (video_probe 미실행)";
     const online = s.nodes.filter(n=>n.online).length;
     document.getElementById("status-text").textContent =
       `노드 ${online}/${s.nodes.length} 온라인 · 링크 ${s.edges.length}개 · ${new Date(s.updated*1000).toLocaleTimeString("ko-KR",{hour12:false})}`;
