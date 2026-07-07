@@ -3,7 +3,9 @@
 
 import argparse
 import json
+import os
 import socket
+import subprocess
 import time
 
 try:
@@ -12,11 +14,57 @@ except ImportError:
     from motor_driver import build_robot_controller
 
 
+def handle_camera_command(role: str, command: str, message: dict) -> bool:
+    normalized = command.strip().lower().replace("-", "_").replace(" ", "_")
+    if not (normalized == "camera_profile" or normalized.startswith("camera_profile_")):
+        return False
+
+    if role != "head":
+        print(f"[{role}] camera profile command ignored; camera is controlled by head")
+        return True
+
+    profile = message.get("profile")
+    if profile is None and normalized.startswith("camera_profile_"):
+        profile = normalized.rsplit("_", 1)[1]
+    if profile is None:
+        profile = 0
+
+    profile = str(profile)
+    allowed_profiles = {"custom", "0", "1", "2", "3", "high", "medium", "low", "survival"}
+    if profile not in allowed_profiles:
+        print(f"[{role}] invalid camera profile: {profile}")
+        return True
+
+    dest_ip = str(message.get("dest_ip", "192.168.60.2"))
+    dest_port = str(message.get("dest_port", "5600"))
+    transport = str(message.get("transport", os.environ.get("CAMERA_TRANSPORT", "rtp")))
+    if transport not in {"rtp", "raw"}:
+        print(f"[{role}] invalid camera transport: {transport}")
+        return True
+
+    script = os.environ.get(
+        "HANSEL_CAMERA_RESTART_SCRIPT",
+        "/home/hansel/HANSEL_MESH/scripts/restart_camera_profile.sh",
+    )
+
+    if not os.path.exists(script):
+        print(f"[{role}] camera restart script not found: {script}")
+        return True
+
+    print(f"[{role}] restarting camera profile={profile} transport={transport} dest={dest_ip}:{dest_port}")
+    env = os.environ.copy()
+    env["CAMERA_TRANSPORT"] = transport
+    subprocess.Popen(["bash", script, profile, dest_ip, dest_port], env=env)
+    return True
+
+
 def apply_command(controller, role: str, command: str, message: dict) -> None:
     print(
         f"[{role}] apply command={command} seq={message.get('seq')} "
         f"source={message.get('source', 'unknown')}"
     )
+    if handle_camera_command(role, command, message):
+        return
     controller.handle_command(command, message)
 
 
@@ -79,7 +127,7 @@ def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Receive end-to-end UDP control over BATMAN mesh.")
-    parser.add_argument("--role", required=True, help="head, node1, or node2")
+    parser.add_argument("--role", required=True, help="head, node1, node2, or node3")
     parser.add_argument("--host", default="0.0.0.0", help="bind address")
     parser.add_argument("--port", type=int, default=7000, help="UDP control port")
     parser.add_argument("--timeout", type=float, default=0.5, help="seconds before automatic stop")

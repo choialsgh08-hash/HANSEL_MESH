@@ -6,6 +6,98 @@
 <title>HANSEL_MESH 모니터</title>
 <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script>
+// Offline fallbacks for field tests where the laptop has no internet.
+// The normal dashboard uses vis-network + Chart.js from CDN. If they fail to
+// load, these tiny replacements keep topology, tables, and trend charts usable.
+(function(){
+  if(!window.vis){
+    class MiniDataSet{
+      constructor(){ this.items = new Map(); this.listeners = []; }
+      add(item){ this.items.set(item.id, item); this.notify(); }
+      update(item){ this.items.set(item.id, Object.assign({}, this.items.get(item.id)||{}, item)); this.notify(); }
+      remove(id){ this.items.delete(id); this.notify(); }
+      get(id){ return this.items.get(id); }
+      getIds(){ return Array.from(this.items.keys()); }
+      values(){ return Array.from(this.items.values()); }
+      onChange(fn){ this.listeners.push(fn); }
+      notify(){ this.listeners.forEach(fn=>fn()); }
+    }
+    class MiniNetwork{
+      constructor(el, data){
+        this.el = el; this.nodes = data.nodes; this.edges = data.edges;
+        this.nodes.onChange(()=>this.render());
+        this.edges.onChange(()=>this.render());
+        this.render();
+      }
+      render(){
+        const nodes = this.nodes.values();
+        const edges = this.edges.values();
+        const edgeRows = edges.map(e=>`<tr><td>${e.from} ↔ ${e.to}</td><td>${e.label||""}</td></tr>`).join("");
+        const nodeRows = nodes.map(n=>`<span class="mini-node">${n.label||n.id}</span>`).join("");
+        this.el.innerHTML = `<div class="mini-topology">${nodeRows}</div>
+          <table class="mini-edge-table"><tbody>${edgeRows||"<tr><td>링크 없음</td><td></td></tr>"}</tbody></table>`;
+      }
+    }
+    window.vis = {DataSet: MiniDataSet, Network: MiniNetwork};
+  }
+
+  if(!window.Chart){
+    window.Chart = class MiniChart{
+      constructor(canvas, config){
+        this.canvas = canvas;
+        this.ctx = canvas.getContext("2d");
+        this.data = config.data || {labels:[], datasets:[]};
+      }
+      update(){
+        const ctx = this.ctx;
+        const canvas = this.canvas;
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.max(320, Math.floor(rect.width * dpr));
+        canvas.height = Math.max(150, Math.floor(rect.height * dpr));
+        ctx.setTransform(dpr,0,0,dpr,0,0);
+        const w = canvas.width / dpr, h = canvas.height / dpr;
+        ctx.clearRect(0,0,w,h);
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "12px system-ui";
+        if(!this.data.datasets.length){
+          ctx.fillText("데이터 없음", 12, 22);
+          return;
+        }
+        const values = [];
+        this.data.datasets.forEach(ds=>(ds.data||[]).forEach(v=>{ if(v!=null && !Number.isNaN(v)) values.push(Number(v)); }));
+        if(!values.length){
+          ctx.fillText("데이터 대기 중", 12, 22);
+          return;
+        }
+        let min = Math.min(...values), max = Math.max(...values);
+        if(min === max){ min -= 1; max += 1; }
+        const pad = 24, plotW = Math.max(1, w - pad*2), plotH = Math.max(1, h - pad*2);
+        ctx.strokeStyle = "#262c36"; ctx.lineWidth = 1;
+        ctx.strokeRect(pad, pad, plotW, plotH);
+        this.data.datasets.forEach(ds=>{
+          const arr = ds.data || [];
+          ctx.strokeStyle = ds.borderColor || "#58a6ff";
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          let started = false;
+          arr.forEach((raw, i)=>{
+            if(raw == null || Number.isNaN(raw)) return;
+            const x = pad + (arr.length <= 1 ? 0 : (i/(arr.length-1))*plotW);
+            const y = pad + (1 - ((Number(raw)-min)/(max-min))) * plotH;
+            if(!started){ ctx.moveTo(x,y); started = true; } else { ctx.lineTo(x,y); }
+          });
+          ctx.stroke();
+        });
+        ctx.fillStyle = "#8b949e";
+        ctx.fillText(`${max.toFixed(1)}`, 4, pad + 4);
+        ctx.fillText(`${min.toFixed(1)}`, 4, h - pad);
+      }
+    };
+  }
+})();
+</script>
 <style>
   :root { --bg:#0e1116; --panel:#171b22; --line:#262c36; --txt:#e6edf3; --dim:#8b949e; }
   * { box-sizing:border-box; }
@@ -14,19 +106,39 @@
   header h1 { font-size:18px; margin:0; }
   #status { font-size:13px; color:var(--dim); }
   #status .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; margin-right:6px; }
+  .status-cards { display:grid; grid-template-columns:repeat(5,minmax(120px,1fr)); gap:10px; padding:14px 14px 0; }
+  .metric-card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; min-height:86px; }
+  .metric-label { color:var(--dim); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.2px; }
+  .metric-value { font-size:23px; font-weight:700; margin-top:4px; line-height:1.15; }
+  .metric-detail { color:var(--dim); font-size:12px; margin-top:5px; line-height:1.35; word-break:keep-all; }
+  .quality-good { border-color:#2ea043; }
+  .quality-transient { border-color:#d29922; }
+  .quality-warn { border-color:#d29922; }
+  .quality-danger { border-color:#f85149; }
+  .quality-unknown { border-color:#6e7681; }
   .grid { display:grid; grid-template-columns:1.3fr 1fr; gap:14px; padding:14px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
   .panel h2 { font-size:13px; margin:0 0 10px; color:var(--dim); font-weight:600; letter-spacing:.3px; text-transform:uppercase; }
-  #graph { height:420px; border-radius:8px; }
+  #graph { height:520px; min-height:520px; border-radius:8px; overflow:hidden; }
+  #graph canvas { max-height:none; }
   .charts { display:grid; grid-template-rows:1fr 1fr; gap:14px; }
-  canvas { max-height:185px; }
+  .panel > canvas { max-height:185px; }
   .legend { display:flex; gap:14px; font-size:12px; color:var(--dim); margin-top:8px; flex-wrap:wrap; }
   .legend span { display:inline-flex; align-items:center; gap:5px; }
   .legend i { width:18px; height:4px; border-radius:2px; display:inline-block; }
+  .status-legend { color:var(--dim); font-size:12px; margin-top:8px; line-height:1.45; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
   th { color:var(--dim); font-weight:600; }
   .full { grid-column:1 / -1; }
+  .mini-topology { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
+  .mini-node { white-space:pre-line; background:#1f6feb; border:1px solid #58a6ff; border-radius:8px; padding:8px 10px; font-size:12px; }
+  .mini-edge-table { font-size:12px; }
+  @media (max-width: 1100px) {
+    .status-cards { grid-template-columns:repeat(2,minmax(140px,1fr)); }
+    .grid { grid-template-columns:1fr; }
+    .full { grid-column:auto; }
+  }
 </style>
 </head>
 <body>
@@ -34,6 +146,34 @@
   <h1>🐝 HANSEL_MESH 실시간 모니터</h1>
   <span id="status"><span class="dot"></span><span id="status-text">연결 중…</span></span>
 </header>
+
+<section class="status-cards">
+  <div class="metric-card quality-unknown" id="qualityCard">
+    <div class="metric-label">품질 판단</div>
+    <div class="metric-value" id="qualityValue">UNKNOWN</div>
+    <div class="metric-detail" id="qualityReason">샘플 대기 중</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">수신 FPS</div>
+    <div class="metric-value" id="fpsValue">-</div>
+    <div class="metric-detail" id="fpsDetail">목표 대비 -</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Decode Error</div>
+    <div class="metric-value" id="errValue">-</div>
+    <div class="metric-detail" id="errDetail">error/s</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Frame Drop</div>
+    <div class="metric-value" id="dropValue">-</div>
+    <div class="metric-detail" id="dropDetail">drop/s</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">예상 대응</div>
+    <div class="metric-value" id="actionValue">-</div>
+    <div class="metric-detail" id="actionDetail">camera profile / speed cap</div>
+  </div>
+</section>
 
 <div class="grid">
   <div class="panel">
@@ -67,6 +207,12 @@
     <h2>통신 ↔ 영상 상관 (최저 RSSI vs 에러/초)</h2>
     <canvas id="corrChart"></canvas>
     <div class="legend"><span>RSSI가 내려갈 때 에러가 같이 오르면 → 통신이 영상 품질을 좌우</span></div>
+  </div>
+
+  <div class="panel full">
+    <h2>품질 판단 타임라인 (GOOD/WARN/DANGER + bitrate)</h2>
+    <canvas id="qualityChart"></canvas>
+    <div class="status-legend">상태값: 1=GOOD, 2=TRANSIENT, 3=WARN, 4=DANGER. WARN/DANGER는 자동 감속, 카메라 profile 변경, 자동분리 판단과 같은 기준을 사용한다.</div>
   </div>
 
   <div class="panel full">
@@ -114,6 +260,15 @@ function updateGraph(state){
     if(gEdges.get(id)) gEdges.update(item); else gEdges.add(item);
   });
   gEdges.getIds().forEach(id=>{ if(!ekeys.has(id)) gEdges.remove(id); });
+
+  if(network && typeof network.redraw === "function"){
+    requestAnimationFrame(()=>{
+      network.redraw();
+      if(typeof network.fit === "function"){
+        network.fit({animation:false});
+      }
+    });
+  }
 }
 
 // ---- charts ----
@@ -148,6 +303,23 @@ const videoChart = mkDualChart(document.getElementById("videoChart"), "FPS", "�
 // RSSI axis reversed: "worse signal" rises, so it tracks errors when correlated.
 const corrChart = mkDualChart(document.getElementById("corrChart"), "에러/초", "최저 RSSI (나쁨↑)", true);
 
+function mkQualityChart(ctx){
+  return new Chart(ctx, { type:"line", data:{ labels:[], datasets:[] },
+    options:{ animation:false, responsive:true, maintainAspectRatio:false,
+      interaction:{ intersect:false, mode:"index" },
+      scales:{
+        x:{ ticks:{ color:"#8b949e", maxTicksLimit:8 }, grid:{ color:"#262c36" } },
+        y:{ min:0, max:4, position:"left",
+            title:{ display:true, text:"품질 상태", color:"#8b949e" },
+            ticks:{ color:"#8b949e", stepSize:1,
+              callback:v=>({0:"UNKNOWN",1:"GOOD",2:"TRANSIENT",3:"WARN",4:"DANGER"}[v]||v) },
+            grid:{ color:"#262c36" } },
+        y1:{ position:"right", title:{ display:true, text:"kbps", color:"#8b949e" },
+            ticks:{ color:"#8b949e" }, grid:{ drawOnChartArea:false } } },
+      plugins:{ legend:{ labels:{ color:"#adbac7", boxWidth:12 } } } } });
+}
+const qualityChart = mkQualityChart(document.getElementById("qualityChart"));
+
 // Build datasets from scalar history fields (one value per record).
 function timeLabels(history){
   return history.map(r=>{ const d=new Date(r.ts*1000); return d.toLocaleTimeString("ko-KR",{hour12:false}); });
@@ -156,12 +328,38 @@ function scalarSeries(history, specs){
   return specs.map(sp=>({ label:sp.label, yAxisID:sp.axis||"y",
     data:history.map(r=> r[sp.key]!=null ? r[sp.key] : null),
     borderColor:sp.color, backgroundColor:sp.color, tension:0.25,
-    pointRadius:0, borderWidth:2, spanGaps:true }));
+    pointRadius:0, borderWidth:2, spanGaps:true, borderDash:sp.dash||[] }));
 }
 function refreshScalar(chart, history, specs){
   chart.data.labels = timeLabels(history);
   chart.data.datasets = scalarSeries(history, specs);
   chart.update();
+}
+
+function constantSeries(labels, label, value, color, axis){
+  if(value == null) return null;
+  return { label, yAxisID:axis||"y", data:labels.map(()=>value),
+    borderColor:color, backgroundColor:color, borderDash:[6,4],
+    tension:0, pointRadius:0, borderWidth:1, spanGaps:true };
+}
+
+function refreshVideoChart(history, quality){
+  const labels = timeLabels(history);
+  const th = (quality && quality.thresholds) || {};
+  const datasets = scalarSeries(history, [
+    {key:"vid_fps", label:"수신 FPS", color:"#3fb950", axis:"y"},
+    {key:"vid_err", label:"에러/초", color:"#f85149", axis:"y1"},
+    {key:"vid_drop", label:"drop/초", color:"#d29922", axis:"y1"},
+  ]);
+  [
+    constantSeries(labels, "FPS WARN", th.fps_warn, "#d29922", "y"),
+    constantSeries(labels, "FPS DANGER", th.fps_danger, "#f85149", "y"),
+    constantSeries(labels, "ERR DANGER", th.err_danger_rate, "#ff7b72", "y1"),
+    constantSeries(labels, "DROP DANGER", th.drop_danger_rate, "#bc8cff", "y1"),
+  ].forEach(ds=>{ if(ds) datasets.push(ds); });
+  videoChart.data.labels = labels;
+  videoChart.data.datasets = datasets;
+  videoChart.update();
 }
 
 function buildDatasets(history, field){
@@ -193,6 +391,50 @@ function updateTable(edges){
   }).join("");
 }
 
+function fmt(v, digits=1, suffix=""){
+  if(v == null || Number.isNaN(Number(v))) return "-";
+  return Number(v).toFixed(digits).replace(/\.0$/,"") + suffix;
+}
+
+function qualityClass(status){
+  const s = (status || "UNKNOWN").toLowerCase();
+  if(s === "good") return "quality-good";
+  if(s === "transient") return "quality-transient";
+  if(s === "warn") return "quality-warn";
+  if(s === "danger") return "quality-danger";
+  return "quality-unknown";
+}
+
+function updateCards(state){
+  const q = state.quality || {};
+  const v = state.video || {};
+  const th = q.thresholds || {};
+  const status = q.status || "UNKNOWN";
+  const card = document.getElementById("qualityCard");
+  card.className = "metric-card " + qualityClass(status);
+  document.getElementById("qualityValue").textContent = status;
+  document.getElementById("qualityReason").textContent =
+    (q.reasons && q.reasons.length) ? q.reasons.slice(0,3).join(" · ") : "판단 근거 대기";
+
+  const fpsRatio = v.fps_ratio != null ? `${Math.round(v.fps_ratio * 100)}%` : "-";
+  document.getElementById("fpsValue").textContent = fmt(v.fps, 1);
+  document.getElementById("fpsDetail").textContent =
+    `목표 ${fmt(v.target_fps || th.target_fps, 0)}fps 대비 ${fpsRatio}`;
+
+  document.getElementById("errValue").textContent = fmt(v.err_rate, 2);
+  document.getElementById("errDetail").textContent =
+    `WARN>${fmt(th.err_warn_rate, 2)} · DANGER>${fmt(th.err_danger_rate, 2)}`;
+
+  document.getElementById("dropValue").textContent = fmt(v.drop_rate, 2);
+  document.getElementById("dropDetail").textContent =
+    `WARN>${fmt(th.drop_warn_rate, 1)} · DANGER>${fmt(th.drop_danger_rate, 1)}`;
+
+  const profile = q.camera_profile != null ? q.camera_profile : "-";
+  const cap = q.speed_cap == null ? "제한 없음" : `${Math.round(q.speed_cap * 100)}%`;
+  document.getElementById("actionValue").textContent = `P${profile}`;
+  document.getElementById("actionDetail").textContent = `속도 cap ${cap}`;
+}
+
 async function poll(){
   try{
     const r = await fetch("/api/state");
@@ -201,13 +443,15 @@ async function poll(){
     updateTable(s.edges);
     refreshChart(rttChart, s.history, "rtt");
     refreshChart(rssiChart, s.history, "rssi");
-    refreshScalar(videoChart, s.history, [
-      {key:"vid_fps", label:"수신 FPS", color:"#3fb950", axis:"y"},
-      {key:"vid_err", label:"에러/초", color:"#f85149", axis:"y1"},
-    ]);
+    updateCards(s);
+    refreshVideoChart(s.history, s.quality);
     refreshScalar(corrChart, s.history, [
       {key:"vid_err", label:"에러/초", color:"#f85149", axis:"y"},
       {key:"net_rssi", label:"최저 RSSI", color:"#58a6ff", axis:"y1"},
+    ]);
+    refreshScalar(qualityChart, s.history, [
+      {key:"quality_level", label:"품질 상태", color:"#d29922", axis:"y"},
+      {key:"vid_bitrate", label:"bitrate kbps", color:"#58a6ff", axis:"y1"},
     ]);
     const v = s.video;
     document.getElementById("vidNow").textContent = v

@@ -219,13 +219,15 @@ sudo pkill -f libcamera-still
 
 ```bash
 cd ~/Projects/HANSEL_MESH
+CAMERA_TRANSPORT=rtp \
 ./scripts/receive_camera_stream.sh 5600
 ```
 
 Head에서 송신:
 
 ```bash
-rpicam-vid -t 0 --nopreview --width 320 --height 240 --framerate 10 --codec h264 --inline --bitrate 600000 -o udp://192.168.60.2:5600
+CAMERA_TRANSPORT=rtp PROFILE=2 \
+~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
 ```
 
 가까운 거리에서 안정적이면 다음 설정으로 올린다.

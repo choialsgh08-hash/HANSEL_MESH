@@ -488,7 +488,7 @@ Python 표준 라이브러리:
 Raspberry Pi 라이브러리:
 
 - `RPi.GPIO`: motor driver direction pin, PWM, encoder input
-- `pigpio`: head servo pulse width control
+- `pigpio`: head servo와 detach servo의 hardware-timed pulse width control
 
 외부 시스템 도구:
 
@@ -540,12 +540,23 @@ handle_command()
 
 ```text
 receive_camera_stream.sh on laptop
+  -> RTP/H.264 or raw H.264 receiver
   -> ffplay/gstreamer/vlc wait UDP 5600
 
 start_camera_stream.sh on head
   -> rpicam-vid
-  -> H.264 UDP
+  -> H.264 encoder output
+  -> RTP packetizer by GStreamer or ffmpeg
+  -> RTP/H.264 over UDP
   -> 192.168.60.2:5600
+```
+
+현재 기본값은 `CAMERA_TRANSPORT=rtp`다. RTP는 UDP 위에 sequence number, timestamp, payload type을 얹어서 영상 패킷 순서와 손실을 수신 쪽에서 더 잘 판단하게 한다. 조종 명령은 그대로 UDP 7000을 사용하고, 영상은 UDP 5600을 사용하므로 두 흐름은 충돌하지 않는다.
+
+예전 raw UDP 방식으로 되돌릴 때:
+
+```bash
+CAMERA_TRANSPORT=raw ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
 ```
 
 ## 8. BATMAN relay 판단 방법
@@ -632,8 +643,10 @@ HANSEL_RIGHT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server
 낮은 설정으로 시작:
 
 ```bash
-WIDTH=320 HEIGHT=240 FPS=10 BITRATE=600000 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+PROFILE=2 CAMERA_TRANSPORT=rtp ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
 ```
+
+RTP packetizer가 없으면 head에 `ffmpeg` 또는 GStreamer가 필요하다.
 
 ## 10. 참고 자료
 

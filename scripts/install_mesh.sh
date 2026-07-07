@@ -19,7 +19,7 @@ echo "[1/6] Updating apt package index..."
 apt update
 
 echo "[2/6] Installing required packages..."
-apt install -y batctl iw wireless-tools net-tools iproute2 rfkill traceroute
+apt install -y batctl iw wireless-tools net-tools iproute2 rfkill traceroute ffmpeg
 
 echo "[3/6] Enabling batman-adv kernel module at boot..."
 echo "batman-adv" > /etc/modules-load.d/batman-adv.conf
@@ -38,12 +38,15 @@ fi
 echo "[6/6] Checking installed tools..."
 command -v batctl >/dev/null 2>&1 || { echo "[ERROR] batctl not found"; exit 1; }
 command -v iw >/dev/null 2>&1 || { echo "[ERROR] iw not found"; exit 1; }
+test -x "$REPO_ROOT/scripts/start_role_network.sh" || chmod +x "$REPO_ROOT/scripts/start_role_network.sh"
+test -x "$REPO_ROOT/scripts/enable_mesh_autostart.sh" || chmod +x "$REPO_ROOT/scripts/enable_mesh_autostart.sh"
 
 echo "========================================"
 echo " Install complete."
 echo "========================================"
 echo "Next:"
-echo "sudo ./scripts/start_mesh.sh configs/base.env"
-echo "or:"
-echo "sudo systemctl enable hansel-mesh@base"
-echo "sudo systemctl start hansel-mesh@base"
+echo "Manual one-shot:"
+echo "  sudo ./scripts/start_role_network.sh base"
+echo "Autostart once per Pi:"
+echo "  sudo ./scripts/enable_mesh_autostart.sh base"
+echo "  sudo systemctl start hansel-mesh@base"

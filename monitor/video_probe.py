@@ -12,11 +12,12 @@ Each interval it writes one JSON line to a log file and (optionally) sends the
 same stats to the mesh collector (dashboard.py) over UDP :7100, so video
 quality can be charted on the same time axis as RSSI / TQ / RTT.
 
-Run on the laptop (where you currently run receive_camera_stream.sh):
-    python3 monitor/video_probe.py --send 192.168.50.1:7100
+Run on the laptop (RTP/H.264 is the default transport). If dashboard.py is also
+running on the laptop, send samples to localhost:
+    python3 monitor/video_probe.py --transport rtp --send 127.0.0.1:7100
 
 No display (headless measure only):
-    python3 monitor/video_probe.py --no-display --send 192.168.50.1:7100
+    python3 monitor/video_probe.py --no-display --transport rtp --send 127.0.0.1:7100
 """
 
 from __future__ import annotations  # 3.9 compatibility
@@ -24,9 +25,11 @@ from __future__ import annotations  # 3.9 compatibility
 import argparse
 import datetime
 import json
+import os
 import re
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -91,18 +94,57 @@ def feed_progress_line(acc: dict, line: str):
 # ffmpeg runner                                                               #
 # --------------------------------------------------------------------------- #
 
-def build_ffmpeg_cmd(port: int, display: bool) -> list:
+def write_rtp_sdp(port: int, payload_type: int) -> str:
+    fh = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="hansel-camera-rtp-",
+        suffix=".sdp",
+        delete=False,
+        encoding="utf-8",
+    )
+    with fh:
+        fh.write("v=0\n")
+        fh.write("o=- 0 0 IN IP4 127.0.0.1\n")
+        fh.write("s=HANSEL_MESH camera\n")
+        fh.write("c=IN IP4 0.0.0.0\n")
+        fh.write("t=0 0\n")
+        fh.write(f"m=video {port} RTP/AVP {payload_type}\n")
+        fh.write(f"a=rtpmap:{payload_type} H264/90000\n")
+        fh.write(f"a=fmtp:{payload_type} packetization-mode=1\n")
+    return fh.name
+
+
+def build_ffmpeg_cmd(port: int, display: bool, transport: str,
+                     payload_type: int):
+    sdp_path = None
     cmd = [
-        "ffmpeg", "-hide_banner",
-        "-fflags", "nobuffer", "-flags", "low_delay",
-        "-i", f"udp://0.0.0.0:{port}",
-        "-progress", "pipe:1", "-nostats",
+        "ffmpeg",
+        "-hide_banner",
+        "-fflags", "nobuffer+discardcorrupt",
+        "-flags", "low_delay",
+        "-avioflags", "direct",
+        "-analyzeduration", "0",
+        "-probesize", "32",
+        "-max_delay", "0",
     ]
+    if transport == "rtp":
+        sdp_path = write_rtp_sdp(port, payload_type)
+        cmd += [
+            "-protocol_whitelist", "file,udp,rtp",
+            "-reorder_queue_size", "0",
+            "-i", sdp_path,
+        ]
+    elif transport in ("raw", "udp"):
+        cmd += ["-i", f"udp://0.0.0.0:{port}?fifo_size=500000&overrun_nonfatal=1"]
+    else:
+        raise ValueError(f"unknown transport: {transport}")
+
+    cmd += ["-progress", "pipe:1", "-nostats", "-vsync", "passthrough"]
     if display:
         cmd += ["-f", "sdl", "HANSEL_MESH video"]
     else:
         cmd += ["-f", "null", "-"]
-    return cmd
+    return cmd, sdp_path
 
 
 class ErrorCounter:
@@ -184,7 +226,12 @@ def emit(sample: dict, log_fh, sender, collector):
 
 
 def run(args) -> int:
-    cmd = build_ffmpeg_cmd(args.port, display=not args.no_display)
+    cmd, sdp_path = build_ffmpeg_cmd(
+        args.port,
+        display=not args.no_display,
+        transport=args.transport,
+        payload_type=args.rtp_payload_type,
+    )
     print("[video_probe] launching:", " ".join(cmd))
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -219,6 +266,11 @@ def run(args) -> int:
         print("\n[video_probe] stopping")
     finally:
         proc.terminate()
+        if sdp_path:
+            try:
+                os.unlink(sdp_path)
+            except OSError:
+                pass
         if log_fh:
             log_fh.close()
     return 0
@@ -227,6 +279,8 @@ def run(args) -> int:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Measure received video quality.")
     p.add_argument("--port", type=int, default=5600, help="UDP port of the stream")
+    p.add_argument("--transport", choices=("rtp", "raw", "udp"), default="rtp", help="camera transport")
+    p.add_argument("--rtp-payload-type", type=int, default=96, help="dynamic RTP payload type for H.264")
     p.add_argument("--target-fps", type=float, default=15.0, help="expected fps")
     p.add_argument("--send", default=None, help="collector host:port (e.g. 192.168.50.1:7100)")
     p.add_argument("--log", default="video_quality.jsonl", help="JSONL log file")

@@ -94,13 +94,13 @@ cd ~/HANSEL_MESH
 sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2
 ```
 
-Head 고개 서보는 pigpio가 있으면 pigpio를 쓰고, 없으면 RPi.GPIO PWM으로 자동 fallback한다. 더 안정적인 서보 펄스를 쓰려면 pigpio daemon을 켠다.
+Head 고개 서보와 detach 서보는 pigpio가 있으면 pigpio의 hardware-timed PWM을 쓰고, 없으면 `SoftwareServoPwm` fallback으로 20ms servo pulse를 직접 만든다. 더 안정적인 서보 펄스를 쓰려면 pigpio daemon을 켠다.
 
 ```bash
 sudo systemctl enable --now pigpiod
 ```
 
-pigpio가 없어도 주행 모터, detach servo, head 고개 서보 fallback은 계속 동작한다.
+pigpio가 없어도 주행 모터, detach servo, head 고개 서보 fallback은 계속 동작하지만, 정밀도는 pigpio 쪽이 더 좋다.
 
 ## 6. 조종
 
@@ -135,9 +135,12 @@ Live mode 키:
 | k | head servo center |
 | f | head front motor forward |
 | v | head front motor stop |
-| 1 | detach_press, 단 `--target all`에서는 안전상 전송 안 함 |
-| 2 | detach_rest, 단 `--target all`에서는 안전상 전송 안 함 |
+| 1 | head GPIO6 서보 동작, node1 분리 |
+| 2 | node1 GPIO6 서보 동작, node2 분리 |
+| 3 | node2 GPIO6 서보 동작, node3 분리 |
 | Ctrl+C | stop 보내고 종료 |
+
+`1/2/3`을 누르면 먼저 분리될 node에 `relay_hold`를 보내서 주행을 잠그고, 이후 해당 node를 live mode의 `all` 주행 대상에서 제외한다. 분리된 node는 그 자리에 남아 BATMAN relay 역할만 한다.
 
 Line mode도 가능하다.
 
@@ -153,12 +156,18 @@ fl, fr, bl, br
 hu, hd, hc, hmin, hmax
 front, front_stop
 detach, detach_rest
+1, 2, 3
 t head
 t node1
 t node2
+t node3
 t all
 quit
 ```
+
+`detach` 또는 `1/2/3`으로 실행되는 `detach_press`는 press 각도로 이동한 뒤 그 각도를 유지한다. 다시 원위치로 돌리고 싶을 때만 `detach_rest`를 수동으로 보낸다.
+
+분리된 node는 `relay_hold` 상태에서 `forward/backward/slow_forward` 같은 주행 명령을 무시한다. 다시 테스트를 위해 움직이게 하려면 해당 target에 `drive_enable`을 보낸다.
 
 ## 7. 튜닝 환경변수
 
@@ -180,7 +189,7 @@ HANSEL_SPEED_SCALE=0.45 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.
 Node 기본 속도만 낮추기:
 
 ```bash
-HANSEL_NODE_SPEED_SCALE=0.5 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1
+HANSEL_SPEED_SCALE=0.5 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1
 ```
 
 기본값은 head/node 모두 `1.0`이다. 즉 `w`만 누르면 모든 유닛이 같은 목표 CPS로 최대속도를 낸다. Head 조향 중에만 node 쪽 명령이 `slow_forward` 또는 `slow_backward`로 낮아진다.
@@ -190,6 +199,14 @@ HANSEL_NODE_SPEED_SCALE=0.5 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_ser
 ```bash
 HANSEL_FRONT_MOTOR_ENABLED=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
 ```
+
+서보 fallback PWM 튜닝:
+
+```bash
+HANSEL_HEAD_SERVO_STEP_ANGLE=1 HANSEL_HEAD_SERVO_RAMP_STEP_ANGLE=0.5 HANSEL_HEAD_SERVO_RAMP_INTERVAL=0.08 HANSEL_SERVO_SOFT_PWM_SPIN_US=300 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+```
+
+pigpio가 없으면 `SoftwareServoPwm` fallback이 20ms servo frame을 직접 만들고, 마지막 수백 us는 busy wait로 지터를 줄인다. `HANSEL_SERVO_SOFT_PWM_SPIN_US`를 키우면 정밀도는 조금 좋아질 수 있지만 CPU 사용량이 늘어난다. pigpio가 정상 연결되면 이 fallback은 쓰지 않는다.
 
 PID 튜닝:
 

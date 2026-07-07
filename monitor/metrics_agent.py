@@ -10,9 +10,9 @@ Designed to be testable WITHOUT hardware: pass --sample <dir> to parse captured
 command output (station.txt, batctl_o.txt, batctl_n.txt, ip_neigh.txt) instead
 of running the real commands. This lets you validate parsing on any machine.
 
-Typical use on a Pi:
+Typical use on a Pi when dashboard.py runs on the operator laptop:
     python3 monitor/metrics_agent.py --self node1 --loop --interval 5 \
-        --send 192.168.50.1:7100
+        --send 192.168.60.2:7100
 """
 
 from __future__ import annotations  # 3.9(Bullseye) 호환: str | None 같은 표기 지원
@@ -277,7 +277,10 @@ def emit(snapshot: dict, send_to: str | None) -> None:
         host, _, port = send_to.partition(":")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.sendto(payload.encode("utf-8"), (host, int(port)))
+            try:
+                sock.sendto(payload.encode("utf-8"), (host, int(port)))
+            except OSError as exc:
+                print(f"[warn] send failed to {send_to}: {exc}", file=sys.stderr)
         finally:
             sock.close()
 

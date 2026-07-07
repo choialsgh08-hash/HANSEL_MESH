@@ -71,6 +71,9 @@ test -f robot/motor_driver.py
 test -f robot/mesh_control_server.py
 test -f controller/mesh_control_client.py
 test -f scripts/start_camera_stream.sh
+test -f scripts/restart_camera_profile.sh
+test -f scripts/start_role_network.sh
+test -f scripts/enable_mesh_autostart.sh
 test -d monitor
 
 RSYNC_FLAGS="-rz --delete --no-times --no-perms --no-owner --no-group --omit-dir-times"
@@ -85,6 +88,9 @@ EXCLUDES=(
     "--exclude=.pytest_cache/"
     "--exclude=.mypy_cache/"
     "--exclude=.ruff_cache/"
+    "--exclude=/logs/"
+    "--exclude=/.lgd-*"
+    "--exclude=/video_quality.jsonl"
 )
 
 echo "[4/4] Deploying repo snapshot to mesh targets..."

@@ -108,16 +108,20 @@ python3 ~/Projects/HANSEL_MESH/controller/mesh_control_client.py --target head
 노트북에서 수신:
 
 ```bash
+CAMERA_TRANSPORT=rtp \
 ./scripts/receive_camera_stream.sh 5600
 ```
 
 Head에서 송신:
 
 ```bash
+CAMERA_TRANSPORT=rtp PROFILE=0 \
 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
 ```
 
-초기 설정은 `640x480`, `15fps`, H.264 UDP다.
+초기 설정은 `640x480`, `15fps`, RTP/H.264 over UDP다.
+
+예전 raw UDP 방식이 필요하면 head와 노트북 양쪽에 `CAMERA_TRANSPORT=raw`를 붙인다.
 
 ## 6. 확인
 

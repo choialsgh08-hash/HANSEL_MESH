@@ -124,7 +124,7 @@ Mesh 시작 후 `wlan0`에는 IP가 없어야 하고, `bat0`에만 `192.168.50.x
 수동 시작이 확인되면 역할별 systemd instance를 켠다.
 
 ```bash
-sudo systemctl enable hansel-mesh@base
+sudo ./scripts/enable_mesh_autostart.sh base
 sudo systemctl start hansel-mesh@base
 ```
 
@@ -136,6 +136,8 @@ sudo systemctl start hansel-mesh@base
 sudo systemctl status hansel-mesh@base
 journalctl -u hansel-mesh@base -n 80 --no-pager
 ```
+
+자동 실행은 mesh 시작 후 role별 route까지 처리한다. base는 `setup_base_gateway.sh`, head/node는 `setup_mesh_route_to_laptop.sh`까지 자동 실행된다.
 
 ## 8. Day1 확인
 

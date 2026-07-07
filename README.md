@@ -28,19 +28,19 @@ Head Pi / Robot
 ```bash
 chmod +x scripts/*.sh
 sudo ./scripts/install_mesh.sh
-sudo ./scripts/start_mesh.sh configs/base.env
+sudo ./scripts/start_role_network.sh base
 ```
 
-장치별로 configs/*.env만 바꿔서 실행합니다.
+장치별로 `base`만 `head`, `node1`, `node2`로 바꿔서 실행합니다.
 
 ## 자동 실행
 
 ```bash
-sudo systemctl enable hansel-mesh@base
+sudo ./scripts/enable_mesh_autostart.sh base
 sudo systemctl start hansel-mesh@base
 ```
 
-다른 장치는 `base`를 `head`, `node1`, `node2`로 바꿔서 사용합니다.
+다른 장치는 `base`를 `head`, `node1`, `node2`로 바꿔서 사용합니다. 자세한 절차는 [Mesh Autostart Runbook](docs/mesh_autostart_runbook.md)을 따른다.
 
 ## 상태 확인
 

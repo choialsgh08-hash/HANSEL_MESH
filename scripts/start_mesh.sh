@@ -35,6 +35,9 @@ source "$CONFIG_FILE"
 MESH_MODE="${MESH_MODE:-auto}"
 IBSS_BSSID="${IBSS_BSSID:-02:12:34:56:78:9a}"
 REQUIRE_IBSS_BSSID_MATCH="${REQUIRE_IBSS_BSSID_MATCH:-no}"
+WIFI_POWER_SAVE="${WIFI_POWER_SAVE:-off}"
+BATMAN_HOP_PENALTY="${BATMAN_HOP_PENALTY:-}"
+BATMAN_ORIG_INTERVAL="${BATMAN_ORIG_INTERVAL:-}"
 
 if [ -z "$NODE_NAME" ] || [ -z "$MESH_IF" ] || [ -z "$BAT_IF" ] || [ -z "$MESH_ID" ] || [ -z "$MESH_FREQ" ] || [ -z "$IP_ADDR" ] || [ -z "$NETMASK_CIDR" ]; then
     echo "[ERROR] Config file has missing required variables."
@@ -85,6 +88,7 @@ freq_to_channel() {
 show_wireless_state() {
     iw dev "$MESH_IF" info 2>/dev/null || true
     iwconfig "$MESH_IF" 2>/dev/null || true
+    iw dev "$MESH_IF" get power_save 2>/dev/null || true
 }
 
 ibss_joined() {
@@ -157,6 +161,43 @@ start_ibss() {
     show_wireless_state
 }
 
+set_wifi_power_save() {
+    case "$WIFI_POWER_SAVE" in
+        off|on)
+            echo "[INFO] Setting Wi-Fi power_save $WIFI_POWER_SAVE on $MESH_IF..."
+            iw dev "$MESH_IF" set power_save "$WIFI_POWER_SAVE" 2>/dev/null || {
+                echo "[WARN] Could not set Wi-Fi power_save $WIFI_POWER_SAVE."
+            }
+            ;;
+        keep|"")
+            echo "[INFO] Keeping current Wi-Fi power_save setting."
+            ;;
+        *)
+            echo "[WARN] Unknown WIFI_POWER_SAVE=$WIFI_POWER_SAVE; keeping current setting."
+            ;;
+    esac
+}
+
+apply_batman_tuning() {
+    if [ -n "$BATMAN_HOP_PENALTY" ]; then
+        if [ -w "/sys/class/net/$BAT_IF/mesh/hop_penalty" ]; then
+            echo "[INFO] Setting BATMAN hop_penalty=$BATMAN_HOP_PENALTY..."
+            printf "%s" "$BATMAN_HOP_PENALTY" > "/sys/class/net/$BAT_IF/mesh/hop_penalty"
+        else
+            echo "[WARN] Cannot write BATMAN hop_penalty for $BAT_IF."
+        fi
+    fi
+
+    if [ -n "$BATMAN_ORIG_INTERVAL" ]; then
+        if [ -w "/sys/class/net/$BAT_IF/mesh/orig_interval" ]; then
+            echo "[INFO] Setting BATMAN orig_interval=$BATMAN_ORIG_INTERVAL ms..."
+            printf "%s" "$BATMAN_ORIG_INTERVAL" > "/sys/class/net/$BAT_IF/mesh/orig_interval"
+        else
+            echo "[WARN] Cannot write BATMAN orig_interval for $BAT_IF."
+        fi
+    fi
+}
+
 echo "[INFO] Node name : $NODE_NAME"
 echo "[INFO] Mesh IF   : $MESH_IF"
 echo "[INFO] BAT IF    : $BAT_IF"
@@ -165,6 +206,9 @@ echo "[INFO] Mesh freq : $MESH_FREQ"
 echo "[INFO] Mesh mode : $MESH_MODE"
 echo "[INFO] IBSS BSSID: $IBSS_BSSID"
 echo "[INFO] Require BSSID match: $REQUIRE_IBSS_BSSID_MATCH"
+echo "[INFO] Wi-Fi power save: $WIFI_POWER_SAVE"
+echo "[INFO] BATMAN hop penalty: ${BATMAN_HOP_PENALTY:-kernel default}"
+echo "[INFO] BATMAN orig interval: ${BATMAN_ORIG_INTERVAL:-kernel default}"
 echo "[INFO] IP addr   : $IP_ADDR/$NETMASK_CIDR"
 
 if ! ip link show "$MESH_IF" >/dev/null 2>&1; then
@@ -228,13 +272,13 @@ if [ "$HAS_MESH_POINT" = "no" ] && [ "$HAS_IBSS" = "no" ]; then
     exit 1
 fi
 
-echo "[1/10] Unblocking Wi-Fi..."
+echo "[1/12] Unblocking Wi-Fi..."
 rfkill unblock wifi || true
 
-echo "[2/10] Loading batman-adv..."
+echo "[2/12] Loading batman-adv..."
 modprobe batman-adv
 
-echo "[3/10] Releasing Wi-Fi from AP/client managers if possible..."
+echo "[3/12] Releasing Wi-Fi from AP/client managers if possible..."
 systemctl stop hostapd 2>/dev/null || true
 systemctl stop dnsmasq 2>/dev/null || true
 systemctl stop "wpa_supplicant@$MESH_IF" 2>/dev/null || true
@@ -243,7 +287,7 @@ if command -v nmcli >/dev/null 2>&1; then
     nmcli dev set "$MESH_IF" managed no 2>/dev/null || true
 fi
 
-echo "[4/10] Cleaning old BATMAN interface..."
+echo "[4/12] Cleaning old BATMAN interface..."
 if ip link show "$BAT_IF" >/dev/null 2>&1; then
     ip link set "$BAT_IF" down || true
     ip link delete "$BAT_IF" type batadv || true
@@ -251,7 +295,7 @@ fi
 
 ACTIVE_MODE=""
 
-echo "[5/10] Selecting wireless mesh mode..."
+echo "[5/12] Selecting wireless mesh mode..."
 case "$MESH_MODE" in
     auto)
         if [ "$HAS_MESH_POINT" = "yes" ]; then
@@ -288,23 +332,35 @@ case "$MESH_MODE" in
         ;;
 esac
 
-echo "[6/10] Wireless mode active: $ACTIVE_MODE"
+echo "[6/12] Wireless mode active: $ACTIVE_MODE"
 ip link set "$MESH_IF" up || true
+set_wifi_power_save
 show_wireless_state
 
-echo "[7/10] Creating BATMAN interface..."
+echo "[7/12] Creating BATMAN interface..."
 ip link add name "$BAT_IF" type batadv
 
-echo "[8/10] Adding mesh interface to BATMAN..."
+echo "[8/12] Adding mesh interface to BATMAN..."
 batctl if add "$MESH_IF"
 
-echo "[9/10] Assigning IP to BATMAN interface..."
+echo "[9/12] Assigning IP to BATMAN interface..."
 ip link set up dev "$BAT_IF"
 ip addr flush dev "$BAT_IF"
 ip addr add "$IP_ADDR/$NETMASK_CIDR" dev "$BAT_IF"
 
-echo "[10/10] Verifying BATMAN interface..."
+echo "[10/12] Applying BATMAN tuning..."
+apply_batman_tuning
+
+echo "[11/12] Verifying BATMAN interface..."
 ip addr show "$BAT_IF"
+
+echo "[12/12] BATMAN mesh settings..."
+for setting in hop_penalty orig_interval; do
+    if [ -r "/sys/class/net/$BAT_IF/mesh/$setting" ]; then
+        printf "%s=" "$setting"
+        cat "/sys/class/net/$BAT_IF/mesh/$setting"
+    fi
+done
 MESH_STARTED="yes"
 
 echo "========================================"

@@ -220,7 +220,7 @@ sudo pkill -f Node3_control.py
 sudo pkill -f mesh_control_server.py
 ```
 
-head 고개 서보는 pigpio가 있으면 pigpio를 쓰고, 없으면 RPi.GPIO PWM으로 자동 fallback한다. 더 안정적인 서보 펄스를 쓰려면 head에서:
+head 고개 서보와 detach 서보는 pigpio가 있으면 pigpio의 hardware-timed PWM을 쓰고, 없으면 `SoftwareServoPwm` fallback을 쓴다. 더 안정적인 서보 펄스를 쓰려면 head에서:
 
 ```bash
 sudo systemctl enable --now pigpiod
@@ -315,8 +315,9 @@ python3 controller/mesh_control_client.py --target all --speed 0.4 --live
 | u | head servo up |
 | j | head servo down |
 | k | head servo center |
-| 1 | detach_press, target all에서는 안전상 전송 안 함 |
-| 2 | detach_rest, target all에서는 안전상 전송 안 함 |
+| 1 | head GPIO6 서보 동작, node1 분리 |
+| 2 | node1 GPIO6 서보 동작, node2 분리 |
+| 3 | node2 GPIO6 서보 동작, node3 분리 |
 | Ctrl+C | stop 보내고 종료 |
 
 현재 기본값은 `w`가 물리 전진, `s`가 물리 후진이 되도록 주행 모터 방향을 reverse 처리한다. 특정 모터가 다시 반대로 돌면 서버 실행 전 환경변수로 보정:
@@ -338,6 +339,7 @@ python3 controller/mesh_control_client.py --target all --live
 
 ```bash
 cd ~/Projects/HANSEL_MESH
+CAMERA_TRANSPORT=rtp \
 ./scripts/receive_camera_stream.sh 5600
 ```
 
@@ -356,13 +358,13 @@ head에서 저대역폭 송신:
 
 ```bash
 cd ~/HANSEL_MESH
-WIDTH=320 HEIGHT=240 FPS=10 BITRATE=600000 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+CAMERA_TRANSPORT=rtp PROFILE=2 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
 ```
 
 가까운 거리에서 안정적이면:
 
 ```bash
-WIDTH=640 HEIGHT=480 FPS=15 BITRATE=1200000 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+CAMERA_TRANSPORT=rtp PROFILE=0 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
 ```
 
 카메라 단독 확인:

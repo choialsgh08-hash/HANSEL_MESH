@@ -11,9 +11,10 @@ Runs on Base (or the operator laptop). Three threads:
 The frontend merges every node's *direct* links into one mesh topology graph
 (edges carry RSSI + BATMAN TQ) and plots RTT / RSSI over time.
 
-No third-party packages required (stdlib only). The chart/graph libraries load
-from a CDN, so the dashboard machine needs internet for the page assets; the
-metrics data itself is fully local.
+No Python third-party packages are required (stdlib only). The normal chart /
+graph libraries load from a CDN when internet is available, and the web page has
+small built-in fallbacks so field tests still show basic topology and trends
+when the laptop is offline.
 
 Run it now without any hardware:
     python monitor/dashboard.py --demo
@@ -28,6 +29,7 @@ import json
 import os
 import random
 import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -37,6 +39,15 @@ from metrics_agent import NODES, build_snapshot
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+try:
+    from controller.quality_supervisor import QualityConfig, score_quality
+except ImportError:
+    QualityConfig = None
+    score_quality = None
 
 # Shared state, guarded by LOCK.
 LOCK = threading.Lock()
@@ -44,6 +55,14 @@ LATEST: dict = {}                 # node_name -> {"snap": snapshot, "recv": ts}
 VIDEO: dict = {}                  # {"stats": <sample>, "recv": ts} from video_probe
 HISTORY: deque = deque(maxlen=180)  # merged records for the charts
 NODE_TIMEOUT_S = 12.0             # mark a node offline after this much silence
+
+QUALITY_LEVELS = {
+    "UNKNOWN": 0,
+    "GOOD": 1,
+    "TRANSIENT": 2,
+    "WARN": 3,
+    "DANGER": 4,
+}
 
 
 def _edge_key(a: str, b: str) -> str:
@@ -62,6 +81,90 @@ def ingest_video(stats: dict, now: float) -> None:
     with LOCK:
         VIDEO["stats"] = stats
         VIDEO["recv"] = now
+
+
+def _quality_from_status(status: str):
+    if status == "WARN":
+        return 0.35, 1
+    if status == "DANGER":
+        return 0.0, 2
+    return None, 0
+
+
+def _worst_ping(e2e: dict) -> dict:
+    losses = []
+    rtts = []
+    for stats in e2e.values():
+        if stats.get("loss_pct") is not None:
+            losses.append(float(stats["loss_pct"]))
+        if stats.get("rtt_avg_ms") is not None:
+            rtts.append(float(stats["rtt_avg_ms"]))
+
+    out = {}
+    if losses:
+        out["loss_pct"] = max(losses)
+    if rtts:
+        out["rtt_avg_ms"] = max(rtts)
+    return out
+
+
+def _quality_thresholds(target_fps: float) -> dict:
+    cfg = QualityConfig(target_fps=target_fps) if QualityConfig else None
+    fps_warn_ratio = cfg.fps_warn_ratio if cfg else 0.85
+    fps_danger_ratio = cfg.fps_danger_ratio if cfg else 0.60
+    err_warn_rate = cfg.err_warn_rate if cfg else 0.20
+    err_danger_rate = cfg.err_danger_rate if cfg else 1.00
+    drop_warn_rate = cfg.drop_warn_rate if cfg else 1.00
+    drop_danger_rate = cfg.drop_danger_rate if cfg else 3.00
+    rtt_warn_ms = cfg.rtt_warn_ms if cfg else 120.0
+    rtt_danger_ms = cfg.rtt_danger_ms if cfg else 180.0
+    tq_warn = cfg.tq_warn if cfg else 200
+    tq_danger = cfg.tq_danger if cfg else 180
+    return {
+        "target_fps": target_fps,
+        "fps_warn": round(target_fps * fps_warn_ratio, 2),
+        "fps_danger": round(target_fps * fps_danger_ratio, 2),
+        "err_warn_rate": err_warn_rate,
+        "err_danger_rate": err_danger_rate,
+        "drop_warn_rate": drop_warn_rate,
+        "drop_danger_rate": drop_danger_rate,
+        "rtt_warn_ms": rtt_warn_ms,
+        "rtt_danger_ms": rtt_danger_ms,
+        "tq_warn": tq_warn,
+        "tq_danger": tq_danger,
+    }
+
+
+def evaluate_quality(video, e2e: dict, edges: list, now: float) -> dict:
+    """Mirror the controller's video-first quality judgment for the dashboard."""
+    video = video or {}
+    target_fps = float(video.get("target_fps") or 15.0)
+    thresholds = _quality_thresholds(target_fps)
+    ping = _worst_ping(e2e)
+    edge_tqs = [int(e["tq"]) for e in edges if e.get("tq") is not None]
+    batman = {"selected_tq_min": min(edge_tqs)} if edge_tqs else {}
+
+    if score_quality and QualityConfig:
+        cfg = QualityConfig(target_fps=target_fps)
+        raw_status, reasons = score_quality(video, ping, batman, cfg, now)
+    else:
+        raw_status = "UNKNOWN" if not video else "GOOD"
+        reasons = ["quality_supervisor unavailable"] if not video else ["healthy"]
+
+    speed_cap, camera_profile = _quality_from_status(raw_status)
+    sample_ts = float(video.get("ts") or 0.0)
+    video_age_s = round(now - sample_ts, 2) if sample_ts else None
+    return {
+        "status": raw_status,
+        "level": QUALITY_LEVELS.get(raw_status, 0),
+        "speed_cap": speed_cap,
+        "camera_profile": camera_profile,
+        "reasons": reasons,
+        "video_age_s": video_age_s,
+        "ping": ping,
+        "batman": batman,
+        "thresholds": thresholds,
+    }
 
 
 def merge_state(now: float) -> dict:
@@ -120,8 +223,11 @@ def merge_state(now: float) -> dict:
         video = dict(VIDEO.get("stats") or {}) if (
             VIDEO.get("recv") and (now - VIDEO["recv"]) < NODE_TIMEOUT_S) else None
 
+    quality = evaluate_quality(video, e2e, edges, now)
+
     return {"nodes": nodes, "edges": edges, "e2e": e2e,
-            "video": video, "net_rssi_worst": net_rssi_worst}
+            "video": video, "quality": quality,
+            "net_rssi_worst": net_rssi_worst}
 
 
 def sampler_loop(interval: float, log_path: str = None) -> None:
@@ -137,6 +243,7 @@ def sampler_loop(interval: float, log_path: str = None) -> None:
         now = time.time()
         state = merge_state(now)
         vid = state.get("video") or {}
+        quality = state.get("quality") or {}
         rec = {
             "ts": round(now, 1),
             # Human-readable receive time (local clock of the collector).
@@ -149,9 +256,13 @@ def sampler_loop(interval: float, log_path: str = None) -> None:
                     for k, v in state["e2e"].items() if "rtt_avg_ms" in v},
             # Video quality + the network scalar, on the same time axis.
             "vid_fps": vid.get("fps"),
+            "vid_fps_ratio": vid.get("fps_ratio"),
             "vid_err": vid.get("err_rate"),
             "vid_drop": vid.get("drop_rate"),
+            "vid_bitrate": vid.get("bitrate_kbps"),
             "net_rssi": state.get("net_rssi_worst"),
+            "quality_level": quality.get("level"),
+            "quality_status": quality.get("status"),
         }
         with LOCK:
             HISTORY.append(rec)

@@ -28,6 +28,41 @@ DO_LOG=0
 CSV=""
 REPORT_DIR="report"
 DECODER="auto"
+CAMERA_TRANSPORT="${CAMERA_TRANSPORT:-rtp}"
+RTP_PAYLOAD_TYPE="${RTP_PAYLOAD_TYPE:-96}"
+RTP_LATENCY_MS="${RTP_LATENCY_MS:-80}"
+SDP_FILE=""
+
+cleanup() {
+    if [[ -n "$SDP_FILE" && -f "$SDP_FILE" ]]; then
+        rm -f "$SDP_FILE"
+    fi
+}
+
+make_rtp_sdp() {
+    SDP_FILE="$(mktemp /tmp/hansel-camera-rtp-XXXXXX.sdp)"
+    {
+        printf "v=0\n"
+        printf "o=- 0 0 IN IP4 127.0.0.1\n"
+        printf "s=HANSEL_MESH camera\n"
+        printf "c=IN IP4 0.0.0.0\n"
+        printf "t=0 0\n"
+        printf "m=video %s RTP/AVP %s\n" "$PORT" "$RTP_PAYLOAD_TYPE"
+        printf "a=rtpmap:%s H264/90000\n" "$RTP_PAYLOAD_TYPE"
+        printf "a=fmtp:%s packetization-mode=1\n" "$RTP_PAYLOAD_TYPE"
+    } > "$SDP_FILE"
+}
+
+ffmpeg_input_args() {
+    if [[ "$CAMERA_TRANSPORT" == "rtp" ]]; then
+        make_rtp_sdp
+        printf '%s\n' -protocol_whitelist file,udp,rtp -i "$SDP_FILE"
+    else
+        printf '%s\n' -i "udp://0.0.0.0:$PORT"
+    fi
+}
+
+trap cleanup EXIT INT TERM
 
 # 첫 인자가 숫자면 PORT 로 해석
 if [[ "${1:-}" =~ ^[0-9]+$ ]]; then PORT="$1"; shift; fi
@@ -43,6 +78,7 @@ done
 
 echo "========================================"
 echo " HANSEL_MESH camera receiver"
+echo " transport: $CAMERA_TRANSPORT"
 echo " UDP port : $PORT"
 echo " logging  : $([[ $DO_LOG -eq 1 ]] && echo on || echo off)"
 echo "========================================"
@@ -52,14 +88,30 @@ echo "========================================"
 # ---------------------------------------------------------------------------
 if [[ "$DO_LOG" -eq 0 ]]; then
     if command -v ffplay >/dev/null 2>&1; then
+        if [[ "$CAMERA_TRANSPORT" == "rtp" ]]; then
+            make_rtp_sdp
+            ffplay -protocol_whitelist file,udp,rtp -fflags nobuffer -flags low_delay -framedrop "$SDP_FILE"
+            exit "$?"
+        fi
         exec ffplay -fflags nobuffer -flags low_delay -framedrop "udp://0.0.0.0:$PORT"
     fi
     if command -v gst-launch-1.0 >/dev/null 2>&1; then
+        if [[ "$CAMERA_TRANSPORT" == "rtp" ]]; then
+            exec gst-launch-1.0 -v \
+                udpsrc port="$PORT" caps="application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)$RTP_PAYLOAD_TYPE" \
+                ! rtpjitterbuffer latency="$RTP_LATENCY_MS" drop-on-latency=true \
+                ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
+        fi
         exec gst-launch-1.0 -v \
             udpsrc port="$PORT" caps="application/x-h264,stream-format=(string)byte-stream,alignment=(string)au" \
             ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
     fi
     if command -v vlc >/dev/null 2>&1; then
+        if [[ "$CAMERA_TRANSPORT" == "rtp" ]]; then
+            make_rtp_sdp
+            vlc "$SDP_FILE"
+            exit "$?"
+        fi
         exec vlc "udp/h264://@:$PORT"
     fi
     echo "[ERROR] Need one receiver: ffplay, gst-launch-1.0, or vlc."
@@ -82,10 +134,18 @@ echo "========================================"
 
 # gstreamer: 표시(fpsdisplaysink) + 측정. -v 의 last-message 에서 current/average 파싱
 log_from_gst() {
-    gst-launch-1.0 -e -v \
-        udpsrc port="$PORT" caps="application/x-h264,stream-format=(string)byte-stream,alignment=(string)au" \
-        ! h264parse ! avdec_h264 ! videoconvert \
-        ! fpsdisplaysink sync=false fps-update-interval=1000 2>&1 \
+    if [[ "$CAMERA_TRANSPORT" == "rtp" ]]; then
+        gst-launch-1.0 -e -v \
+            udpsrc port="$PORT" caps="application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)$RTP_PAYLOAD_TYPE" \
+            ! rtpjitterbuffer latency="$RTP_LATENCY_MS" drop-on-latency=true \
+            ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert \
+            ! fpsdisplaysink sync=false fps-update-interval=1000 2>&1
+    else
+        gst-launch-1.0 -e -v \
+            udpsrc port="$PORT" caps="application/x-h264,stream-format=(string)byte-stream,alignment=(string)au" \
+            ! h264parse ! avdec_h264 ! videoconvert \
+            ! fpsdisplaysink sync=false fps-update-interval=1000 2>&1
+    fi \
     | while IFS= read -r line; do
         case "$line" in
             *current:*)
@@ -104,8 +164,9 @@ log_from_gst() {
 
 # ffmpeg: sdl2 창으로 표시 + -progress 로 fps 출력(개행 구분이라 파싱 안정)
 log_from_ffmpeg() {
+    mapfile -t INPUT_ARGS < <(ffmpeg_input_args)
     ffmpeg -hide_banner -nostats -fflags nobuffer -flags low_delay \
-        -i "udp://0.0.0.0:$PORT" -an \
+        "${INPUT_ARGS[@]}" -an \
         -f sdl2 "HANSEL camera :$PORT" \
         -progress pipe:1 2>/dev/null \
     | while IFS= read -r line; do
