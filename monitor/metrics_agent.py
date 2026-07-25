@@ -18,6 +18,7 @@ Typical use on a Pi when dashboard.py runs on the operator laptop:
 from __future__ import annotations  # 3.9(Bullseye) 호환: str | None 같은 표기 지원
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import re
 import socket
@@ -177,7 +178,8 @@ def ip_to_node(ip: str) -> str:
 # --------------------------------------------------------------------------- #
 
 def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
-                   ping_targets: dict, timestamp: float) -> dict:
+                   ping_targets: dict, timestamp: float,
+                   bat_if: str = "bat0") -> dict:
     """Combine parsed command outputs into one snapshot dict.
 
     links_text: {"station": ..., "batctl_o": ..., "batctl_n": ..., "ip_neigh": ...}
@@ -217,30 +219,59 @@ def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
     return {
         "node": self_name,
         "mesh_if": mesh_if,
+        "bat_if": bat_if,
         "ts": round(timestamp, 3),
         "links": links,
         "end_to_end": e2e,
     }
 
 
-def collect_real(self_name: str, mesh_if: str, ping_list: list,
+def collect_real(self_name: str, mesh_if: str, bat_if: str, ping_list: list,
                  timestamp: float) -> dict:
-    links_text = {
-        "station": _run(["iw", "dev", mesh_if, "station", "dump"]),
-        "batctl_o": _run(["batctl", "o"]),
-        "batctl_n": _run(["batctl", "n"]),
-        "ip_neigh": _run(["ip", "neigh", "show", "dev", "bat0"]),
+    link_commands = {
+        "station": ["iw", "dev", mesh_if, "station", "dump"],
+        "batctl_o": ["batctl", "-m", bat_if, "o"],
+        "batctl_n": ["batctl", "-m", bat_if, "n"],
+        "ip_neigh": ["ip", "neigh", "show", "dev", bat_if],
     }
-    ping_targets = {}
+    ping_commands = {}
     for name in ping_list:
         ip = NODES.get(name)
-        if not ip:
-            continue
-        ping_targets[name] = _run(["ping", "-c", "3", "-W", "1", ip])
-    return build_snapshot(self_name, mesh_if, links_text, ping_targets, timestamp)
+        if ip:
+            ping_commands[name] = ["ping", "-c", "3", "-W", "1", ip]
+
+    # Sequential three-packet pings to five nodes can make a nominal five
+    # second agent report only every ~15 seconds. The dashboard marks nodes
+    # offline after 12 seconds, so collect independent commands concurrently.
+    links_text = {}
+    ping_targets = {}
+    jobs = {}
+    worker_count = min(8, len(link_commands) + len(ping_commands))
+    with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
+        for name, command in link_commands.items():
+            jobs[executor.submit(_run, command)] = ("link", name)
+        for name, command in ping_commands.items():
+            jobs[executor.submit(_run, command)] = ("ping", name)
+        for future in as_completed(jobs):
+            kind, name = jobs[future]
+            output = future.result()
+            if kind == "link":
+                links_text[name] = output
+            else:
+                ping_targets[name] = output
+
+    return build_snapshot(
+        self_name,
+        mesh_if,
+        links_text,
+        ping_targets,
+        timestamp,
+        bat_if=bat_if,
+    )
 
 
 def collect_sample(sample_dir: str, self_name: str, mesh_if: str,
+                   bat_if: str,
                    timestamp: float) -> dict:
     """Read captured command output from a directory (no hardware needed)."""
     import os
@@ -263,7 +294,14 @@ def collect_sample(sample_dir: str, self_name: str, mesh_if: str,
         text = read(f"ping_{name}.txt")
         if text:
             ping_targets[name] = text
-    return build_snapshot(self_name, mesh_if, links_text, ping_targets, timestamp)
+    return build_snapshot(
+        self_name,
+        mesh_if,
+        links_text,
+        ping_targets,
+        timestamp,
+        bat_if=bat_if,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -290,6 +328,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--self", dest="self_name", default="unknown",
                    help="this node's name (base/head/node1/...)")
     p.add_argument("--mesh-if", default="wlan0", help="wireless interface")
+    p.add_argument("--bat-if", default="bat0", help="BATMAN interface")
     p.add_argument("--ping", nargs="*", default=[],
                    help="node names to ping for RTT (e.g. --ping head base)")
     p.add_argument("--send", default=None,
@@ -309,9 +348,21 @@ def main() -> int:
 
     def one(ts):
         if args.sample:
-            snap = collect_sample(args.sample, args.self_name, args.mesh_if, ts)
+            snap = collect_sample(
+                args.sample,
+                args.self_name,
+                args.mesh_if,
+                args.bat_if,
+                ts,
+            )
         else:
-            snap = collect_real(args.self_name, args.mesh_if, args.ping, ts)
+            snap = collect_real(
+                args.self_name,
+                args.mesh_if,
+                args.bat_if,
+                args.ping,
+                ts,
+            )
         emit(snap, args.send)
 
     if not args.loop:
@@ -319,8 +370,10 @@ def main() -> int:
         return 0
 
     while True:
+        cycle_started = time.monotonic()
         one(time.time())
-        time.sleep(args.interval)
+        elapsed = time.monotonic() - cycle_started
+        time.sleep(max(0.0, args.interval - elapsed))
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@
 
 - GOOD: 정상 주행, camera profile 0
 - WARN: 3초 이상 영상/네트워크가 나빠짐. 속도 `0.35`로 제한, camera profile 1
-- DANGER: 1.5초 이상 위험. 즉시 stop, camera profile 2, `node2 -> node1` 순서로 자동 분리
+- DANGER: 1.5초 이상 위험. 즉시 stop, camera profile 2, `node2 -> node1` 순서로 분리 절차 시작. 기본 모드에서는 각 유닛의 실제 분리를 운전자가 확인해야 완료된다.
 
 ## 카메라 프로파일
 
@@ -33,7 +33,7 @@
 head rpicam-vid -> H.264 -> RTP packetizer -> UDP 5600 -> laptop video_probe/receiver
 ```
 
-조종 명령은 그대로 UDP 7000을 쓴다. 영상 포트와 제어 포트가 다르기 때문에 서로 충돌하지 않는다.
+조종 명령은 version/session/sequence/TTL/ACK가 포함된 UDP 7000 프로토콜을 쓴다. 영상 포트와 제어 포트가 다르기 때문에 서로 충돌하지 않는다.
 
 `scripts/start_camera_stream.sh`는 `PROFILE` 값으로 해상도/비트레이트를 바꾼다.
 
@@ -44,7 +44,13 @@ PROFILE=2  # low:      320x240@10, 0.6 Mbps
 PROFILE=3  # survival: 320x240@8,  0.4 Mbps
 ```
 
-자동 프로파일 변경은 기존 UDP 제어 채널을 쓴다. 노트북이 `camera_profile` 명령을 head로 보내면, head의 `mesh_control_server.py`가 `scripts/restart_camera_profile.sh`를 실행해서 카메라 스트림을 재시작한다.
+자동 프로파일 변경은 기존 UDP 제어 채널을 쓴다. 노트북이
+`camera_profile` 명령을 head로 보내면, head의 `mesh_control_server.py`는
+root 소유 `/run/hansel-camera-profile` 토큰만 갱신하고
+`hansel-camera.service` 재시작을 예약한다. 목적지와 전송 방식은 관리자가
+`/etc/hansel-mesh/camera.env`에 설정한 값을 유지한다. 클라이언트는 적용
+ACK를 받은 뒤에만 전환을 확정하며, 거부 또는 timeout이면 제어 루프를 막지
+않고 재시도한다.
 
 ## 필요한 패키지
 
@@ -71,7 +77,10 @@ RTP가 현장에서 바로 안 되면 예전 raw UDP 방식으로 되돌릴 수 
 head:
 
 ```bash
-CAMERA_TRANSPORT=raw bash ~/HANSEL_MESH/scripts/restart_camera_profile.sh 1 192.168.60.2 5600
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_TRANSPORT="raw", PROFILE="1"로 변경
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 노트북:
@@ -113,14 +122,14 @@ sudo ./scripts/start_mesh.sh configs/head.env   # head에서만
 sudo ./scripts/start_mesh.sh configs/node1.env  # node1에서만
 sudo ./scripts/start_mesh.sh configs/node2.env  # node2에서만
 sudo ./scripts/setup_mesh_route_to_laptop.sh
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 node1/node2는 마지막 줄의 role만 바꾼다.
 
 ```bash
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2 --host 192.168.50.12 --allow-source 192.168.60.2/32
 ```
 
 4. head 카메라 시작
@@ -129,13 +138,24 @@ head에서:
 
 ```bash
 cd ~/HANSEL_MESH
-bash ~/HANSEL_MESH/scripts/restart_camera_profile.sh 0 192.168.60.2 5600
+sudo install -d -m 0755 /etc/hansel-mesh
+sudo test -f /etc/hansel-mesh/camera.env || \
+  sudo install -m 0644 configs/camera.env.example /etc/hansel-mesh/camera.env
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_ENABLED="yes", CAMERA_DEST_IP="192.168.60.2",
+# CAMERA_TRANSPORT="rtp", PROFILE="0" 확인
+sudo ./scripts/enable_mesh_autostart.sh head --with-camera
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 기본값은 `CAMERA_TRANSPORT=rtp`다. 시작부터 안정성을 우선하면 profile 1로 시작해도 된다.
 
 ```bash
-CAMERA_TRANSPORT=rtp bash ~/HANSEL_MESH/scripts/restart_camera_profile.sh 1 192.168.60.2 5600
+sudoedit /etc/hansel-mesh/camera.env
+# PROFILE="1"로 변경
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 5. 노트북에서 영상 수신 + 품질 로그 생성
@@ -164,7 +184,6 @@ python3 controller/mesh_control_client.py --target all --speed 1.0 --live \
   --quality-target-fps 15 \
   --quality-base-ssh hansel@192.168.60.1 \
   --quality-warn-speed 0.35 \
-  --auto-camera-profile \
   --camera-transport rtp \
   --auto-detach \
   --detach-order node2,node1
@@ -172,13 +191,19 @@ python3 controller/mesh_control_client.py --target all --speed 1.0 --live \
 
 `--auto-detach`를 빼면 분리 없이 stop/속도 제한/카메라 프로파일 변경만 테스트할 수 있다.
 
+조종 시작 시에는 선택된 target마다 `stop` ACK를 먼저 받아 새 제어 세션의
+monotonic 시간 기준을 만든다. 첫 품질 판정 전 `NOT_READY`, 감시 예외 `ERROR`,
+갱신 중단 `STALE` 상태에서는 속도 cap이 0이며 이동 명령을 보내지 않는다.
+영상 샘플 누락이나 유효한 FPS 부재도 `DANGER`로 처리한다. 단, 시작 시 로그가
+아직 없다는 이유만으로 유닛을 떨어뜨리지 않도록 자동분리는 한 번 이상
+`GOOD` 또는 `WARN`의 사용 가능한 영상 샘플을 본 뒤에만 무장된다.
+
 ```bash
 python3 controller/mesh_control_client.py --target all --speed 1.0 --live \
   --quality-log video_quality.jsonl \
   --quality-target-fps 15 \
   --quality-base-ssh hansel@192.168.60.1 \
   --quality-warn-speed 0.35 \
-  --auto-camera-profile \
   --camera-transport rtp
 ```
 
@@ -206,9 +231,9 @@ python3 controller/mesh_control_client.py --target all --speed 1.0 --live \
 각 Pi에서:
 
 ```bash
+# head에서만 먼저 실행
+sudo systemctl stop hansel-camera.service
 sudo pkill -f mesh_control_server.py
-sudo pkill -f rpicam-vid
-sudo pkill -f libcamera-vid
 sudo ./scripts/stop_mesh.sh
 sudo shutdown now
 ```

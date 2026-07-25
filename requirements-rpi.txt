@@ -1,0 +1,5 @@
+# Raspberry Pi-only optional hardware dependencies.
+# Prefer the Raspberry Pi OS packages python3-rpi.gpio and python3-pigpio
+# where available; use this file only in a Pi virtual environment.
+RPi.GPIO>=0.7.1
+pigpio>=1.78

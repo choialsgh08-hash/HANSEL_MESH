@@ -5,6 +5,7 @@ set -e
 ROLE="${1:-}"
 REPO_DIR="${REPO_DIR:-/home/hansel/HANSEL_MESH}"
 IFACE_WAIT_TIMEOUT="${IFACE_WAIT_TIMEOUT:-45}"
+MESH_STARTED_FOR_ROLE="no"
 
 echo "========================================"
 echo " HANSEL_MESH role network start"
@@ -29,6 +30,18 @@ fi
 
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
+
+cleanup_failed_start() {
+    local status="$?"
+    trap - EXIT
+    if [ "$status" -ne 0 ] && [ "$MESH_STARTED_FOR_ROLE" = "yes" ]; then
+        echo "[ERROR] Role setup failed after mesh start; cleaning up interfaces."
+        "$REPO_DIR/scripts/stop_mesh.sh" "$CONFIG_FILE" || true
+    fi
+    exit "$status"
+}
+
+trap cleanup_failed_start EXIT
 
 wait_for_interface() {
     local iface="$1"
@@ -61,6 +74,7 @@ echo "[INFO] Repo : $REPO_DIR"
 echo "[1/2] Starting BATMAN mesh..."
 wait_for_interface "$MESH_IF" "$IFACE_WAIT_TIMEOUT"
 "$REPO_DIR/scripts/start_mesh.sh" "$CONFIG_FILE"
+MESH_STARTED_FOR_ROLE="yes"
 
 echo "[2/2] Applying role-specific routing..."
 case "$ROLE" in
