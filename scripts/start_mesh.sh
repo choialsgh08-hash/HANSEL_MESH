@@ -38,6 +38,19 @@ REQUIRE_IBSS_BSSID_MATCH="${REQUIRE_IBSS_BSSID_MATCH:-no}"
 WIFI_POWER_SAVE="${WIFI_POWER_SAVE:-off}"
 BATMAN_HOP_PENALTY="${BATMAN_HOP_PENALTY:-}"
 BATMAN_ORIG_INTERVAL="${BATMAN_ORIG_INTERVAL:-}"
+# A separate rescue AP is expected to use wlan1.  Stopping the global
+# hostapd/dnsmasq units would tear that AP down, so global service handling is
+# deliberately opt-in.  Interface-scoped units for MESH_IF are still stopped.
+STOP_GLOBAL_WIFI_SERVICES="${STOP_GLOBAL_WIFI_SERVICES:-no}"
+
+case "$STOP_GLOBAL_WIFI_SERVICES" in
+    yes|no)
+        ;;
+    *)
+        echo "[ERROR] STOP_GLOBAL_WIFI_SERVICES must be yes or no."
+        exit 1
+        ;;
+esac
 
 if [ -z "$NODE_NAME" ] || [ -z "$MESH_IF" ] || [ -z "$BAT_IF" ] || [ -z "$MESH_ID" ] || [ -z "$MESH_FREQ" ] || [ -z "$IP_ADDR" ] || [ -z "$NETMASK_CIDR" ]; then
     echo "[ERROR] Config file has missing required variables."
@@ -209,6 +222,7 @@ echo "[INFO] Require BSSID match: $REQUIRE_IBSS_BSSID_MATCH"
 echo "[INFO] Wi-Fi power save: $WIFI_POWER_SAVE"
 echo "[INFO] BATMAN hop penalty: ${BATMAN_HOP_PENALTY:-kernel default}"
 echo "[INFO] BATMAN orig interval: ${BATMAN_ORIG_INTERVAL:-kernel default}"
+echo "[INFO] Stop global Wi-Fi services: $STOP_GLOBAL_WIFI_SERVICES"
 echo "[INFO] IP addr   : $IP_ADDR/$NETMASK_CIDR"
 
 if ! ip link show "$MESH_IF" >/dev/null 2>&1; then
@@ -219,6 +233,127 @@ if ! ip link show "$MESH_IF" >/dev/null 2>&1; then
 fi
 
 MESH_STARTED="no"
+HOSTAPD_WAS_ACTIVE="no"
+DNSMASQ_WAS_ACTIVE="no"
+WPA_SUPPLICANT_WAS_ACTIVE="no"
+NETWORK_MANAGER_WAS_ACTIVE="no"
+DHCPCD_WAS_ACTIVE="no"
+HOSTAPD_IF_WAS_ACTIVE="no"
+DNSMASQ_IF_WAS_ACTIVE="no"
+WPA_SUPPLICANT_AT_IF_WAS_ACTIVE="no"
+WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE="no"
+WPA_INTERFACE_REMOVED="no"
+GLOBAL_WIFI_SERVICES_STOPPED="no"
+
+remember_wifi_service_state() {
+    if systemctl is-active --quiet hostapd 2>/dev/null; then
+        HOSTAPD_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        DNSMASQ_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
+        WPA_SUPPLICANT_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        NETWORK_MANAGER_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet dhcpcd 2>/dev/null; then
+        DHCPCD_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet "hostapd@$MESH_IF.service" 2>/dev/null; then
+        HOSTAPD_IF_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet "dnsmasq@$MESH_IF.service" 2>/dev/null; then
+        DNSMASQ_IF_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet "wpa_supplicant@$MESH_IF.service" 2>/dev/null; then
+        WPA_SUPPLICANT_AT_IF_WAS_ACTIVE="yes"
+    fi
+    if systemctl is-active --quiet "wpa_supplicant-$MESH_IF.service" 2>/dev/null; then
+        WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE="yes"
+    fi
+}
+
+release_mesh_interface_from_managers() {
+    remember_wifi_service_state
+
+    if command -v nmcli >/dev/null 2>&1; then
+        # Do this before asking a global supplicant to release MESH_IF, or
+        # NetworkManager may immediately add it again.
+        nmcli dev set "$MESH_IF" managed no 2>/dev/null || true
+    fi
+
+    # These instance names are used by common Debian/Raspberry Pi OS setups.
+    # A missing instance is harmless.  Crucially, they target MESH_IF only.
+    systemctl stop "hostapd@$MESH_IF.service" 2>/dev/null || true
+    systemctl stop "dnsmasq@$MESH_IF.service" 2>/dev/null || true
+    systemctl stop "wpa_supplicant@$MESH_IF.service" 2>/dev/null || true
+    systemctl stop "wpa_supplicant-$MESH_IF.service" 2>/dev/null || true
+
+    # A single global wpa_supplicant may still own wlan0 even after the
+    # interface-scoped units above have stopped.  Remove only MESH_IF through
+    # its global control API; never terminate the daemon merely to free wlan0,
+    # because it may also serve another adapter.
+    if command -v wpa_cli >/dev/null 2>&1; then
+        for WPA_GLOBAL_SOCKET in \
+            /run/wpa_supplicant/global \
+            /var/run/wpa_supplicant/global
+        do
+            if [ -S "$WPA_GLOBAL_SOCKET" ] && \
+                wpa_cli -g "$WPA_GLOBAL_SOCKET" \
+                    interface_remove "$MESH_IF" 2>/dev/null | grep -q '^OK'
+            then
+                WPA_INTERFACE_REMOVED="yes"
+                echo "[INFO] Released $MESH_IF from global wpa_supplicant control."
+                break
+            fi
+        done
+    fi
+
+    if [ "$WPA_INTERFACE_REMOVED" = "no" ] && command -v busctl >/dev/null 2>&1; then
+        WPA_OBJECT="$(
+            busctl call \
+                fi.w1.wpa_supplicant1 \
+                /fi/w1/wpa_supplicant1 \
+                fi.w1.wpa_supplicant1 \
+                GetInterface s "$MESH_IF" 2>/dev/null |
+                sed -n 's/^o[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p'
+        )"
+        if [ -n "$WPA_OBJECT" ] && busctl call \
+            fi.w1.wpa_supplicant1 \
+            /fi/w1/wpa_supplicant1 \
+            fi.w1.wpa_supplicant1 \
+            RemoveInterface o "$WPA_OBJECT" >/dev/null 2>&1
+        then
+            WPA_INTERFACE_REMOVED="yes"
+            echo "[INFO] Released $MESH_IF from wpa_supplicant over D-Bus."
+        fi
+    fi
+
+    if [ "$STOP_GLOBAL_WIFI_SERVICES" = "yes" ]; then
+        echo "[WARN] Explicit opt-in enabled: stopping global hostapd/dnsmasq/wpa_supplicant."
+        GLOBAL_WIFI_SERVICES_STOPPED="yes"
+        systemctl stop hostapd 2>/dev/null || true
+        systemctl stop dnsmasq 2>/dev/null || true
+        systemctl stop wpa_supplicant 2>/dev/null || true
+    else
+        echo "[INFO] Preserving global hostapd/dnsmasq services (for example a wlan1 rescue AP)."
+        if command -v wpa_cli >/dev/null 2>&1 && \
+            wpa_cli -i "$MESH_IF" ping 2>/dev/null | grep -q '^PONG$'
+        then
+            echo "[ERROR] Global wpa_supplicant still owns $MESH_IF."
+            echo "        Configure its global control/D-Bus interface, or use"
+            echo "        STOP_GLOBAL_WIFI_SERVICES=yes only when no other Wi-Fi"
+            echo "        service depends on the global daemon."
+            return 1
+        fi
+        if iw dev "$MESH_IF" info 2>/dev/null | grep -qE '^[[:space:]]*type AP$'; then
+            echo "[WARN] $MESH_IF is currently an AP. Stop the service bound to this interface,"
+            echo "       or set STOP_GLOBAL_WIFI_SERVICES=yes only when no separate AP must survive."
+        fi
+    fi
+}
 
 restore_wifi_on_error() {
     EXIT_CODE="$?"
@@ -246,8 +381,41 @@ restore_wifi_on_error() {
         nmcli radio wifi on 2>/dev/null || true
     fi
 
-    systemctl restart NetworkManager 2>/dev/null || true
-    systemctl restart dhcpcd 2>/dev/null || true
+    # Restore every interface-scoped service which this invocation stopped.
+    [ "$HOSTAPD_IF_WAS_ACTIVE" = "yes" ] && \
+        systemctl start "hostapd@$MESH_IF.service" 2>/dev/null || true
+    [ "$DNSMASQ_IF_WAS_ACTIVE" = "yes" ] && \
+        systemctl start "dnsmasq@$MESH_IF.service" 2>/dev/null || true
+    [ "$WPA_SUPPLICANT_AT_IF_WAS_ACTIVE" = "yes" ] && \
+        systemctl start "wpa_supplicant@$MESH_IF.service" 2>/dev/null || true
+    [ "$WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE" = "yes" ] && \
+        systemctl start "wpa_supplicant-$MESH_IF.service" 2>/dev/null || true
+
+    # Restart only global services that this invocation explicitly stopped.
+    if [ "$GLOBAL_WIFI_SERVICES_STOPPED" = "yes" ]; then
+        [ "$HOSTAPD_WAS_ACTIVE" = "yes" ] && systemctl start hostapd 2>/dev/null || true
+        [ "$DNSMASQ_WAS_ACTIVE" = "yes" ] && systemctl start dnsmasq 2>/dev/null || true
+        [ "$WPA_SUPPLICANT_WAS_ACTIVE" = "yes" ] && systemctl start wpa_supplicant 2>/dev/null || true
+    fi
+
+    # A global daemon interface removed through wpa_cli/D-Bus must be
+    # recreated by the manager which owned it. This branch runs only while
+    # recovering a failed mesh start; a brief client-network restart is safer
+    # than leaving wlan0 permanently unmanaged.
+    if [ "$WPA_INTERFACE_REMOVED" = "yes" ] && \
+        [ "$WPA_SUPPLICANT_AT_IF_WAS_ACTIVE" = "no" ] && \
+        [ "$WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE" = "no" ]
+    then
+        if [ "$NETWORK_MANAGER_WAS_ACTIVE" = "yes" ]; then
+            nmcli dev set "$MESH_IF" managed yes 2>/dev/null || true
+        elif [ "$DHCPCD_WAS_ACTIVE" = "yes" ]; then
+            systemctl restart dhcpcd 2>/dev/null || true
+        elif [ "$WPA_SUPPLICANT_WAS_ACTIVE" = "yes" ]; then
+            systemctl restart wpa_supplicant 2>/dev/null || true
+        else
+            echo "[WARN] Could not identify the manager that must reclaim $MESH_IF."
+        fi
+    fi
 }
 
 trap restore_wifi_on_error EXIT
@@ -279,13 +447,7 @@ echo "[2/12] Loading batman-adv..."
 modprobe batman-adv
 
 echo "[3/12] Releasing Wi-Fi from AP/client managers if possible..."
-systemctl stop hostapd 2>/dev/null || true
-systemctl stop dnsmasq 2>/dev/null || true
-systemctl stop "wpa_supplicant@$MESH_IF" 2>/dev/null || true
-systemctl stop wpa_supplicant 2>/dev/null || true
-if command -v nmcli >/dev/null 2>&1; then
-    nmcli dev set "$MESH_IF" managed no 2>/dev/null || true
-fi
+release_mesh_interface_from_managers
 
 echo "[4/12] Cleaning old BATMAN interface..."
 if ip link show "$BAT_IF" >/dev/null 2>&1; then
@@ -341,7 +503,7 @@ echo "[7/12] Creating BATMAN interface..."
 ip link add name "$BAT_IF" type batadv
 
 echo "[8/12] Adding mesh interface to BATMAN..."
-batctl if add "$MESH_IF"
+batctl -m "$BAT_IF" if add "$MESH_IF"
 
 echo "[9/12] Assigning IP to BATMAN interface..."
 ip link set up dev "$BAT_IF"
@@ -368,5 +530,5 @@ echo " Mesh started successfully."
 echo "========================================"
 echo "Active wireless mode: $ACTIVE_MODE"
 echo "Check neighbors:"
-echo "sudo batctl n"
-echo "sudo batctl o"
+echo "sudo batctl -m $BAT_IF n"
+echo "sudo batctl -m $BAT_IF o"

@@ -1,6 +1,6 @@
 [Unit]
 Description=HANSEL BATMAN Mesh Network (%i)
-After=systemd-udev-settle.service network-pre.target systemd-modules-load.service
+After=systemd-udev-settle.service network-pre.target systemd-modules-load.service NetworkManager.service dhcpcd.service
 Wants=systemd-udev-settle.service network-pre.target
 
 [Service]
@@ -8,7 +8,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/home/hansel/HANSEL_MESH
 ExecStart=/home/hansel/HANSEL_MESH/scripts/start_role_network.sh %i
-ExecStop=/home/hansel/HANSEL_MESH/scripts/stop_mesh.sh
+ExecStop=/home/hansel/HANSEL_MESH/scripts/stop_mesh.sh /home/hansel/HANSEL_MESH/configs/%i.env
 TimeoutStartSec=90
 Restart=on-failure
 RestartSec=5

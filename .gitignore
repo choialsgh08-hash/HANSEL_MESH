@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# HANSEL runtime output (never commit field-test/session data).
+/logs/
+/logs/*.jsonl
+/report/
+/monitor_session.jsonl
+/video_quality.jsonl
+/missions/
+/captures/
