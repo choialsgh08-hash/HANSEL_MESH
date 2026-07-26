@@ -2,6 +2,9 @@
 
 HANSEL_GRETEL 다유닛 로봇을 위한 BATMAN-adv 기반 Wi-Fi Mesh 릴레이 통신 프로젝트입니다.
 
+- 계층 구조/토폴로지: [Architecture](docs/architecture.md)
+- AR9271 동글 도착 후 실행 절차: [Dongle Arrival Runbook](docs/dongle_arrival_runbook.md)
+
 ## 목표 구조
 
 ```text
