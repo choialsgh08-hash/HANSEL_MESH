@@ -250,9 +250,9 @@ def parse_args():
                    help="이 Pi 의 역할 이름")
     p.add_argument("--config", default=None,
                    help="설정 env 파일 경로(기본 configs/<name>.env)")
-    p.add_argument("--mesh-if", default=None, help="무선 메시 인터페이스(기본 wlan0)")
+    p.add_argument("--mesh-if", default=None, help="무선 메시 인터페이스(기본 wlan1)")
     p.add_argument("--forward-unit", default=None, help="전방 유닛 이름")
-    p.add_argument("--forward-mac", default=None, help="전방 유닛 wlan0 MAC(RSSI용)")
+    p.add_argument("--forward-mac", default=None, help="전방 유닛 wlan1 MAC(RSSI용)")
     p.add_argument("--forward-ip", default=None, help="전방 유닛 bat0 IP(RTT용)")
     p.add_argument("--laptop-ip", default=DEFAULT_LAPTOP_IP)
     p.add_argument("--control-port", type=int, default=DEFAULT_CONTROL_PORT)
@@ -269,7 +269,7 @@ def parse_args():
     a.config_loaded = bool(cfg)
 
     # 우선순위: CLI 인자 > 설정파일 > 환경변수 > 기본값/맵
-    a.mesh_if = a.mesh_if or cfg.get("MESH_IF") or os.environ.get("MESH_IF") or "wlan0"
+    a.mesh_if = a.mesh_if or cfg.get("MESH_IF") or os.environ.get("MESH_IF") or "wlan1"
     a.forward_unit = (a.forward_unit or cfg.get("FORWARD_UNIT")
                       or FORWARD_UNIT.get(a.name))
     a.forward_mac = (a.forward_mac or cfg.get("FORWARD_MAC")

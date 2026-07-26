@@ -44,17 +44,30 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 try:
-    from controller.quality_supervisor import QualityConfig, score_quality
+    from dataclasses import replace as _dc_replace
+    from controller.quality_supervisor import (
+        QualityConfig,
+        score_quality,
+        load_quality_overrides,
+    )
 except ImportError:
     QualityConfig = None
     score_quality = None
+    load_quality_overrides = None
+    _dc_replace = None
+
+# Measured threshold overrides (from calibrate_thresholds output), loaded once
+# at startup so the live judge uses tuned values without any code change.
+QUALITY_OVERRIDES: dict = {}
 
 # Shared state, guarded by LOCK.
 LOCK = threading.Lock()
 LATEST: dict = {}                 # node_name -> {"snap": snapshot, "recv": ts}
 VIDEO: dict = {}                  # {"stats": <sample>, "recv": ts} from video_probe
 HISTORY: deque = deque(maxlen=180)  # merged records for the charts
+EVENTS: deque = deque(maxlen=60)    # reconnect/route-change events from agents
 NODE_TIMEOUT_S = 12.0             # mark a node offline after this much silence
+RECONNECT_WINDOW_S = 6.0         # keep the "reconnecting" banner up this long
 
 QUALITY_LEVELS = {
     "UNKNOWN": 0,
@@ -70,10 +83,16 @@ def _edge_key(a: str, b: str) -> str:
 
 
 def ingest(snapshot: dict, now: float) -> None:
-    """Store one agent snapshot keyed by its node name."""
+    """Store one agent snapshot keyed by its node name, plus its reconnect events."""
     node = snapshot.get("node", "unknown")
     with LOCK:
         LATEST[node] = {"snap": snapshot, "recv": now}
+        for ev in snapshot.get("events", []):
+            record = dict(ev)
+            record["node"] = node
+            record["ts"] = round(now, 1)
+            record["time"] = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
+            EVENTS.append(record)
 
 
 def ingest_video(stats: dict, now: float) -> None:
@@ -135,8 +154,14 @@ def _quality_thresholds(target_fps: float) -> dict:
     }
 
 
-def evaluate_quality(video, e2e: dict, edges: list, now: float) -> dict:
-    """Mirror the controller's video-first quality judgment for the dashboard."""
+def evaluate_quality(video, e2e: dict, edges: list, now: float,
+                     link_health: dict = None) -> dict:
+    """Mirror the controller's video-first quality judgment for the dashboard.
+
+    link_health (weakest direct link) is scored here for operator awareness.
+    The motor-stopping control client still omits it until its thresholds are
+    validated against real hardware.
+    """
     video = video or {}
     target_fps = float(video.get("target_fps") or 15.0)
     thresholds = _quality_thresholds(target_fps)
@@ -146,7 +171,10 @@ def evaluate_quality(video, e2e: dict, edges: list, now: float) -> dict:
 
     if score_quality and QualityConfig:
         cfg = QualityConfig(target_fps=target_fps)
-        raw_status, reasons = score_quality(video, ping, batman, cfg, now)
+        if QUALITY_OVERRIDES and _dc_replace:
+            cfg = _dc_replace(cfg, **QUALITY_OVERRIDES)
+        raw_status, reasons = score_quality(
+            video, ping, batman, cfg, now, link=link_health or None)
     else:
         raw_status = "UNKNOWN" if not video else "GOOD"
         reasons = ["quality_supervisor unavailable"] if not video else ["healthy"]
@@ -163,6 +191,7 @@ def evaluate_quality(video, e2e: dict, edges: list, now: float) -> dict:
         "video_age_s": video_age_s,
         "ping": ping,
         "batman": batman,
+        "link": link_health or {},
         "thresholds": thresholds,
     }
 
@@ -183,7 +212,11 @@ def merge_state(now: float) -> dict:
             nodes.append({"id": name, "ip": ip, "online": online.get(name, False)})
 
     # Edges: union of all *direct* radio links, deduped undirected.
+    # Also track the weakest link (worst signal, longest peer silence) so the
+    # quality judgment can warn of a reconnect before video/RTT degrade.
     edges_acc: dict = {}
+    link_signals: list = []
+    link_inactives: list = []
     for name, info in latest.items():
         for link in info["snap"].get("links", []):
             if not link.get("direct"):
@@ -193,12 +226,14 @@ def merge_state(now: float) -> dict:
                 continue
             key = _edge_key(name, peer)
             acc = edges_acc.setdefault(key, {"rssi": [], "tq": []})
-            if "signal_avg_dbm" in link:
-                acc["rssi"].append(link["signal_avg_dbm"])
-            elif "signal_dbm" in link:
-                acc["rssi"].append(link["signal_dbm"])
+            sig = link.get("signal_avg_dbm", link.get("signal_dbm"))
+            if sig is not None:
+                acc["rssi"].append(sig)
+                link_signals.append(sig)
             if "tq" in link:
                 acc["tq"].append(link["tq"])
+            if link.get("inactive_ms") is not None:
+                link_inactives.append(link["inactive_ms"])
 
     edges = []
     for key, acc in edges_acc.items():
@@ -223,10 +258,24 @@ def merge_state(now: float) -> dict:
         video = dict(VIDEO.get("stats") or {}) if (
             VIDEO.get("recv") and (now - VIDEO["recv"]) < NODE_TIMEOUT_S) else None
 
-    quality = evaluate_quality(video, e2e, edges, now)
+    link_health: dict = {}
+    if link_signals:
+        link_health["signal_worst_dbm"] = min(link_signals)
+    if link_inactives:
+        link_health["inactive_worst_ms"] = max(link_inactives)
+
+    quality = evaluate_quality(video, e2e, edges, now, link_health)
+
+    with LOCK:
+        all_events = list(EVENTS)
+    recent = [e for e in all_events if now - e.get("ts", 0.0) < RECONNECT_WINDOW_S]
 
     return {"nodes": nodes, "edges": edges, "e2e": e2e,
             "video": video, "quality": quality,
+            "link_health": link_health,
+            "events": all_events[-15:],
+            "reconnect_active": bool(recent),
+            "reconnect_latest": recent[-1] if recent else None,
             "net_rssi_worst": net_rssi_worst}
 
 
@@ -310,8 +359,10 @@ def _tq_from_rssi(rssi: float) -> int:
 def demo_loop(interval: float) -> None:
     """Synthesize realistic per-node snapshots and feed the real ingest path."""
     print("[collector] DEMO mode: generating a 4-node chain mesh")
+    tick = 0
     while True:
         now = time.time()
+        tick += 1
         jitter = {k: v + random.uniform(-4, 4) for k, v in DEMO_RSSI.items()}
         for idx, node in enumerate(DEMO_CHAIN):
             neighbors = []
@@ -361,6 +412,16 @@ def demo_loop(interval: float) -> None:
             } if node != "base" else {}
 
             snap = build_snapshot(node, "wlan0", links_text, ping_text, now)
+            # Every ~8th cycle, simulate a reconnect on node1 so the banner and
+            # event log are visible in demo mode without real hardware.
+            if node == "node1" and tick % 8 == 0:
+                kind = ["route_changed", "neighbor_lost",
+                        "neighbor_gained"][(tick // 8) % 3]
+                ev = {"type": kind, "peer": "node2", "mac": "02:aa:bb:00:00:0c"}
+                if kind == "route_changed":
+                    ev["from"] = "02:aa:bb:00:00:0c"
+                    ev["to"] = "02:aa:bb:00:00:0a"
+                snap["events"] = [ev]
             ingest(snap, now)
 
         # Synthesize video quality that tracks the weakest link: as the worst
@@ -422,11 +483,20 @@ def parse_args() -> argparse.Namespace:
                    help="generate synthetic data, no agents needed")
     p.add_argument("--log", default=None,
                    help="save combined comms+video metrics to this JSONL file")
+    p.add_argument("--quality-config",
+                   default=os.environ.get("HANSEL_QUALITY_CONFIG"),
+                   help="env file of measured threshold overrides (KEY=VALUE)")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
+    global QUALITY_OVERRIDES
+    if load_quality_overrides:
+        QUALITY_OVERRIDES = load_quality_overrides(args.quality_config, os.environ)
+        if QUALITY_OVERRIDES:
+            print(f"[collector] quality threshold overrides: {QUALITY_OVERRIDES}")
 
     threading.Thread(target=sampler_loop, args=(args.interval, args.log),
                      daemon=True).start()

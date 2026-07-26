@@ -52,6 +52,15 @@ class QualityConfig:
     tq_warn: int = 200
     tq_danger: int = 180
 
+    # Radio link-layer health (weakest direct link). These are PRE-HARDWARE
+    # estimates: tune them against real AR9271 measurements before wiring link
+    # health into the motor-stopping control path. Kept conservative so a weak
+    # link warns (slows) rather than stops.
+    signal_warn_dbm: float = -75.0
+    signal_danger_dbm: float = -82.0
+    inactive_warn_ms: float = 1500.0
+    inactive_danger_ms: float = 3000.0
+
     warn_hold_s: float = 3.0
     danger_hold_s: float = 1.5
     warn_speed_cap: float = 0.35
@@ -382,7 +391,72 @@ def parse_selected_tqs(text: str) -> list[int]:
     return values
 
 
-def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, now: float) -> tuple[str, list[str]]:
+# Tunable thresholds that may be overridden from an env file / environment,
+# so measured values (e.g. from monitor/calibrate_thresholds.py) take effect
+# without editing code. KEY -> (QualityConfig field, type).
+QUALITY_ENV_FIELDS = {
+    "SIGNAL_WARN_DBM": ("signal_warn_dbm", float),
+    "SIGNAL_DANGER_DBM": ("signal_danger_dbm", float),
+    "INACTIVE_WARN_MS": ("inactive_warn_ms", float),
+    "INACTIVE_DANGER_MS": ("inactive_danger_ms", float),
+    "RTT_WARN_MS": ("rtt_warn_ms", float),
+    "RTT_DANGER_MS": ("rtt_danger_ms", float),
+    "LOSS_WARN_PCT": ("loss_warn_pct", float),
+    "LOSS_DANGER_PCT": ("loss_danger_pct", float),
+    "TQ_WARN": ("tq_warn", int),
+    "TQ_DANGER": ("tq_danger", int),
+}
+
+
+def parse_env_file(path: Optional[str]) -> dict:
+    """Read a KEY=VALUE env file into a dict. Missing file -> empty dict."""
+    values: dict = {}
+    if not path or not os.path.exists(path):
+        return values
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                values[key.strip()] = val.strip().strip('"').strip("'")
+    except OSError:
+        return {}
+    return values
+
+
+def load_quality_overrides(env_file: Optional[str] = None,
+                           environ: Optional[dict] = None) -> dict:
+    """Collect QualityConfig field overrides from an env file and/or environ.
+
+    Values from `environ` win over the file. Unknown keys and unparseable
+    numbers are ignored, so a malformed config never crashes the supervisor.
+    """
+    raw = parse_env_file(env_file)
+    if environ:
+        for key in QUALITY_ENV_FIELDS:
+            if key in environ:
+                raw[key] = environ[key]
+    overrides: dict = {}
+    for key, (field, caster) in QUALITY_ENV_FIELDS.items():
+        if key in raw:
+            try:
+                overrides[field] = caster(raw[key])
+            except (TypeError, ValueError):
+                continue
+    return overrides
+
+
+def config_with_overrides(base: QualityConfig, env_file: Optional[str] = None,
+                          environ: Optional[dict] = None) -> QualityConfig:
+    """Return `base` with any measured threshold overrides applied."""
+    overrides = load_quality_overrides(env_file, environ)
+    return replace(base, **overrides) if overrides else base
+
+
+def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, now: float,
+                  link: Optional[dict] = None) -> tuple[str, list[str]]:
     status = "GOOD"
     reasons: list[str] = []
 
@@ -479,6 +553,23 @@ def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, 
             raise_to("DANGER", f"BATMAN TQ {tq}")
         elif parsed_tq < config.tq_warn:
             raise_to("WARN", f"BATMAN TQ {tq}")
+
+    # Radio link-layer health: the weakest direct link predicts a reconnect
+    # before video or RTT degrade. Absent (link=None) on the motor-stopping
+    # control path until thresholds are validated against real hardware.
+    if link:
+        signal = finite_number(link.get("signal_worst_dbm"))
+        if signal is not None:
+            if signal <= config.signal_danger_dbm:
+                raise_to("DANGER", f"radio signal {signal:.0f}dBm")
+            elif signal <= config.signal_warn_dbm:
+                raise_to("WARN", f"radio signal {signal:.0f}dBm")
+        inactive = finite_number(link.get("inactive_worst_ms"))
+        if inactive is not None:
+            if inactive >= config.inactive_danger_ms:
+                raise_to("DANGER", f"peer silent {inactive:.0f}ms")
+            elif inactive >= config.inactive_warn_ms:
+                raise_to("WARN", f"peer silent {inactive:.0f}ms")
 
     if not reasons:
         reasons.append("healthy")

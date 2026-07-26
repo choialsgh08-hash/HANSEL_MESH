@@ -18,7 +18,8 @@ if [ -n "$CONFIG_ARG" ]; then
 fi
 
 BAT_IF="${BAT_IF:-bat0}"
-MESH_IF="${MESH_IF:-wlan0}"
+# AR9271 dongle enumerates as wlan1; fallback when no config is sourced.
+MESH_IF="${MESH_IF:-wlan1}"
 
 echo "========================================"
 echo " HANSEL_MESH status check"

@@ -42,7 +42,7 @@ fi
 
 ARGS=(
     --self "$ROLE"
-    --mesh-if "${MESH_IF:-wlan0}"
+    --mesh-if "${MESH_IF:-wlan1}"
     --bat-if "${BAT_IF:-bat0}"
     --loop
     --interval "$METRICS_INTERVAL"

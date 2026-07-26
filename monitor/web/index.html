@@ -106,7 +106,7 @@
   header h1 { font-size:18px; margin:0; }
   #status { font-size:13px; color:var(--dim); }
   #status .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3fb950; margin-right:6px; }
-  .status-cards { display:grid; grid-template-columns:repeat(5,minmax(120px,1fr)); gap:10px; padding:14px 14px 0; }
+  .status-cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; padding:14px 16px 0; }
   .metric-card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; min-height:86px; }
   .metric-label { color:var(--dim); font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:.2px; }
   .metric-value { font-size:23px; font-weight:700; margin-top:4px; line-height:1.15; }
@@ -116,6 +116,15 @@
   .quality-warn { border-color:#d29922; }
   .quality-danger { border-color:#f85149; }
   .quality-unknown { border-color:#6e7681; }
+  .reconnect-banner { display:flex; align-items:center; gap:10px; margin:10px 16px;
+    padding:10px 14px; border-radius:8px; background:#7d1a1a; color:#fff;
+    font-weight:600; border:1px solid #f85149; animation:rbpulse 1.2s ease-in-out infinite; }
+  @keyframes rbpulse { 0%,100%{opacity:1} 50%{opacity:.55} }
+  .event-panel { margin:0 16px 10px; font-size:13px; color:#c9d1d9; }
+  .event-panel summary { cursor:pointer; color:#8b949e; }
+  .event-panel ul { list-style:none; margin:6px 0 0; padding:0; max-height:150px; overflow:auto; }
+  .event-panel li { padding:3px 0; border-bottom:1px solid #21262d; font-family:monospace; }
+  .ev-route { color:#d29922; } .ev-lost { color:#f85149; } .ev-gained { color:#3fb950; }
   .grid { display:grid; grid-template-columns:1.3fr 1fr; gap:14px; padding:14px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
   .panel h2 { font-size:13px; margin:0 0 10px; color:var(--dim); font-weight:600; letter-spacing:.3px; text-transform:uppercase; }
@@ -146,6 +155,14 @@
   <h1>🐝 HANSEL_MESH 실시간 모니터</h1>
   <span id="status"><span class="dot"></span><span id="status-text">연결 중…</span></span>
 </header>
+
+<div id="reconnectBanner" class="reconnect-banner" style="display:none">
+  <span>🔄</span><span id="reconnectText">재연결 중…</span>
+</div>
+<details id="eventPanel" class="event-panel">
+  <summary>재연결 이벤트 로그 (<span id="eventCount">0</span>)</summary>
+  <ul id="eventList"></ul>
+</details>
 
 <section class="status-cards">
   <div class="metric-card quality-unknown" id="qualityCard">
@@ -199,9 +216,11 @@
   </div>
 
   <div class="panel">
-    <h2>영상 품질 (수신 FPS / 디코드 에러)</h2>
+    <h2>영상 품질 추이 — FPS(↑높을수록 좋음) vs 에러·drop(↓0이 정상)</h2>
     <canvas id="videoChart"></canvas>
     <div class="legend"><span id="vidNow">영상 신호 없음</span></div>
+    <div class="status-legend">읽는 법 — 🟢FPS가 위에 평평하고 🔴에러·🟡drop이 바닥(0)이면 정상.
+      FPS가 점선 아래로 떨어지거나 에러가 점선 위로 솟으면 영상 손상. 아래 상관 차트에서 RSSI도 같이 내려갔으면 통신이 원인.</div>
   </div>
   <div class="panel">
     <h2>통신 ↔ 영상 상관 (최저 RSSI vs 에러/초)</h2>
@@ -351,11 +370,10 @@ function refreshVideoChart(history, quality){
     {key:"vid_err", label:"에러/초", color:"#f85149", axis:"y1"},
     {key:"vid_drop", label:"drop/초", color:"#d29922", axis:"y1"},
   ]);
+  // One danger line per axis keeps the chart readable (was four dashed lines).
   [
-    constantSeries(labels, "FPS WARN", th.fps_warn, "#d29922", "y"),
-    constantSeries(labels, "FPS DANGER", th.fps_danger, "#f85149", "y"),
-    constantSeries(labels, "ERR DANGER", th.err_danger_rate, "#ff7b72", "y1"),
-    constantSeries(labels, "DROP DANGER", th.drop_danger_rate, "#bc8cff", "y1"),
+    constantSeries(labels, "FPS 위험선", th.fps_danger, "#f85149", "y"),
+    constantSeries(labels, "에러 위험선", th.err_danger_rate, "#ff7b72", "y1"),
   ].forEach(ds=>{ if(ds) datasets.push(ds); });
   videoChart.data.labels = labels;
   videoChart.data.datasets = datasets;
@@ -435,10 +453,38 @@ function updateCards(state){
   document.getElementById("actionDetail").textContent = `속도 cap ${cap}`;
 }
 
+function evLabel(e){
+  const who = e.peer || (e.mac ? e.mac.slice(-5) : "");
+  if(e.type === "route_changed") return `경로 변경 ${who} → …${(e.to||"").slice(-5)}`;
+  if(e.type === "neighbor_lost") return `이웃 끊김 ${who}`;
+  if(e.type === "neighbor_gained") return `이웃 복귀 ${who}`;
+  return `${e.type} ${who}`;
+}
+function evClass(t){
+  return t === "route_changed" ? "ev-route"
+       : t === "neighbor_lost" ? "ev-lost"
+       : t === "neighbor_gained" ? "ev-gained" : "";
+}
+function updateReconnect(s){
+  const banner = document.getElementById("reconnectBanner");
+  if(s.reconnect_active && s.reconnect_latest){
+    banner.style.display = "flex";
+    document.getElementById("reconnectText").textContent =
+      `재연결 중 — ${evLabel(s.reconnect_latest)} · 영상이 잠시 끊길 수 있습니다`;
+  } else {
+    banner.style.display = "none";
+  }
+  const events = (s.events || []).slice().reverse();
+  document.getElementById("eventCount").textContent = events.length;
+  document.getElementById("eventList").innerHTML = events.map(e =>
+    `<li class="${evClass(e.type)}">[${e.time || ""}] ${evLabel(e)}</li>`).join("");
+}
+
 async function poll(){
   try{
     const r = await fetch("/api/state");
     const s = await r.json();
+    updateReconnect(s);
     updateGraph(s);
     updateTable(s.edges);
     refreshChart(rttChart, s.history, "rtt");

@@ -38,7 +38,8 @@ REQUIRE_IBSS_BSSID_MATCH="${REQUIRE_IBSS_BSSID_MATCH:-no}"
 WIFI_POWER_SAVE="${WIFI_POWER_SAVE:-off}"
 BATMAN_HOP_PENALTY="${BATMAN_HOP_PENALTY:-}"
 BATMAN_ORIG_INTERVAL="${BATMAN_ORIG_INTERVAL:-}"
-# A separate rescue AP is expected to use wlan1.  Stopping the global
+# A separate rescue AP is expected to use another adapter (the built-in wlan0,
+# since the AR9271 mesh dongle is MESH_IF=wlan1).  Stopping the global
 # hostapd/dnsmasq units would tear that AP down, so global service handling is
 # deliberately opt-in.  Interface-scoped units for MESH_IF are still stopped.
 STOP_GLOBAL_WIFI_SERVICES="${STOP_GLOBAL_WIFI_SERVICES:-no}"
@@ -291,10 +292,10 @@ release_mesh_interface_from_managers() {
     systemctl stop "wpa_supplicant@$MESH_IF.service" 2>/dev/null || true
     systemctl stop "wpa_supplicant-$MESH_IF.service" 2>/dev/null || true
 
-    # A single global wpa_supplicant may still own wlan0 even after the
+    # A single global wpa_supplicant may still own MESH_IF even after the
     # interface-scoped units above have stopped.  Remove only MESH_IF through
-    # its global control API; never terminate the daemon merely to free wlan0,
-    # because it may also serve another adapter.
+    # its global control API; never terminate the daemon merely to free MESH_IF,
+    # because it may also serve another adapter (for example a wlan0 rescue AP).
     if command -v wpa_cli >/dev/null 2>&1; then
         for WPA_GLOBAL_SOCKET in \
             /run/wpa_supplicant/global \
@@ -338,7 +339,7 @@ release_mesh_interface_from_managers() {
         systemctl stop dnsmasq 2>/dev/null || true
         systemctl stop wpa_supplicant 2>/dev/null || true
     else
-        echo "[INFO] Preserving global hostapd/dnsmasq services (for example a wlan1 rescue AP)."
+        echo "[INFO] Preserving global hostapd/dnsmasq services (for example a rescue AP on the built-in wlan0)."
         if command -v wpa_cli >/dev/null 2>&1 && \
             wpa_cli -i "$MESH_IF" ping 2>/dev/null | grep -q '^PONG$'
         then
@@ -401,7 +402,7 @@ restore_wifi_on_error() {
     # A global daemon interface removed through wpa_cli/D-Bus must be
     # recreated by the manager which owned it. This branch runs only while
     # recovering a failed mesh start; a brief client-network restart is safer
-    # than leaving wlan0 permanently unmanaged.
+    # than leaving MESH_IF permanently unmanaged.
     if [ "$WPA_INTERFACE_REMOVED" = "yes" ] && \
         [ "$WPA_SUPPLICANT_AT_IF_WAS_ACTIVE" = "no" ] && \
         [ "$WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE" = "no" ]

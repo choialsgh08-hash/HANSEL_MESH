@@ -13,7 +13,7 @@ HANSEL_GRETEL 다유닛 로봇의 각 유닛을 Wi-Fi Mesh 릴레이 노드로 �
 ```text
 구조자 PC
    |
-base Pi (eth0: 구조자 PC, wlan0/bat0: Mesh)
+base Pi (eth0: 구조자 PC, wlan1(AR9271)/bat0: Mesh)
    |
 node2 Pi
    |
@@ -42,14 +42,14 @@ head Pi
 
 ## 3. 중요 원칙
 
-`wlan0`에는 IP를 부여하지 않는다.
+mesh 무선 인터페이스(`wlan1`, AR9271)에는 IP를 부여하지 않는다.
 `bat0`에만 고정 IP를 부여한다.
 `head`는 AP를 열지 않는다.
 detach된 Node도 Mesh는 계속 유지한다.
 detach는 모터 제어 제외를 의미하며, 통신 릴레이 종료를 의미하지 않는다.
 Base Pi가 명령을 해석해서 각 유닛으로 다시 보내는 command dispatcher 구조는 기본 통신 구조로 사용하지 않는다.
 각 유닛은 BATMAN-adv Mesh 라우터로 동작하며, 모든 일반 데이터는 `bat0` 위에서 end-to-end로 흐른다.
-현재 동글 없는 구성에서는 Head의 내장 Wi-Fi 하나를 Mesh에 사용하므로, 조난자 핸드폰용 AP를 동시에 열지 않는다.
+mesh 무선 링크는 AR9271 동글(`wlan1`)이 담당하므로, Head의 내장 Wi-Fi(`wlan0`)는 Mesh에서 빠져 조난자 핸드폰용 AP 등 다른 용도로 확보된다. (AR9271 동글 도착 전까지는 이 config로 Mesh가 뜨지 않는다.)
 
 무선 모드는 `MESH_MODE=auto`를 기본값으로 두고, `802.11s mesh point`를 먼저 시도한 뒤 지원하지 않거나 join에 실패하면 `IBSS`로 fallback한다.
 
@@ -90,7 +90,7 @@ Head Pi Camera
 → 구조자 PC
 ```
 
-다만 현재 전제는 Wi-Fi 동글을 추가하지 않는 것이다. 따라서 현재 단계에서는 Head AP 기능을 구현하지 않고, Camera Module 3 영상과 조종을 먼저 BATMAN Mesh 위에서 검증한다. 조난자 핸드폰 AP는 Head에 두 번째 Wi-Fi 인터페이스가 생긴 뒤 추가한다.
+각 노드는 AR9271 동글(`wlan1`)을 Mesh에 사용하고, 내장 Wi-Fi(`wlan0`)가 두 번째 인터페이스로 남는다. 조난자 핸드폰 AP는 이 내장 `wlan0`에 구현할 수 있으나, 우선 Camera Module 3 영상과 조종을 BATMAN Mesh 위에서 검증한 뒤 추가한다. (AR9271 동글은 배송 예정이며, 도착 후 검증을 시작한다.)
 
 ## 6. Day1 성공 기준
 

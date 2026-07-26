@@ -2,6 +2,9 @@
 
 HANSEL_GRETEL 다유닛 로봇을 위한 BATMAN-adv 기반 Wi-Fi Mesh 릴레이 통신 프로젝트입니다.
 
+- 계층 구조/토폴로지: [Architecture](docs/architecture.md)
+- AR9271 동글 도착 후 실행 절차: [Dongle Arrival Runbook](docs/dongle_arrival_runbook.md)
+
 ## 목표 구조
 
 ```text
@@ -55,7 +58,7 @@ sudo batctl o
 
 ## 카메라 + 조종
 
-동글 없는 현재 구성에서는 Head의 `wlan0`를 Mesh 전용으로 쓰고, 카메라 영상과 조종 명령을 먼저 검증합니다.
+각 노드는 AR9271 동글(`wlan1`)을 Mesh 전용으로 쓰고, 내장 `wlan0`는 조난자 핸드폰 AP 등 향후 용도로 남깁니다. AR9271 동글 도착 전까지는 이 config로 Mesh가 뜨지 않으며, 그 전에 카메라 영상과 조종 명령 경로를 먼저 준비합니다.
 
 실행 순서는 [Camera And Control Quickstart](docs/camera_control_quickstart.md)를 따른다.
 
