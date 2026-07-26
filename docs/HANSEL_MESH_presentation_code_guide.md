@@ -52,7 +52,7 @@ scripts/
   setup_laptop_mesh_routes.sh
   setup_mesh_route_to_laptop.sh
   start_camera_stream.sh
-  restart_camera_profile.sh
+  restart_camera_profile.sh  # unsafe legacy bench only
   receive_camera_stream.sh
   deploy_from_base.sh
 
@@ -237,7 +237,12 @@ RTP를 쓰는 이유:
 | 2 / low | 저화질 | 320x240, 10fps, 0.6Mbps |
 | 3 / survival | 생존 모드 | 320x240, 8fps, 0.4Mbps |
 
-자동 품질 제어가 켜져 있으면 WARN/DANGER 상태에 따라 head에 `camera_profile` 명령을 보내고, head는 `restart_camera_profile.sh`로 스트림을 재시작한다.
+자동 품질 제어가 켜져 있으면 WARN/DANGER 상태에 따라 head에
+`camera_profile` 명령을 보낸다. head는 root 소유
+`/run/hansel-camera-profile` 토큰만 갱신하고
+`hansel-camera.service` 재시작을 예약한다. 목적지와 전송 방식은 관리자가
+`/etc/hansel-mesh/camera.env`에서 지정한 값을 유지한다. 클라이언트는 적용
+ACK를 받아야 전환을 확정하고, 거부 또는 timeout이면 비동기로 재시도한다.
 
 ## 5. 자동분리 알고리즘
 
@@ -330,7 +335,8 @@ node2 -> node1
 - 개별 `detach` 명령은 `--target all`에는 전송하지 않는다.
 - 수동 분리키 `1/2/3`은 target과 무관하게 정해진 앞쪽 유닛의 GPIO6 서보를 움직인다.
 - 자동분리는 "분리될 node"를 기준으로 판단하고, 실제 명령은 그 node를 잡고 있는 앞쪽 유닛의 서보로 보낸다.
-- 자동분리/수동분리 후 해당 node는 `relay_hold` 상태가 되어 서버에서도 주행 명령을 무시하고, active moving targets에서도 제거되어 더 이상 같이 움직이지 않는다.
+- 자동분리/수동분리는 전체 stop ACK → `relay_hold` ACK → 서보 ACK 순서로 진행한다. 기본 모드에서는 운전자가 실제 분리를 확인한 뒤에만 active moving targets에서 제거하며, 확인 실패 시 정지 상태로 세션을 종료한다.
+- `relay_hold` 상태는 운영 서비스의 state directory에 영속 저장되어 서버나 Pi가 재시작되어도 유지된다.
 - 테스트를 위해 다시 움직이게 하려면 해당 node에 `drive_enable`을 보낸다.
 
 ## 6. 조종 로직
@@ -370,7 +376,8 @@ node2 -> node1
 
 1. JSON parsing
 2. command 추출
-3. camera profile 명령이면 head에서 카메라 재시작
+3. camera profile 명령이면 head의 `/run` 토큰을 갱신하고 관리형
+   `hansel-camera.service` 재시작을 예약
 4. 그 외 명령은 `motor_driver.py`로 전달
 5. 일정 시간 명령이 없으면 watchdog stop
 
@@ -585,12 +592,12 @@ DETACH_PRESS_ANGLE = 75
 detach_press
   -> press angle 이동
   -> press angle 유지
-
-detach_rest
-  -> rest angle로 수동 복귀
+  -> 설정 시간이 지나면 rest angle로 자동 복귀
 ```
 
-자동분리도 결국 이 `detach_press` 명령을 해당 node에 UDP로 보내는 방식이다.
+자동분리는 전체 stop ACK와 분리될 node의 `relay_hold` ACK를 확인한 뒤,
+그 node를 잡고 있는 앞쪽 유닛으로 안전 context가 포함된 `detach_press`를
+보낸다. context가 없는 원시 명령은 기본적으로 클라이언트와 서버가 모두 거부한다.
 
 ### 9.4 SoftwareServoPwm fallback
 
@@ -684,20 +691,24 @@ HTTP 8080 dashboard
 
 ### 11.1 코드 배포
 
-노트북에서 base로:
+노트북 변경 사항은 먼저 커밋/push한다. base에서는 파일을 직접 덮어쓰지
+말고 같은 커밋을 fast-forward로 받는다.
 
 ```bash
-cd ~/Projects/HANSEL_MESH
-scp -r configs controller docs monitor robot scripts services README.md \
-  hansel@192.168.60.1:/home/hansel/HANSEL_MESH/
+cd ~/HANSEL_MESH
+git pull --ff-only
 ```
 
-base에서 head/node로:
+로봇을 받쳐 바퀴를 띄운 뒤 모든 systemd/수동 모터 제어 서버를 종료한다.
+그 다음 base에서 head/node로:
 
 ```bash
 cd ~/HANSEL_MESH
 ./scripts/deploy_from_base.sh
 ```
+
+배포가 일부 유닛에서 실패하면 모터 제어를 다시 시작하지 않고 같은 커밋을
+전 유닛에 재배포한다.
 
 ### 11.2 mesh 확인
 
@@ -722,9 +733,9 @@ sudo batctl o
 base에서 원격 실행:
 
 ```bash
-ssh -t hansel@192.168.50.10 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role head'
-ssh -t hansel@192.168.50.11 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node1'
-ssh -t hansel@192.168.50.12 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node2'
+ssh -t hansel@192.168.50.10 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32'
+ssh -t hansel@192.168.50.11 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32'
+ssh -t hansel@192.168.50.12 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node2 --host 192.168.50.12 --allow-source 192.168.60.2/32'
 ```
 
 head 기대 로그:
@@ -740,7 +751,15 @@ head:
 
 ```bash
 cd ~/HANSEL_MESH
-CAMERA_TRANSPORT=rtp bash scripts/restart_camera_profile.sh 1 192.168.60.2 5600
+sudo install -d -m 0755 /etc/hansel-mesh
+sudo test -f /etc/hansel-mesh/camera.env || \
+  sudo install -m 0644 configs/camera.env.example /etc/hansel-mesh/camera.env
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_ENABLED="yes", CAMERA_DEST_IP="192.168.60.2",
+# CAMERA_TRANSPORT="rtp", PROFILE="1" 확인
+sudo ./scripts/enable_mesh_autostart.sh head --with-camera
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 노트북:
@@ -761,7 +780,6 @@ python3 controller/mesh_control_client.py --target all --speed 1 --live \
   --quality-log video_quality.jsonl \
   --quality-target-fps 12 \
   --quality-warn-speed 0.35 \
-  --auto-camera-profile \
   --camera-transport rtp \
   --auto-detach \
   --detach-order node2,node1

@@ -10,11 +10,15 @@ RTT/loss and optional BATMAN TQ as secondary predictors.
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
+from dataclasses import replace
 import json
+import math
 import os
 import re
 import subprocess
+import threading
 import time
 from typing import Optional
 
@@ -52,6 +56,7 @@ class QualityConfig:
     danger_hold_s: float = 1.5
     warn_speed_cap: float = 0.35
     danger_speed_cap: float = 0.0
+    async_stale_s: float = 8.0
 
 
 @dataclass
@@ -77,8 +82,8 @@ class QualitySupervisor:
         self.last_decision = QualityDecision(
             status="UNKNOWN",
             raw_status="UNKNOWN",
-            speed_cap=None,
-            camera_profile=0,
+            speed_cap=config.danger_speed_cap,
+            camera_profile=2,
             reasons=["no samples yet"],
             video={},
             network={},
@@ -101,10 +106,11 @@ class QualitySupervisor:
         speed_cap = None
         camera_profile = 0
 
-        if status == "WARN":
+        control_status = raw_status if status == "TRANSIENT" else status
+        if control_status == "WARN":
             speed_cap = self.config.warn_speed_cap
             camera_profile = 1
-        elif status == "DANGER":
+        elif control_status in {"DANGER", "UNKNOWN"}:
             speed_cap = self.config.danger_speed_cap
             camera_profile = 2
 
@@ -141,6 +147,158 @@ class QualitySupervisor:
         if self.warn_since is not None and now - self.warn_since >= self.config.warn_hold_s:
             return "WARN"
         return "TRANSIENT"
+
+
+class AsyncQualitySupervisor:
+    """Run a :class:`QualitySupervisor` without blocking the control loop.
+
+    ``QualitySupervisor.update()`` intentionally remains synchronous because it
+    is also useful for one-shot diagnostics.  Network probes performed by that
+    method may take several seconds, however, so callers that refresh motor
+    commands should use this wrapper and only read :meth:`latest`.
+
+    Until the first successful sample, after an update error, or when the last
+    success becomes stale, the published decision has a zero speed cap.
+    """
+
+    def __init__(
+        self,
+        supervisor: QualitySupervisor,
+        interval: Optional[float] = None,
+    ) -> None:
+        self.supervisor = supervisor
+        configured_interval = supervisor.config.interval if interval is None else interval
+        if not math.isfinite(configured_interval) or configured_interval <= 0:
+            raise ValueError("interval must be finite and greater than zero")
+        self.interval = configured_interval
+
+        initial = copy.deepcopy(supervisor.last_decision)
+        self._last_successful_decision = initial
+        self._latest_decision = replace(
+            initial,
+            status="NOT_READY",
+            speed_cap=supervisor.config.danger_speed_cap,
+            camera_profile=2,
+            reasons=["quality supervisor has not completed its first update"],
+        )
+        self._last_error: Optional[str] = None
+        self._has_success = False
+        self._last_success_monotonic: Optional[float] = None
+        self._decision_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> "AsyncQualitySupervisor":
+        """Start the daemon worker; repeated calls while running are harmless."""
+
+        with self._state_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return self
+
+            stop_event = threading.Event()
+            thread = threading.Thread(
+                target=self._run,
+                args=(stop_event,),
+                name="hansel-quality-supervisor",
+                daemon=True,
+            )
+            self._stop_event = stop_event
+            self._thread = thread
+            thread.start()
+        return self
+
+    def stop(self, timeout: float = 1.0) -> bool:
+        """Request shutdown and wait at most ``timeout`` seconds.
+
+        The worker is a daemon thread, so a probe stuck in an operating-system
+        call cannot prevent process exit.  The return value is ``True`` when
+        the worker stopped within the requested bound.
+        """
+
+        timeout = max(0.0, timeout)
+        with self._state_lock:
+            thread = self._thread
+            self._stop_event.set()
+
+        if thread is None:
+            return True
+
+        thread.join(timeout)
+        stopped = not thread.is_alive()
+        if stopped:
+            with self._state_lock:
+                if self._thread is thread:
+                    self._thread = None
+        return stopped
+
+    def latest(self) -> QualityDecision:
+        """Return a thread-safe snapshot without performing network I/O."""
+
+        with self._decision_lock:
+            snapshot = copy.deepcopy(self._latest_decision)
+            last_success = self._last_success_monotonic
+            has_success = self._has_success
+        if (
+            has_success
+            and last_success is not None
+            and time.monotonic() - last_success
+            > self.supervisor.config.async_stale_s
+        ):
+            age = time.monotonic() - last_success
+            return replace(
+                snapshot,
+                status="STALE",
+                speed_cap=self.supervisor.config.danger_speed_cap,
+                camera_profile=2,
+                reasons=list(snapshot.reasons)
+                + [f"quality update stale for {age:.1f}s"],
+            )
+        return snapshot
+
+    @property
+    def last_error(self) -> Optional[str]:
+        with self._decision_lock:
+            return self._last_error
+
+    @property
+    def is_running(self) -> bool:
+        with self._state_lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def __enter__(self) -> "AsyncQualitySupervisor":
+        return self.start()
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.stop()
+
+    def _run(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                decision = self.supervisor.update()
+            except Exception as exc:  # Keep motor command refresh alive on probe failures.
+                error = f"quality update error: {type(exc).__name__}: {exc}"
+                with self._decision_lock:
+                    previous = self._last_successful_decision
+                    self._latest_decision = replace(
+                        previous,
+                        status="ERROR",
+                        speed_cap=self.supervisor.config.danger_speed_cap,
+                        camera_profile=2,
+                        reasons=list(previous.reasons) + [error],
+                    )
+                    self._last_error = error
+            else:
+                snapshot = copy.deepcopy(decision)
+                with self._decision_lock:
+                    self._last_successful_decision = snapshot
+                    self._latest_decision = snapshot
+                    self._last_error = None
+                    self._has_success = True
+                    self._last_success_monotonic = time.monotonic()
+
+            if stop_event.wait(self.interval):
+                break
 
 
 def read_latest_video_sample(path: Optional[str]) -> dict:
@@ -235,23 +393,38 @@ def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, 
             status = next_status
         reasons.append(reason)
 
+    def finite_number(value: object) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
     if not video:
-        raise_to("WARN", "video sample missing")
+        raise_to("DANGER", "video sample missing")
     else:
-        sample_ts = float(video.get("ts") or 0)
-        if sample_ts:
+        sample_ts = finite_number(video.get("ts"))
+        if sample_ts is None or sample_ts <= 0:
+            raise_to("DANGER", "video timestamp missing or invalid")
+        else:
             age = now - sample_ts
-            if age >= config.video_stale_danger_s:
+            if age < -1.0:
+                raise_to("DANGER", f"video timestamp is {-age:.1f}s in the future")
+            elif age >= config.video_stale_danger_s:
                 raise_to("DANGER", f"video stale {age:.1f}s")
             elif age >= config.video_stale_warn_s:
                 raise_to("WARN", f"video stale {age:.1f}s")
 
-        target_fps = float(video.get("target_fps") or config.target_fps)
-        fps = video.get("fps")
-        fps_ratio = video.get("fps_ratio")
-        if fps_ratio is None and fps is not None and target_fps > 0:
-            fps_ratio = float(fps) / target_fps
-        if fps_ratio is not None:
+        target_fps = finite_number(
+            video.get("target_fps", config.target_fps)
+        )
+        fps = finite_number(video.get("fps"))
+        fps_ratio = finite_number(video.get("fps_ratio"))
+        if fps_ratio is None and fps is not None and target_fps and target_fps > 0:
+            fps_ratio = fps / target_fps
+        if fps_ratio is None:
+            raise_to("DANGER", "video FPS unavailable or invalid")
+        else:
             if fps_ratio < config.fps_danger_ratio:
                 raise_to("DANGER", f"fps ratio {fps_ratio:.2f}")
             elif fps_ratio < config.fps_warn_ratio:
@@ -259,37 +432,52 @@ def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, 
 
         err_rate = video.get("err_rate")
         if err_rate is not None:
-            if float(err_rate) > config.err_danger_rate:
+            parsed_err_rate = finite_number(err_rate)
+            if parsed_err_rate is None:
+                raise_to("DANGER", "decode error rate invalid")
+            elif parsed_err_rate > config.err_danger_rate:
                 raise_to("DANGER", f"decode err/s {err_rate}")
-            elif float(err_rate) > config.err_warn_rate:
+            elif parsed_err_rate > config.err_warn_rate:
                 raise_to("WARN", f"decode err/s {err_rate}")
 
         drop_rate = video.get("drop_rate")
         if drop_rate is not None:
-            if float(drop_rate) > config.drop_danger_rate:
+            parsed_drop_rate = finite_number(drop_rate)
+            if parsed_drop_rate is None:
+                raise_to("DANGER", "video drop rate invalid")
+            elif parsed_drop_rate > config.drop_danger_rate:
                 raise_to("DANGER", f"drop/s {drop_rate}")
-            elif float(drop_rate) > config.drop_warn_rate:
+            elif parsed_drop_rate > config.drop_warn_rate:
                 raise_to("WARN", f"drop/s {drop_rate}")
 
     if ping:
         loss = ping.get("loss_pct")
         if loss is not None:
-            if float(loss) > config.loss_danger_pct:
+            parsed_loss = finite_number(loss)
+            if parsed_loss is None:
+                raise_to("DANGER", "ping loss value invalid")
+            elif parsed_loss > config.loss_danger_pct:
                 raise_to("DANGER", f"ping loss {loss}%")
-            elif float(loss) > config.loss_warn_pct:
+            elif parsed_loss > config.loss_warn_pct:
                 raise_to("WARN", f"ping loss {loss}%")
         rtt = ping.get("rtt_avg_ms")
         if rtt is not None:
-            if float(rtt) > config.rtt_danger_ms:
+            parsed_rtt = finite_number(rtt)
+            if parsed_rtt is None:
+                raise_to("DANGER", "RTT value invalid")
+            elif parsed_rtt > config.rtt_danger_ms:
                 raise_to("DANGER", f"rtt {rtt}ms")
-            elif float(rtt) > config.rtt_warn_ms:
+            elif parsed_rtt > config.rtt_warn_ms:
                 raise_to("WARN", f"rtt {rtt}ms")
 
     tq = batman.get("selected_tq_min") if batman else None
     if tq is not None:
-        if int(tq) < config.tq_danger:
+        parsed_tq = finite_number(tq)
+        if parsed_tq is None:
+            raise_to("DANGER", "BATMAN TQ value invalid")
+        elif parsed_tq < config.tq_danger:
             raise_to("DANGER", f"BATMAN TQ {tq}")
-        elif int(tq) < config.tq_warn:
+        elif parsed_tq < config.tq_warn:
             raise_to("WARN", f"BATMAN TQ {tq}")
 
     if not reasons:
@@ -297,14 +485,19 @@ def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, 
     return status, reasons
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate video-first link quality.")
     parser.add_argument("--video-log", default="video_quality.jsonl")
     parser.add_argument("--target-fps", type=float, default=15.0)
     parser.add_argument("--ping-ip", default=HEAD_IP)
     parser.add_argument("--base-ssh", default=None, help="optional base SSH target, e.g. hansel@192.168.60.1")
     parser.add_argument("--interval", type=float, default=0.5)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.target_fps) or args.target_fps <= 0:
+        parser.error("--target-fps must be finite and greater than zero")
+    if not math.isfinite(args.interval) or args.interval <= 0:
+        parser.error("--interval must be finite and greater than zero")
+    return args
 
 
 def main() -> int:

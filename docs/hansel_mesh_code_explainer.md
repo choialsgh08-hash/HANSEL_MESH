@@ -255,7 +255,11 @@ node 서버에서도 이중 안전장치를 둔다. node가 실수로 `left`, `r
 head에서:
 
 ```bash
-rpicam-vid -t 0 --nopreview --width 640 --height 480 --framerate 15 --codec h264 --inline --bitrate 1200000 -o udp://192.168.60.2:5600
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_ENABLED="yes", CAMERA_DEST_IP="192.168.60.2",
+# CAMERA_TRANSPORT="rtp", PROFILE="high" 확인
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 노트북에서:
@@ -553,10 +557,12 @@ start_camera_stream.sh on head
 
 현재 기본값은 `CAMERA_TRANSPORT=rtp`다. RTP는 UDP 위에 sequence number, timestamp, payload type을 얹어서 영상 패킷 순서와 손실을 수신 쪽에서 더 잘 판단하게 한다. 조종 명령은 그대로 UDP 7000을 사용하고, 영상은 UDP 5600을 사용하므로 두 흐름은 충돌하지 않는다.
 
-예전 raw UDP 방식으로 되돌릴 때:
+예전 raw UDP 방식으로 되돌릴 때도 관리 서비스의 설정만 바꾼다:
 
 ```bash
-CAMERA_TRANSPORT=raw ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_TRANSPORT="raw"로 변경
+sudo systemctl restart hansel-camera.service
 ```
 
 ## 8. BATMAN relay 판단 방법
@@ -611,12 +617,11 @@ ping -c 4 192.168.50.10
 ### 9.2 카메라 busy
 
 ```bash
-sudo pkill -f rpicam-vid
-sudo pkill -f libcamera-vid
-sudo pkill -f rpicam-hello
-sudo pkill -f libcamera-hello
-sudo pkill -f rpicam-still
-sudo pkill -f libcamera-still
+sudo systemctl stop hansel-camera.service
+# 설정과 로그를 확인한 뒤 다시 시작
+sudo systemctl status hansel-camera.service
+sudo journalctl -u hansel-camera.service -n 100 --no-pager
+sudo systemctl start hansel-camera.service
 ```
 
 ### 9.3 motor server 시작 실패
@@ -634,8 +639,8 @@ sudo pkill -f libcamera-still
 환경변수로 보정:
 
 ```bash
-HANSEL_LEFT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
-HANSEL_RIGHT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_LEFT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
+HANSEL_RIGHT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 ### 9.5 영상 깨짐
@@ -643,7 +648,10 @@ HANSEL_RIGHT_REVERSE=yes sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server
 낮은 설정으로 시작:
 
 ```bash
-PROFILE=2 CAMERA_TRANSPORT=rtp ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_TRANSPORT="rtp", PROFILE="2"로 변경
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 RTP packetizer가 없으면 head에 `ffmpeg` 또는 GStreamer가 필요하다.

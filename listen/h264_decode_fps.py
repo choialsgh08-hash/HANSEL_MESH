@@ -42,7 +42,7 @@ import time
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from common.monitor_common import kr_now_str, kr_now, DEFAULT_CAMERA_PORT  # noqa: E402
+from listen.monitor_common import kr_now_str, kr_now, DEFAULT_CAMERA_PORT  # noqa: E402
 
 
 # --- 디코더 출력에서 fps 수치 인식 ------------------------------------------

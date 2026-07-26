@@ -38,16 +38,16 @@ sudo pkill -f mesh_control_server.py
 
 ```bash
 cd ~/Projects/HANSEL_MESH
-ssh hansel@192.168.60.1 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/controller'
-scp -r robot controller hansel@192.168.60.1:/home/hansel/HANSEL_MESH/
+ssh hansel@192.168.60.1 'mkdir -p /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/controller'
+scp -r common robot controller hansel@192.168.60.1:/home/hansel/HANSEL_MESH/
 ```
 
 Base에서 Head/node1/node2로:
 
 ```bash
-scp -r /home/hansel/HANSEL_MESH/robot hansel@192.168.50.10:/home/hansel/HANSEL_MESH/
-scp -r /home/hansel/HANSEL_MESH/robot hansel@192.168.50.11:/home/hansel/HANSEL_MESH/
-scp -r /home/hansel/HANSEL_MESH/robot hansel@192.168.50.12:/home/hansel/HANSEL_MESH/
+scp -r /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/robot hansel@192.168.50.10:/home/hansel/HANSEL_MESH/
+scp -r /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/robot hansel@192.168.50.11:/home/hansel/HANSEL_MESH/
+scp -r /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/robot hansel@192.168.50.12:/home/hansel/HANSEL_MESH/
 ```
 
 ## 4. Dry-run 확인
@@ -77,21 +77,21 @@ Head에서:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 node1에서:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32
 ```
 
 node2에서:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2 --host 192.168.50.12 --allow-source 192.168.60.2/32
 ```
 
 Head 고개 서보와 detach 서보는 pigpio가 있으면 pigpio의 hardware-timed PWM을 쓰고, 없으면 `SoftwareServoPwm` fallback으로 20ms servo pulse를 직접 만든다. 더 안정적인 서보 펄스를 쓰려면 pigpio daemon을 켠다.
@@ -117,6 +117,13 @@ Head만 테스트할 때:
 python3 controller/mesh_control_client.py --target head --speed 0.5 --live
 ```
 
+클라이언트는 키 입력을 받기 전에 선택된 모든 target에 `stop`을 보내고 ACK를
+확인한다. `--target all`에서는 현재 active 목록의 서버가 모두 실행 중이어야 한다.
+Head 단독 벤치 시험이라면 `--target head`로 시작한다. 시작 stop ACK가 하나라도
+없으면 조종 세션은 fail-closed로 종료되고 이동 명령을 보내지 않는다.
+기본 active 목록은 현재 기본 체인인 `head,node1,node2`이다. optional node3를
+장착했다면 `--active-targets head,node1,node2,node3`를 명시한다.
+
 Live mode 키:
 
 | 키 | 명령 |
@@ -140,7 +147,7 @@ Live mode 키:
 | 3 | node2 GPIO6 서보 동작, node3 분리 |
 | Ctrl+C | stop 보내고 종료 |
 
-`1/2/3`을 누르면 먼저 분리될 node에 `relay_hold`를 보내서 주행을 잠그고, 이후 해당 node를 live mode의 `all` 주행 대상에서 제외한다. 분리된 node는 그 자리에 남아 BATMAN relay 역할만 한다.
+`1/2/3`을 누르면 모든 이동 유닛의 stop ACK를 확인하고, 분리될 node의 `relay_hold` ACK를 받은 뒤 서보를 동작시킨다. 기본 모드에서는 운전자가 실제 분리를 확인해야만 해당 node를 live mode의 `all` 주행 대상에서 제외한다. 확인하지 않거나 ACK가 끊기면 정지 상태로 조종 세션을 종료한다.
 
 Line mode도 가능하다.
 
@@ -165,9 +172,9 @@ t all
 quit
 ```
 
-`detach` 또는 `1/2/3`으로 실행되는 `detach_press`는 press 각도로 이동한 뒤 그 각도를 유지한다. 다시 원위치로 돌리고 싶을 때만 `detach_rest`를 수동으로 보낸다.
+안전한 분리는 `1/2/3` 명령을 사용한다. 원시 `detach` 명령은 stop/relay 절차를 우회하므로 기본적으로 클라이언트와 서버 모두 거부하며, 바퀴를 띄운 벤치 시험에서 양쪽에 unsafe 옵션을 명시한 경우에만 허용된다. `detach_press`는 press 각도로 이동해 설정된 시간 동안 누른 뒤 자동으로 rest 각도로 복귀한다. ACK는 이 소프트웨어 동작이 끝났다는 뜻이며 실제 기계 분리는 운전자나 별도 센서로 확인해야 한다.
 
-분리된 node는 `relay_hold` 상태에서 `forward/backward/slow_forward` 같은 주행 명령을 무시한다. 다시 테스트를 위해 움직이게 하려면 해당 target에 `drive_enable`을 보낸다.
+분리된 node는 `relay_hold` 상태에서 `forward/backward/slow_forward` 같은 주행 명령을 무시한다. 운영 서비스에서는 이 latch를 `/var/lib/hansel-mesh`에 저장하므로 제어 서버나 Pi가 재시작되어도 잠금 상태가 유지된다. 다시 테스트를 위해 움직이게 하려면 해당 target에 `drive_enable`을 명시적으로 보낸다.
 
 ## 7. 튜닝 환경변수
 
@@ -176,20 +183,20 @@ quit
 특정 모터가 다시 반대로 돌면 해당 Pi에서 서버 실행 전 환경변수를 `no` 또는 `yes`로 바꿔 보정한다.
 
 ```bash
-HANSEL_LEFT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
-HANSEL_RIGHT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_LEFT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
+HANSEL_RIGHT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 속도를 낮춰 시작:
 
 ```bash
-HANSEL_SPEED_SCALE=0.45 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_SPEED_SCALE=0.45 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 Node 기본 속도만 낮추기:
 
 ```bash
-HANSEL_SPEED_SCALE=0.5 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1
+HANSEL_SPEED_SCALE=0.5 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32
 ```
 
 기본값은 head/node 모두 `1.0`이다. 즉 `w`만 누르면 모든 유닛이 같은 목표 CPS로 최대속도를 낸다. Head 조향 중에만 node 쪽 명령이 `slow_forward` 또는 `slow_backward`로 낮아진다.
@@ -197,13 +204,13 @@ HANSEL_SPEED_SCALE=0.5 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.p
 앞쪽 Head DC모터를 임시로 끄기:
 
 ```bash
-HANSEL_FRONT_MOTOR_ENABLED=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_FRONT_MOTOR_ENABLED=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 서보 fallback PWM 튜닝:
 
 ```bash
-HANSEL_HEAD_SERVO_STEP_ANGLE=1 HANSEL_HEAD_SERVO_RAMP_STEP_ANGLE=0.5 HANSEL_HEAD_SERVO_RAMP_INTERVAL=0.08 HANSEL_SERVO_SOFT_PWM_SPIN_US=300 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_HEAD_SERVO_STEP_ANGLE=1 HANSEL_HEAD_SERVO_RAMP_STEP_ANGLE=0.5 HANSEL_HEAD_SERVO_RAMP_INTERVAL=0.08 HANSEL_SERVO_SOFT_PWM_SPIN_US=300 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 pigpio가 없으면 `SoftwareServoPwm` fallback이 20ms servo frame을 직접 만들고, 마지막 수백 us는 busy wait로 지터를 줄인다. `HANSEL_SERVO_SOFT_PWM_SPIN_US`를 키우면 정밀도는 조금 좋아질 수 있지만 CPU 사용량이 늘어난다. pigpio가 정상 연결되면 이 fallback은 쓰지 않는다.
@@ -211,7 +218,7 @@ pigpio가 없으면 `SoftwareServoPwm` fallback이 20ms servo frame을 직접 �
 PID 튜닝:
 
 ```bash
-HANSEL_KP_LEFT=0.035 HANSEL_KI_LEFT=0.015 HANSEL_KP_RIGHT=0.035 HANSEL_KI_RIGHT=0.015 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_KP_LEFT=0.035 HANSEL_KI_LEFT=0.015 HANSEL_KP_RIGHT=0.035 HANSEL_KI_RIGHT=0.015 sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 기본값은 이전 GitHub 제어 코드의 엔코더 PID 값을 가져온다.

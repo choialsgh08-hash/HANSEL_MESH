@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import math
 import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -37,12 +38,15 @@ def env_float(name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         return default
+    return value if math.isfinite(value) else default
 
 
 def clamp(value: float, min_value: float, max_value: float) -> float:
+    if not math.isfinite(value):
+        return min_value
     return max(min_value, min(max_value, value))
 
 
@@ -52,6 +56,49 @@ def clamp_pwm(value: float) -> float:
 
 def clamp_angle(angle: float, min_angle: int = 0, max_angle: int = 180) -> int:
     return int(clamp(angle, min_angle, max_angle))
+
+
+DRIVE_COMMANDS = {
+    "forward",
+    "backward",
+    "left",
+    "right",
+    "forward_left",
+    "forward_right",
+    "backward_left",
+    "backward_right",
+    "mild_forward_left",
+    "mild_forward_right",
+    "mild_backward_left",
+    "mild_backward_right",
+    "slow_forward",
+    "slow_backward",
+    "front_motor_forward",
+    "front_motor_backward",
+    "front_forward",
+    "front_backward",
+}
+
+NON_DRIVE_COMMANDS = {
+    "stop",
+    "relay_hold",
+    "drive_disable",
+    "drive_enable",
+    "detach_press",
+    "detach_rest",
+    "head_servo_up",
+    "head_servo_down",
+    "head_servo_center",
+    "head_servo_min",
+    "head_servo_max",
+    "servo_up",
+    "servo_down",
+    "servo_center",
+    "servo_min",
+    "servo_max",
+    "front_motor_stop",
+    "front_stop",
+}
 
 
 @dataclass(frozen=True)
@@ -96,6 +143,15 @@ class RoleConfig:
     node_slow_ratio: float
 
 
+@dataclass(frozen=True)
+class EncoderSnapshot:
+    """Atomic read-only copy of cumulative wheel encoder counts."""
+
+    monotonic_ns: int
+    left_count: int
+    right_count: int
+
+
 DEFAULT_DRIVE_PINS = MotorPins(18, 23, 24, 13, 27, 22)
 DEFAULT_ENCODER_PINS = EncoderPins(20, 21, 16, 26)
 DEFAULT_FRONT_MOTOR_PINS = MotorPins(12, 3, 8, 19, 5, 7)
@@ -131,19 +187,44 @@ class DryRunRobotController:
         self.reason = reason
         self.running = False
         self.last_command = "stop"
+        self.drive_enabled = True
 
     def start(self) -> None:
         self.running = True
         print(f"[{self.role}] dry-run motor controller active: {self.reason}")
 
-    def handle_command(self, command: str, message: Optional[dict] = None) -> None:
-        self.last_command = command
-        print(f"[{self.role}] dry-run command={command} message={message or {}}")
+    def handle_command(self, command: str, message: Optional[dict] = None) -> Tuple[bool, str]:
+        normalized = command.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"relay_hold", "drive_disable"}:
+            self.drive_enabled = False
+            self.last_command = "stop"
+            print(f"[{self.role}] dry-run drive disabled and stopped")
+            return True, "drive_disabled"
+        if normalized == "drive_enable":
+            self.drive_enabled = True
+            print(f"[{self.role}] dry-run drive enabled")
+            return True, "drive_enabled"
+        if normalized in DRIVE_COMMANDS and not self.drive_enabled:
+            print(f"[{self.role}] dry-run rejected command={normalized}: drive disabled")
+            return False, "drive_disabled"
+        if normalized not in DRIVE_COMMANDS and normalized not in NON_DRIVE_COMMANDS:
+            print(f"[{self.role}] dry-run unknown command={command}")
+            return False, "unknown_command"
+        self.last_command = normalized
+        print(f"[{self.role}] dry-run command={normalized} message={message or {}}")
+        return True, "applied"
 
     def stop(self) -> None:
         if self.running:
             print(f"[{self.role}] dry-run stop")
         self.running = False
+
+    def encoder_snapshot(self) -> EncoderSnapshot:
+        return EncoderSnapshot(
+            monotonic_ns=time.monotonic_ns(),
+            left_count=0,
+            right_count=0,
+        )
 
 
 class GpioRobotController:
@@ -166,7 +247,11 @@ class GpioRobotController:
     SERVO_FREQ = 50
     DETACH_REST_ANGLE = int(env_float("HANSEL_DETACH_REST_ANGLE", 20))
     DETACH_PRESS_ANGLE = int(env_float("HANSEL_DETACH_PRESS_ANGLE", 75))
-    DETACH_PRESS_TIME = env_float("HANSEL_DETACH_PRESS_TIME", 0.35)
+    DETACH_PRESS_TIME = clamp(
+        env_float("HANSEL_DETACH_PRESS_TIME", 0.35),
+        0.05,
+        2.0,
+    )
     HEAD_SERVO_MIN_ANGLE = int(env_float("HANSEL_HEAD_SERVO_MIN_ANGLE", 20))
     HEAD_SERVO_MAX_ANGLE = int(env_float("HANSEL_HEAD_SERVO_MAX_ANGLE", 150))
     HEAD_SERVO_CENTER_ANGLE = int(env_float("HANSEL_HEAD_SERVO_CENTER_ANGLE", 70))
@@ -220,6 +305,8 @@ class GpioRobotController:
         self.right_prev_error = 0.0
         self.current_head_servo_angle = self.HEAD_SERVO_CENTER_ANGLE
         self.last_debug_time = 0.0
+        self.drive_enabled = True
+        self.control_fault: Optional[str] = None
 
         self.pwm_left = None
         self.pwm_right = None
@@ -233,6 +320,7 @@ class GpioRobotController:
 
     def start(self) -> None:
         print(f"[{self.role}] starting GPIO motor controller")
+        self.control_fault = None
         self._check_duplicate_pins()
         self._setup_gpio()
         self.stop_all()
@@ -255,6 +343,16 @@ class GpioRobotController:
         thread = threading.Thread(target=target, name=f"{self.role}-{name}", daemon=True)
         thread.start()
         self.threads.append(thread)
+
+    def encoder_snapshot(self) -> EncoderSnapshot:
+        """Copy encoder state without changing PID counters or holding I/O."""
+
+        with self.encoder_lock:
+            return EncoderSnapshot(
+                monotonic_ns=time.monotonic_ns(),
+                left_count=self.left_count,
+                right_count=self.right_count,
+            )
 
     def _check_duplicate_pins(self) -> None:
         pins = {
@@ -401,12 +499,7 @@ class GpioRobotController:
                     )
                     self.right_last_state = right_state
             except Exception as exc:
-                print(f"[{self.role}] encoder polling error: {exc}")
-                self.running.clear()
-                try:
-                    self.stop_all()
-                except Exception:
-                    pass
+                self._fail_closed_control_loop("encoder", exc)
                 break
 
             time.sleep(self.ENCODER_POLL_INTERVAL)
@@ -450,6 +543,9 @@ class GpioRobotController:
         right_cps: float,
         right_dir: str,
     ) -> None:
+        if not self.drive_enabled:
+            print(f"[{self.role}] drive target ignored: propulsion latch disabled")
+            return
         with self.target_lock:
             self.left_target_cps = abs(float(left_cps))
             self.right_target_cps = abs(float(right_cps))
@@ -476,10 +572,22 @@ class GpioRobotController:
             try:
                 speed = float(message["speed"])
             except (TypeError, ValueError):
-                speed = self.config.default_speed_scale
+                speed = 0.0
         speed = clamp(speed, 0.0, 1.0)
         full = self.config.full_speed_cps_left if side == "left" else self.config.full_speed_cps_right
         return full * ratio * speed
+
+    def _front_command_pwm(self, message: Optional[dict] = None) -> float:
+        """Apply the same validated 0..1 command scale to keyed front motion."""
+        speed = self.config.default_speed_scale
+        if message is not None and "speed" in message:
+            try:
+                speed = float(message["speed"])
+            except (TypeError, ValueError):
+                speed = 0.0
+        return clamp_pwm(
+            self.FRONT_MOTOR_KEY_PWM * clamp(speed, 0.0, 1.0)
+        )
 
     def forward(self, message: Optional[dict] = None) -> None:
         self._set_drive_target(
@@ -581,9 +689,10 @@ class GpioRobotController:
         speed = self.config.node_slow_ratio
         if message is not None and "speed" in message:
             try:
-                speed = min(float(message["speed"]), self.config.node_slow_ratio)
+                speed = float(message["speed"])
             except (TypeError, ValueError):
-                speed = self.config.node_slow_ratio
+                speed = 0.0
+        speed = clamp(speed, 0.0, self.config.node_slow_ratio)
         self._set_drive_target(
             self.config.full_speed_cps_left * speed,
             "forward",
@@ -595,9 +704,10 @@ class GpioRobotController:
         speed = self.config.node_slow_ratio
         if message is not None and "speed" in message:
             try:
-                speed = min(float(message["speed"]), self.config.node_slow_ratio)
+                speed = float(message["speed"])
             except (TypeError, ValueError):
-                speed = self.config.node_slow_ratio
+                speed = 0.0
+        speed = clamp(speed, 0.0, self.config.node_slow_ratio)
         self._set_drive_target(
             self.config.full_speed_cps_left * speed,
             "backward",
@@ -609,6 +719,8 @@ class GpioRobotController:
         with self.target_lock:
             self.left_target_cps = 0.0
             self.right_target_cps = 0.0
+            self.left_direction = "stop"
+            self.right_direction = "stop"
             self.left_pwm_value = 0.0
             self.right_pwm_value = 0.0
             self.left_integral = 0.0
@@ -623,6 +735,17 @@ class GpioRobotController:
             if self.pwm_right is not None:
                 self.pwm_right.ChangeDutyCycle(0)
             self.front_motor_stop()
+
+    def disable_drive(self, message: Optional[dict] = None) -> None:
+        """Latch propulsion off until an explicit drive_enable command."""
+        self.drive_enabled = False
+        self.stop_all(message)
+        print(f"[{self.role}] propulsion latch disabled")
+
+    def enable_drive(self, message: Optional[dict] = None) -> None:
+        """Clear the propulsion latch without starting any motor."""
+        self.drive_enabled = True
+        print(f"[{self.role}] propulsion latch enabled")
 
     def _compute_pid_pwm(
         self,
@@ -659,78 +782,101 @@ class GpioRobotController:
         print(f"[{self.role}] PID control loop started")
         prev_left_count = 0
         prev_right_count = 0
-        prev_time = time.time()
+        prev_time = time.monotonic()
 
         while self.running.is_set():
             time.sleep(self.CONTROL_INTERVAL)
+            try:
+                now = time.monotonic()
+                dt = now - prev_time
+                if dt <= 0:
+                    continue
 
-            now = time.time()
-            dt = now - prev_time
-            if dt <= 0:
-                continue
+                with self.encoder_lock:
+                    current_left_count = self.left_count
+                    current_right_count = self.right_count
 
-            with self.encoder_lock:
-                current_left_count = self.left_count
-                current_right_count = self.right_count
+                delta_left = current_left_count - prev_left_count
+                delta_right = current_right_count - prev_right_count
+                prev_left_count = current_left_count
+                prev_right_count = current_right_count
+                prev_time = now
 
-            delta_left = current_left_count - prev_left_count
-            delta_right = current_right_count - prev_right_count
-            prev_left_count = current_left_count
-            prev_right_count = current_right_count
-            prev_time = now
+                measured_left_cps = abs(delta_left) / dt
+                measured_right_cps = abs(delta_right) / dt
 
-            measured_left_cps = abs(delta_left) / dt
-            measured_right_cps = abs(delta_right) / dt
-
-            with self.target_lock:
-                self.left_pwm_value, self.left_integral, self.left_prev_error = self._compute_pid_pwm(
-                    self.left_target_cps,
-                    measured_left_cps,
-                    self.config.full_speed_cps_left,
-                    self.gains.kp_left,
-                    self.gains.ki_left,
-                    self.gains.kd_left,
-                    self.left_integral,
-                    self.left_prev_error,
-                    self.left_pwm_value,
-                    dt,
-                )
-
-                self.right_pwm_value, self.right_integral, self.right_prev_error = self._compute_pid_pwm(
-                    self.right_target_cps,
-                    measured_right_cps,
-                    self.config.full_speed_cps_right,
-                    self.gains.kp_right,
-                    self.gains.ki_right,
-                    self.gains.kd_right,
-                    self.right_integral,
-                    self.right_prev_error,
-                    self.right_pwm_value,
-                    dt,
-                )
-
-                left_pwm = 0.0 if self.left_target_cps <= 0 else self.left_pwm_value
-                right_pwm = 0.0 if self.right_target_cps <= 0 else self.right_pwm_value
-
-            self.pwm_left.ChangeDutyCycle(left_pwm)
-            self.pwm_right.ChangeDutyCycle(right_pwm)
-
-            if self.front_follow_drive and self.config.front_motor_pins is not None:
-                self._apply_front_pwm(left_pwm * self.front_speed_ratio, right_pwm * self.front_speed_ratio)
-
-            if now - self.last_debug_time >= self.DEBUG_PRINT_INTERVAL:
-                self.last_debug_time = now
                 with self.target_lock:
-                    target_left = self.left_target_cps
-                    target_right = self.right_target_cps
-                    pwm_left = self.left_pwm_value
-                    pwm_right = self.right_pwm_value
-                if target_left > 0 or target_right > 0:
-                    print(
-                        f"[{self.role}] "
-                        f"L target={target_left:.1f} cps measured={measured_left_cps:.1f} pwm={pwm_left:.1f} | "
-                        f"R target={target_right:.1f} cps measured={measured_right_cps:.1f} pwm={pwm_right:.1f}"
+                    self.left_pwm_value, self.left_integral, self.left_prev_error = self._compute_pid_pwm(
+                        self.left_target_cps,
+                        measured_left_cps,
+                        self.config.full_speed_cps_left,
+                        self.gains.kp_left,
+                        self.gains.ki_left,
+                        self.gains.kd_left,
+                        self.left_integral,
+                        self.left_prev_error,
+                        self.left_pwm_value,
+                        dt,
                     )
+
+                    self.right_pwm_value, self.right_integral, self.right_prev_error = self._compute_pid_pwm(
+                        self.right_target_cps,
+                        measured_right_cps,
+                        self.config.full_speed_cps_right,
+                        self.gains.kp_right,
+                        self.gains.ki_right,
+                        self.gains.kd_right,
+                        self.right_integral,
+                        self.right_prev_error,
+                        self.right_pwm_value,
+                        dt,
+                    )
+
+                    left_pwm = 0.0 if self.left_target_cps <= 0 else self.left_pwm_value
+                    right_pwm = 0.0 if self.right_target_cps <= 0 else self.right_pwm_value
+
+                self.pwm_left.ChangeDutyCycle(left_pwm)
+                self.pwm_right.ChangeDutyCycle(right_pwm)
+
+                if self.front_follow_drive and self.config.front_motor_pins is not None:
+                    self._apply_front_pwm(left_pwm * self.front_speed_ratio, right_pwm * self.front_speed_ratio)
+
+                if now - self.last_debug_time >= self.DEBUG_PRINT_INTERVAL:
+                    self.last_debug_time = now
+                    with self.target_lock:
+                        target_left = self.left_target_cps
+                        target_right = self.right_target_cps
+                        pwm_left = self.left_pwm_value
+                        pwm_right = self.right_pwm_value
+                    if target_left > 0 or target_right > 0:
+                        print(
+                            f"[{self.role}] "
+                            f"L target={target_left:.1f} cps measured={measured_left_cps:.1f} pwm={pwm_left:.1f} | "
+                            f"R target={target_right:.1f} cps measured={measured_right_cps:.1f} pwm={pwm_right:.1f}"
+                        )
+            except Exception as exc:
+                self._fail_closed_control_loop("pid", exc)
+                break
+
+    def _fail_closed_control_loop(
+        self,
+        loop_name: str,
+        error: Exception,
+    ) -> None:
+        self.control_fault = f"{loop_name}: {type(error).__name__}: {error}"
+        self.drive_enabled = False
+        self.running.clear()
+        print(
+            f"[{self.role}] {loop_name} control fault; propulsion disabled: "
+            f"{error}"
+        )
+        try:
+            self.stop_all()
+        except Exception as stop_error:
+            print(
+                f"[{self.role}] CRITICAL: failed to stop after "
+                f"{loop_name} fault: {stop_error}"
+            )
 
     def _apply_front_left_direction(self, direction: str) -> None:
         front = self.config.front_motor_pins
@@ -758,7 +904,8 @@ class GpioRobotController:
             return
         self._apply_front_left_direction("forward")
         self._apply_front_right_direction("forward")
-        self._apply_front_pwm(self.FRONT_MOTOR_KEY_PWM, self.FRONT_MOTOR_KEY_PWM)
+        pwm = self._front_command_pwm(message)
+        self._apply_front_pwm(pwm, pwm)
 
     def front_motor_backward(self, message: Optional[dict] = None) -> None:
         if self.config.front_motor_pins is None:
@@ -766,7 +913,8 @@ class GpioRobotController:
             return
         self._apply_front_left_direction("backward")
         self._apply_front_right_direction("backward")
-        self._apply_front_pwm(self.FRONT_MOTOR_KEY_PWM, self.FRONT_MOTOR_KEY_PWM)
+        pwm = self._front_command_pwm(message)
+        self._apply_front_pwm(pwm, pwm)
 
     def front_motor_stop(self, message: Optional[dict] = None) -> None:
         if self.config.front_motor_pins is None:
@@ -796,9 +944,32 @@ class GpioRobotController:
         self.set_detach_servo_angle(self.DETACH_REST_ANGLE, hold=False)
 
     def detach_servo_press(self, message: Optional[dict] = None) -> None:
-        self.set_detach_servo_angle(self.DETACH_PRESS_ANGLE, hold=True)
-        time.sleep(self.DETACH_PRESS_TIME)
-        self.set_detach_servo_angle(self.DETACH_REST_ANGLE, hold=False)
+        try:
+            self.set_detach_servo_angle(
+                self.DETACH_PRESS_ANGLE,
+                hold=True,
+            )
+            time.sleep(
+                clamp(self.DETACH_PRESS_TIME, 0.05, 2.0)
+            )
+        finally:
+            # Never leave the servo energized in the release position, even
+            # if timing or GPIO code raises after the press starts.
+            try:
+                self.set_detach_servo_angle(
+                    self.DETACH_REST_ANGLE,
+                    hold=False,
+                )
+            finally:
+                detach_pwm = getattr(self, "detach_servo_pwm", None)
+                if detach_pwm is not None:
+                    try:
+                        detach_pwm.ChangeDutyCycle(0)
+                    except Exception as exc:
+                        print(
+                            f"[{self.role}] CRITICAL: failed to de-energize "
+                            f"detach servo after press: {exc}"
+                        )
 
     def _head_servo_pulse_us(self, angle: int) -> int:
         angle = clamp_angle(angle, self.HEAD_SERVO_MIN_ANGLE, self.HEAD_SERVO_MAX_ANGLE)
@@ -850,13 +1021,26 @@ class GpioRobotController:
     def head_servo_max(self, message: Optional[dict] = None) -> None:
         self.set_head_servo_angle(self.HEAD_SERVO_MAX_ANGLE)
 
-    def handle_command(self, command: str, message: Optional[dict] = None) -> None:
+    def handle_command(self, command: str, message: Optional[dict] = None) -> Tuple[bool, str]:
         normalized = command.strip().lower().replace("-", "_").replace(" ", "_")
         if not normalized:
-            return
+            return False, "invalid_command"
 
         if self.role != "head":
             normalized = self._normalize_node_command(normalized)
+
+        if self.control_fault is not None and (
+            normalized in DRIVE_COMMANDS or normalized == "drive_enable"
+        ):
+            print(
+                f"[{self.role}] rejected command={normalized}: "
+                f"controller fault is latched ({self.control_fault})"
+            )
+            return False, "controller_fault"
+
+        if normalized in DRIVE_COMMANDS and not self.drive_enabled:
+            print(f"[{self.role}] rejected command={normalized}: propulsion latch disabled")
+            return False, "drive_disabled"
 
         command_map: Dict[str, Callable[[Optional[dict]], None]] = {
             "forward": self.forward,
@@ -874,6 +1058,9 @@ class GpioRobotController:
             "mild_backward_right": self.mild_backward_right,
             "slow_forward": self.slow_forward,
             "slow_backward": self.slow_backward,
+            "relay_hold": self.disable_drive,
+            "drive_disable": self.disable_drive,
+            "drive_enable": self.enable_drive,
             "detach_press": self.detach_servo_press,
             "detach_rest": self.detach_servo_rest,
             "head_servo_up": self.head_servo_up_step,
@@ -897,10 +1084,15 @@ class GpioRobotController:
         action = command_map.get(normalized)
         if action is None:
             print(f"[{self.role}] unknown command: {command}")
-            return
+            return False, "unknown_command"
 
         print(f"[{self.role}] command={normalized}")
         action(message)
+        if normalized in {"relay_hold", "drive_disable"}:
+            return True, "drive_disabled"
+        if normalized == "drive_enable":
+            return True, "drive_enabled"
+        return True, "applied"
 
     @staticmethod
     def _normalize_node_command(command: str) -> str:
@@ -971,5 +1163,8 @@ def build_robot_controller(role: str, dry_run: bool = False):
     if dry_run:
         return DryRunRobotController(role, "--dry-run requested")
     if GPIO is None:
-        return DryRunRobotController(role, "RPi.GPIO not installed")
+        raise RuntimeError(
+            "RPi.GPIO is not installed; install the Raspberry Pi runtime "
+            "dependency or pass --dry-run explicitly"
+        )
     return GpioRobotController(role_config(role))

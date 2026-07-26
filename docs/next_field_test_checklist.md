@@ -162,19 +162,19 @@ sudo batctl o
 Head에서:
 
 ```bash
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 node1에서:
 
 ```bash
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32
 ```
 
 node2에서:
 
 ```bash
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2 --host 192.168.50.12 --allow-source 192.168.60.2/32
 ```
 
 노트북에서:
@@ -204,15 +204,10 @@ python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --dry-run
 
 ## 8. 카메라 테스트
 
-카메라가 busy이면 Head에서 먼저 정리한다.
+Head의 관리 서비스를 먼저 멈춰 카메라 소유권을 정리한다.
 
 ```bash
-sudo pkill -f rpicam-vid
-sudo pkill -f libcamera-vid
-sudo pkill -f rpicam-hello
-sudo pkill -f libcamera-hello
-sudo pkill -f rpicam-still
-sudo pkill -f libcamera-still
+sudo systemctl stop hansel-camera.service
 ```
 
 노트북에서 수신:
@@ -223,17 +218,28 @@ CAMERA_TRANSPORT=rtp \
 ./scripts/receive_camera_stream.sh 5600
 ```
 
-Head에서 송신:
+Head에서 저대역폭 프로필로 관리 서비스를 시작:
 
 ```bash
-CAMERA_TRANSPORT=rtp PROFILE=2 \
-~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+cd ~/HANSEL_MESH
+sudo install -d -m 0755 /etc/hansel-mesh
+sudo test -f /etc/hansel-mesh/camera.env || \
+  sudo install -m 0644 configs/camera.env.example /etc/hansel-mesh/camera.env
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_ENABLED="yes", CAMERA_DEST_IP="192.168.60.2",
+# CAMERA_TRANSPORT="rtp", PROFILE="2" 확인
+sudo ./scripts/enable_mesh_autostart.sh head --with-camera
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 가까운 거리에서 안정적이면 다음 설정으로 올린다.
 
 ```bash
-rpicam-vid -t 0 --nopreview --width 640 --height 480 --framerate 15 --codec h264 --inline --bitrate 1200000 -o udp://192.168.60.2:5600
+sudoedit /etc/hansel-mesh/camera.env
+# PROFILE="0"으로 변경
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 ## 9. 종료
@@ -248,6 +254,8 @@ Ctrl + C
 
 ```bash
 cd ~/HANSEL_MESH
+# head에서만 먼저 실행
+sudo systemctl stop hansel-camera.service
 sudo ./scripts/stop_mesh.sh
 sudo poweroff
 ```

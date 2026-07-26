@@ -22,6 +22,8 @@ Head Pi / Robot
 | node2    | 릴레이 유닛 2            | configs/node2.env | 192.168.50.12 |
 
 `node3`는 예비 Pi가 생겼을 때 추가할 optional 릴레이입니다.
+조종 클라이언트의 기본 active 목록도 `head,node1,node2`이다. node3를 실제로
+연결한 시험에서는 `--active-targets head,node1,node2,node3`를 추가한다.
 
 ## 기본 실행 순서
 
@@ -64,6 +66,17 @@ sudo batctl o
 내일 구동 + 카메라 테스트 전체 순서는 [Tomorrow Drive + Camera Runbook](docs/tomorrow_drive_camera_runbook.md)을 따른다.
 
 팀원 설명용 코드/원리 문서는 [HANSEL_MESH Code And Network Explainer](docs/hansel_mesh_code_explainer.md)를 따른다.
+
+## 전방 레이더 화면
+
+레이더가 없어도 합성 붕괴현장 점군으로 화면을 먼저 확인할 수 있다.
+
+```bash
+python3 monitor/radar_front.py --demo
+```
+
+실제 IWRL6432 UART 캡처와 화면 연결 절차는
+[IWRL6432 Front Radar View](docs/radar_front_view.md)를 따른다.
 
 ## 통신 원칙
 

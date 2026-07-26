@@ -79,8 +79,8 @@ base mesh와 LAN gateway가 살아 있어야 파일 복사가 쉽다. 새로 켠
 
 ```bash
 cd ~/Projects/HANSEL_MESH
-ssh hansel@192.168.60.1 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/controller /home/hansel/HANSEL_MESH/scripts /home/hansel/HANSEL_MESH/docs'
-scp -r robot controller scripts docs README.md hansel@192.168.60.1:/home/hansel/HANSEL_MESH/
+ssh hansel@192.168.60.1 'mkdir -p /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/configs /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/controller /home/hansel/HANSEL_MESH/scripts /home/hansel/HANSEL_MESH/services /home/hansel/HANSEL_MESH/docs'
+scp -r common configs robot controller scripts services docs README.md hansel@192.168.60.1:/home/hansel/HANSEL_MESH/
 ```
 
 base에서 각 Pi로:
@@ -90,9 +90,9 @@ ssh hansel@192.168.50.10 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/H
 ssh hansel@192.168.50.11 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts'
 ssh hansel@192.168.50.12 'mkdir -p /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts'
 
-scp -r /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts hansel@192.168.50.10:/home/hansel/HANSEL_MESH/
-scp -r /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts hansel@192.168.50.11:/home/hansel/HANSEL_MESH/
-scp -r /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts hansel@192.168.50.12:/home/hansel/HANSEL_MESH/
+scp -r /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/configs /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts /home/hansel/HANSEL_MESH/services hansel@192.168.50.10:/home/hansel/HANSEL_MESH/
+scp -r /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/configs /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts /home/hansel/HANSEL_MESH/services hansel@192.168.50.11:/home/hansel/HANSEL_MESH/
+scp -r /home/hansel/HANSEL_MESH/common /home/hansel/HANSEL_MESH/configs /home/hansel/HANSEL_MESH/robot /home/hansel/HANSEL_MESH/scripts /home/hansel/HANSEL_MESH/services hansel@192.168.50.12:/home/hansel/HANSEL_MESH/
 ```
 
 ## 3. Pi 전원 켜기
@@ -265,21 +265,21 @@ head에서:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 node1에서:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32
 ```
 
 node2에서:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2
+sudo python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role node2 --host 192.168.50.12 --allow-source 192.168.60.2/32
 ```
 
 서버 시작 실패 시 확인:
@@ -323,8 +323,8 @@ python3 controller/mesh_control_client.py --target all --speed 0.4 --live
 현재 기본값은 `w`가 물리 전진, `s`가 물리 후진이 되도록 주행 모터 방향을 reverse 처리한다. 특정 모터가 다시 반대로 돌면 서버 실행 전 환경변수로 보정:
 
 ```bash
-HANSEL_LEFT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
-HANSEL_RIGHT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head
+HANSEL_LEFT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
+HANSEL_RIGHT_REVERSE=no sudo -E python3 ~/HANSEL_MESH/robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 방향 확인 후 최대속도:
@@ -343,35 +343,43 @@ CAMERA_TRANSPORT=rtp \
 ./scripts/receive_camera_stream.sh 5600
 ```
 
-head에서 카메라 busy 정리:
+head에서 카메라 관리 서비스를 먼저 정지:
 
 ```bash
-sudo pkill -f rpicam-vid
-sudo pkill -f libcamera-vid
-sudo pkill -f rpicam-hello
-sudo pkill -f libcamera-hello
-sudo pkill -f rpicam-still
-sudo pkill -f libcamera-still
+sudo systemctl stop hansel-camera.service
 ```
 
-head에서 저대역폭 송신:
+head에서 저대역폭 프로필로 관리 서비스를 시작:
 
 ```bash
 cd ~/HANSEL_MESH
-CAMERA_TRANSPORT=rtp PROFILE=2 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+sudo install -d -m 0755 /etc/hansel-mesh
+sudo test -f /etc/hansel-mesh/camera.env || \
+  sudo install -m 0644 configs/camera.env.example /etc/hansel-mesh/camera.env
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_ENABLED="yes", CAMERA_DEST_IP="192.168.60.2",
+# CAMERA_TRANSPORT="rtp", PROFILE="2" 확인
+sudo ./scripts/enable_mesh_autostart.sh head --with-camera
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 가까운 거리에서 안정적이면:
 
 ```bash
-CAMERA_TRANSPORT=rtp PROFILE=0 ~/HANSEL_MESH/scripts/start_camera_stream.sh 192.168.60.2 5600
+sudoedit /etc/hansel-mesh/camera.env
+# PROFILE="0"으로 변경
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
-카메라 단독 확인:
+카메라 단독 명령은 관리 서비스를 멈춘 벤치에서만 확인한다:
 
 ```bash
+sudo systemctl stop hansel-camera.service
 rpicam-vid -t 2000 --nopreview --width 640 --height 480 --framerate 15 --codec h264 --inline --bitrate 1200000 -o /tmp/test.h264
 ls -lh /tmp/test.h264
+sudo systemctl start hansel-camera.service
 ```
 
 ## 12. 구동 + 카메라 동시 테스트
@@ -409,10 +417,10 @@ Ctrl+C
 Ctrl+C
 ```
 
-head 카메라 송신:
+head 카메라 송신 서비스:
 
-```text
-Ctrl+C
+```bash
+sudo systemctl stop hansel-camera.service
 ```
 
 각 Pi 종료 순서:

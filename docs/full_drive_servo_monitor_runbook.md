@@ -60,20 +60,25 @@ http://127.0.0.1:8080
 
 ## 테스트 전 최신 코드 배포
 
-노트북에서 base로:
+노트북에서 변경 사항을 먼저 커밋하고 Git 원격에 push한다. base에서는 파일을
+`scp`로 덮어쓰지 말고 같은 커밋을 fast-forward로 받는다.
 
 ```bash
-cd ~/Projects/HANSEL_MESH
-scp -r configs controller docs monitor robot scripts services README.md \
-  hansel@192.168.60.1:/home/hansel/HANSEL_MESH/
+cd ~/HANSEL_MESH
+git pull --ff-only
 ```
 
-base에서 전체 유닛으로:
+로봇을 받쳐 바퀴를 띄우고 head/node의 systemd 제어 서비스와 수동
+`mesh_control_server.py`를 모두 종료한다. 그 다음 base에서 전체 유닛으로
+동일한 깨끗한 커밋을 배포한다.
 
 ```bash
 cd ~/HANSEL_MESH
 ./scripts/deploy_from_base.sh
 ```
+
+스크립트가 중간에 실패하면 제어 서비스를 다시 켜지 말고 같은 커밋으로
+재실행한다.
 
 ## Mesh 확인
 
@@ -115,7 +120,7 @@ head:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 robot/mesh_control_server.py --role head
+sudo python3 robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32
 ```
 
 head에서 기대 로그:
@@ -129,22 +134,22 @@ node1:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 robot/mesh_control_server.py --role node1
+sudo python3 robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32
 ```
 
 node2:
 
 ```bash
 cd ~/HANSEL_MESH
-sudo python3 robot/mesh_control_server.py --role node2
+sudo python3 robot/mesh_control_server.py --role node2 --host 192.168.50.12 --allow-source 192.168.60.2/32
 ```
 
 base에서 원격으로 한 번에 터미널을 열어 실행해도 된다. 각 명령은 별도 터미널에서 실행해야 로그를 보기 쉽다.
 
 ```bash
-ssh -t hansel@192.168.50.10 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role head'
-ssh -t hansel@192.168.50.11 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node1'
-ssh -t hansel@192.168.50.12 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node2'
+ssh -t hansel@192.168.50.10 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role head --host 192.168.50.10 --allow-source 192.168.60.2/32'
+ssh -t hansel@192.168.50.11 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node1 --host 192.168.50.11 --allow-source 192.168.60.2/32'
+ssh -t hansel@192.168.50.12 'cd ~/HANSEL_MESH && sudo python3 robot/mesh_control_server.py --role node2 --host 192.168.50.12 --allow-source 192.168.60.2/32'
 ```
 
 ## 카메라 RTP 시작
@@ -153,8 +158,23 @@ head에서 새 터미널:
 
 ```bash
 cd ~/HANSEL_MESH
-CAMERA_TRANSPORT=rtp bash scripts/restart_camera_profile.sh 1 192.168.60.2 5600
+sudo install -d -m 0755 /etc/hansel-mesh
+sudo test -f /etc/hansel-mesh/camera.env || \
+  sudo install -m 0644 configs/camera.env.example /etc/hansel-mesh/camera.env
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_ENABLED="yes", CAMERA_DEST_IP="192.168.60.2",
+# CAMERA_TRANSPORT="rtp", PROFILE="1" 확인
+sudo ./scripts/enable_mesh_autostart.sh head --with-camera
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
+
+운영 중 프로필 변경은 노트북의 `camera_profile` 제어 명령으로 요청한다. head는
+root 소유 `/run/hansel-camera-profile` 토큰만 갱신하고
+`hansel-camera.service` 재시작을 예약한다. 목적지와 전송 방식은
+`/etc/hansel-mesh/camera.env`에서만 관리한다. 클라이언트는 적용 ACK를 받은
+뒤에만 프로필 전환을 확정하며, 거부 또는 timeout이면 제어 루프를 막지 않고
+재시도한다.
 
 ## 필수 monitor: 영상 품질 측정
 
@@ -301,14 +321,30 @@ quit
 3  # node2 GPIO6 서보 동작, node3 분리
 ```
 
-각 키는 먼저 분리될 node에 `relay_hold`를 보내서 주행을 잠그고, live mode의 `all` 주행 대상에서 그 node를 제거한다. 그래서 분리된 유닛은 따라 움직이지 않고 그 위치에서 BATMAN relay로 남는다.
+각 키는 모든 이동 유닛의 stop ACK와 분리될 node의 `relay_hold` ACK를 먼저 확인한다. 서보 ACK 이후 운전자가 실제 분리를 확인해야만 live mode의 `all` 주행 대상에서 그 node를 제거한다. ACK 또는 물리 확인에 실패하면 정지 상태로 조종 세션을 종료한다.
 
-개별 유닛의 GPIO6 서보만 직접 움직이고 싶으면 반드시 타겟을 하나로 지정해서 테스트한다. `--target all`에서는 안전상 skip된다.
+원시 `detach` 명령은 stop/hold 절차를 우회하므로 기본 클라이언트와 서버가 모두
+거부한다. 분리 시험은 `1/2/3` 안전 시퀀스를 사용한다. 바퀴를 띄운 벤치에서
+서보만 점검해야 할 때에만 서버와 클라이언트 양쪽에
+`--allow-unsafe-raw-detach`를 명시하고 타겟을 하나로 제한한다.
 
-node2 분리 서보:
+node2 GPIO6 서보만 벤치 시험하는 예(바퀴를 띄우고 주변을 비운 상태):
+
+node2에서 운영 서비스를 잠시 멈추고 unsafe 서버를 수동 실행한다.
 
 ```bash
-python3 controller/mesh_control_client.py --target node2 --repeat 1
+sudo systemctl stop hansel-control@node2
+sudo python3 -m robot.mesh_control_server --role node2 \
+  --host 192.168.50.12 \
+  --allow-source 192.168.60.2/32 \
+  --allow-unsafe-raw-detach
+```
+
+운영 PC에서:
+
+```bash
+python3 controller/mesh_control_client.py --target node2 --repeat 1 \
+  --allow-unsafe-raw-detach
 ```
 
 프롬프트에서:
@@ -319,7 +355,9 @@ detach_rest
 quit
 ```
 
-`detach`는 press 각도로 이동한 뒤 유지된다. 원위치 복귀가 필요할 때만 `detach_rest`를 따로 보낸다.
+`detach`는 unsafe 옵션을 양쪽에 켠 벤치 모드에서만 press 각도로 이동해 설정된
+시간 동안 누른 뒤 자동으로 rest 각도로 복귀한다. ACK는 소프트웨어 서보
+시퀀스 완료만 뜻하고 실제 분리 성공을 보장하지 않는다.
 
 ## 저속 전체 구동 테스트
 
@@ -331,7 +369,6 @@ python3 controller/mesh_control_client.py --target all --speed 0.35 --live \
   --quality-log video_quality.jsonl \
   --quality-target-fps 12 \
   --quality-warn-speed 0.25 \
-  --auto-camera-profile \
   --camera-transport rtp
 ```
 
@@ -349,7 +386,7 @@ python3 controller/mesh_control_client.py --target all --speed 0.35 --live \
 - `2`: node1 GPIO6 서보 동작, node2 분리
 - `3`: node2 GPIO6 서보 동작, node3 분리
 
-수동 분리 키를 누른 뒤에는 해당 node가 live mode의 `all` 주행 대상에서 빠지고, 서버에서도 주행 명령을 무시한다. 다시 움직이게 하려면 해당 target에 `drive_enable`을 보낸다.
+수동 분리 키를 누른 뒤 실제 분리를 확인하면 해당 node가 live mode의 `all` 주행 대상에서 빠지고, 서버의 `relay_hold` latch가 주행 명령을 거부한다. 운영 서비스는 latch를 영속 저장하므로 서버나 Pi 재시작 뒤에도 잠금이 유지된다. 다시 움직이게 하려면 해당 target에 `drive_enable`을 명시적으로 보내야 한다.
 
 자동 분리는 영상/구동이 안정적으로 확인된 뒤에만 켠다. `--detach-order node2,node1`은 "node2를 분리하려면 node1 서보", "node1을 분리하려면 head 서보"를 움직이는 의미다.
 
@@ -358,7 +395,6 @@ python3 controller/mesh_control_client.py --target all --speed 0.6 --live \
   --quality-log video_quality.jsonl \
   --quality-target-fps 12 \
   --quality-warn-speed 0.35 \
-  --auto-camera-profile \
   --camera-transport rtp \
   --auto-detach \
   --detach-order node2,node1
@@ -371,7 +407,10 @@ RTP 영상이 안 뜨면 raw UDP로 비교한다.
 head:
 
 ```bash
-CAMERA_TRANSPORT=raw bash ~/HANSEL_MESH/scripts/restart_camera_profile.sh 1 192.168.60.2 5600
+sudoedit /etc/hansel-mesh/camera.env
+# CAMERA_TRANSPORT="raw", PROFILE="1"로 변경
+sudo rm -f /run/hansel-camera-profile
+sudo systemctl restart hansel-camera.service
 ```
 
 노트북:
@@ -388,8 +427,8 @@ python3 monitor/video_probe.py --transport raw --port 5600 --target-fps 12 \
 각 Pi:
 
 ```bash
+# head에서만 먼저 실행
+sudo systemctl stop hansel-camera.service
 sudo pkill -f mesh_control_server.py
 sudo pkill -f metrics_agent.py
-sudo pkill -f rpicam-vid
-sudo pkill -f libcamera-vid
 ```
