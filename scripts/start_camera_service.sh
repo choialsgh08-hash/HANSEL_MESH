@@ -66,5 +66,17 @@ case "$CAMERA_TRANSPORT" in
         ;;
 esac
 
+# Optional keyframe interval (GOP) override for faster reconnect recovery.
+CAMERA_INTRA="${CAMERA_INTRA:-}"
+if [ -n "$CAMERA_INTRA" ]; then
+    case "$CAMERA_INTRA" in
+        ''|*[!0-9]*)
+            echo "[ERROR] CAMERA_INTRA must be a positive integer (frames)."
+            exit 1
+            ;;
+    esac
+    export INTRA="$CAMERA_INTRA"
+fi
+
 export CAMERA_TRANSPORT PROFILE
 exec "$REPO_DIR/scripts/start_camera_stream.sh" "$CAMERA_DEST_IP" "$CAMERA_DEST_PORT"
