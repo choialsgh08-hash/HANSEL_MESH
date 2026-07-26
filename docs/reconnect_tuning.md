@@ -30,26 +30,18 @@ python3 monitor/calibrate_thresholds.py --events reconnect_events.jsonl
 링크가 복구돼도 H.264는 다음 **키프레임(I-frame)** 이 와야 다시 그려진다.
 GOP(키프레임 간격)가 길면 복구된 뒤에도 화면이 그만큼 멈춘다.
 
-### 레버 ①: GOP 단축 (지금 가능, config 레벨)
+### GOP(키프레임 간격) 현황
 
-```
-옵션 이름   : CAMERA_INTRA  (configs/camera.env)
-의미        : 키프레임 사이 프레임 수. rpicam-vid --intra 로 전달됨.
-현재 기본값 : 비어있으면 프레임레이트(FPS)와 동일 = 약 1키프레임/초
-확인 명령   : grep CAMERA_INTRA /etc/hansel-mesh/camera.env
-              (실제 적용값은 head 카메라 로그의 --intra 확인)
-설정 명령   : /etc/hansel-mesh/camera.env 에 CAMERA_INTRA=8  (15fps에서 ~0.5초)
-              sudo systemctl restart hansel-camera
-예상 효과   : 재연결 후 최대 키프레임 대기 = INTRA/FPS 초로 감소
-부작용      : bitrate 상승(키프레임이 큼) → 링크 여유 없으면 오히려 손실↑
-측정 지표   : calibrate_thresholds 의 video_recovery_s p50/p95
-원복 명령   : CAMERA_INTRA="" 로 되돌리고 systemctl restart hansel-camera
-```
+현재 카메라는 `start_camera_stream.sh`에서 `--intra $FPS`로 GOP를 프레임레이트와
+같게 둔다 = **약 1키프레임/초**. 즉 재연결 후 키프레임 대기는 최대 ~1초다.
 
-> 주의: GOP를 너무 줄이면 bitrate가 올라 링크를 더 압박한다. 원인 B가
-> 측정으로 주범일 때만, 그리고 링크 여유(RSSI/TQ) 범위에서 줄인다.
+GOP를 더 줄이면(키프레임을 자주) 대기가 짧아지지만 bitrate가 오른다(키프레임이 큼).
+현재는 이를 **config 손잡이로 노출하지 않는다** — 기본 1초로 충분하다고 보고, 측정으로
+원인 B가 주범임이 확인되기 전엔 섣부른 knob을 추가하지 않는다. 정말 필요하면
+`start_camera_stream.sh`의 `INTRA`(프레임 수)를 직접 조정할 수 있으나, 근본 대응은
+아래 ②(인코더 교체)다.
 
-### 레버 ②: 진짜 on-demand 키프레임 (향후 과제, 미구현)
+### 진짜 on-demand 키프레임 (향후 과제, 미구현)
 
 현재 인코더 `rpicam-vid`는 실행 중 "지금 키프레임 강제" 신호를 못 받는다.
 route 변화 시 즉석 IDR을 쏘려면 **인코더를 GStreamer로 교체**해야 한다:
