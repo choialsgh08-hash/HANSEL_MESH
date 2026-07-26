@@ -3,7 +3,7 @@
 set -e
 
 BAT_IF="bat0"
-MESH_IF="wlan0"
+MESH_IF="wlan1"
 
 echo "========================================"
 echo " HANSEL_MESH stop script"

@@ -289,7 +289,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Collect mesh link + RTT metrics.")
     p.add_argument("--self", dest="self_name", default="unknown",
                    help="this node's name (base/head/node1/...)")
-    p.add_argument("--mesh-if", default="wlan0", help="wireless interface")
+    p.add_argument("--mesh-if", default="wlan1", help="wireless interface")
     p.add_argument("--ping", nargs="*", default=[],
                    help="node names to ping for RTT (e.g. --ping head base)")
     p.add_argument("--send", default=None,

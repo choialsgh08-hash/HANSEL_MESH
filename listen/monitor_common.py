@@ -83,7 +83,7 @@ def decode_msg(b):
 
 
 # --- RSSI 취득 (노드 전용) ---------------------------------------------------
-def read_station_signals(iface="wlan0"):
+def read_station_signals(iface="wlan1"):
     """
     `iw dev <iface> station dump` 를 파싱해서
     { mac(소문자): {"signal": dBm, "signal_avg": dBm} } 를 반환.
