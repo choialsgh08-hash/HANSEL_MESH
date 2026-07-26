@@ -5,16 +5,31 @@
 AR9271 동글이 batman-adv를 **직접 제어하지 않는다.** 계층이 분리돼 있고,
 각 계층이 위 계층에 인터페이스를 올려준다.
 
+계층(소프트웨어)과 그 계층이 만드는 인터페이스(netdev)를 구분한다. USB는
+계층이 아니라 버스이므로 화살표로 표시한다.
+
 ```mermaid
 flowchart TD
-    A["AR9271 USB 동글<br/>하드웨어 + htc_9271.fw 펌웨어"] --> B["USB"]
-    B --> C["ath9k_htc<br/>드라이버: 펌웨어 로딩, USB 통신"]
-    C --> D["mac80211 / cfg80211 / nl80211<br/>리눅스 무선 스택"]
-    D --> E["wlan1<br/>IBSS(ad-hoc) 모드로 join"]
-    E --> F["batman-adv hard interface<br/>batctl if add wlan1"]
-    F --> G["bat0<br/>L2 메시, IP 192.168.50.x"]
-    G --> H["애플리케이션<br/>제어 UDP :7000 · 카메라 RTP · 모니터 :7100"]
+    HW["AR9271 동글<br/>내장 CPU가 htc_9271.fw 펌웨어 실행"]
+    DRV["ath9k_htc 드라이버<br/>부팅 시 펌웨어 업로드 · USB 통신"]
+    MAC["mac80211 / cfg80211 / nl80211<br/>리눅스 무선 스택"]
+    WLAN["wlan1 &#40;netdev&#41;<br/>IBSS 모드로 join"]
+    BAT["batman-adv 모듈<br/>L2 메시 라우팅"]
+    BAT0["bat0 &#40;netdev&#41;<br/>IP 192.168.50.x"]
+    APP["애플리케이션<br/>제어 :7000 · 카메라 RTP · 모니터 :7100"]
+
+    HW -->|USB| DRV
+    DRV --> MAC
+    MAC -->|인터페이스 생성| WLAN
+    WLAN -->|hard interface로 등록<br/>batctl if add wlan1| BAT
+    BAT -->|인터페이스 생성| BAT0
+    BAT0 --> APP
 ```
+
+- 소프트웨어 계층: `ath9k_htc` → `mac80211` → `batman-adv`
+- 그 계층이 만드는 netdev: `mac80211` → `wlan1`, `batman-adv` → `bat0`
+- `batman-adv`는 `wlan1`을 **hard interface로 입력받아** `bat0`를 **출력**한다
+  (둘 사이에 별도 인터페이스는 없다)
 
 | 계층 | 역할 |
 | --- | --- |
