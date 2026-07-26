@@ -52,6 +52,15 @@ class QualityConfig:
     tq_warn: int = 200
     tq_danger: int = 180
 
+    # Radio link-layer health (weakest direct link). These are PRE-HARDWARE
+    # estimates: tune them against real AR9271 measurements before wiring link
+    # health into the motor-stopping control path. Kept conservative so a weak
+    # link warns (slows) rather than stops.
+    signal_warn_dbm: float = -75.0
+    signal_danger_dbm: float = -82.0
+    inactive_warn_ms: float = 1500.0
+    inactive_danger_ms: float = 3000.0
+
     warn_hold_s: float = 3.0
     danger_hold_s: float = 1.5
     warn_speed_cap: float = 0.35
@@ -382,7 +391,8 @@ def parse_selected_tqs(text: str) -> list[int]:
     return values
 
 
-def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, now: float) -> tuple[str, list[str]]:
+def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, now: float,
+                  link: Optional[dict] = None) -> tuple[str, list[str]]:
     status = "GOOD"
     reasons: list[str] = []
 
@@ -479,6 +489,23 @@ def score_quality(video: dict, ping: dict, batman: dict, config: QualityConfig, 
             raise_to("DANGER", f"BATMAN TQ {tq}")
         elif parsed_tq < config.tq_warn:
             raise_to("WARN", f"BATMAN TQ {tq}")
+
+    # Radio link-layer health: the weakest direct link predicts a reconnect
+    # before video or RTT degrade. Absent (link=None) on the motor-stopping
+    # control path until thresholds are validated against real hardware.
+    if link:
+        signal = finite_number(link.get("signal_worst_dbm"))
+        if signal is not None:
+            if signal <= config.signal_danger_dbm:
+                raise_to("DANGER", f"radio signal {signal:.0f}dBm")
+            elif signal <= config.signal_warn_dbm:
+                raise_to("WARN", f"radio signal {signal:.0f}dBm")
+        inactive = finite_number(link.get("inactive_worst_ms"))
+        if inactive is not None:
+            if inactive >= config.inactive_danger_ms:
+                raise_to("DANGER", f"peer silent {inactive:.0f}ms")
+            elif inactive >= config.inactive_warn_ms:
+                raise_to("WARN", f"peer silent {inactive:.0f}ms")
 
     if not reasons:
         reasons.append("healthy")

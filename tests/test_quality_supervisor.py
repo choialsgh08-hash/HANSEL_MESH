@@ -88,5 +88,48 @@ class QualityScoringSafetyTests(unittest.TestCase):
                 parse_args([option, "nan"])
 
 
+class LinkHealthScoringTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = QualityConfig(ping_ip=None)
+        self.now = 100.0
+        # A healthy video sample so the base status is GOOD before link scoring.
+        self.good_video = {
+            "ts": self.now,
+            "fps_ratio": 1.0,
+            "err_rate": 0.0,
+            "drop_rate": 0.0,
+        }
+
+    def _score(self, link):
+        return score_quality(
+            self.good_video, {}, {}, self.config, self.now, link=link
+        )
+
+    def test_link_absent_keeps_good(self) -> None:
+        status, _ = self._score(None)
+        self.assertEqual(status, "GOOD")
+
+    def test_healthy_link_keeps_good(self) -> None:
+        status, _ = self._score(
+            {"signal_worst_dbm": -55, "inactive_worst_ms": 100}
+        )
+        self.assertEqual(status, "GOOD")
+
+    def test_weak_signal_warns(self) -> None:
+        status, reasons = self._score({"signal_worst_dbm": -78})
+        self.assertEqual(status, "WARN")
+        self.assertTrue(any("radio signal" in r for r in reasons))
+
+    def test_very_weak_signal_is_danger(self) -> None:
+        status, _ = self._score({"signal_worst_dbm": -85})
+        self.assertEqual(status, "DANGER")
+
+    def test_long_peer_silence_warns_then_dangers(self) -> None:
+        warn_status, _ = self._score({"inactive_worst_ms": 2000})
+        danger_status, _ = self._score({"inactive_worst_ms": 3500})
+        self.assertEqual(warn_status, "WARN")
+        self.assertEqual(danger_status, "DANGER")
+
+
 if __name__ == "__main__":
     unittest.main()

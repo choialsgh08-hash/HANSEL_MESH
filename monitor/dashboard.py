@@ -135,8 +135,14 @@ def _quality_thresholds(target_fps: float) -> dict:
     }
 
 
-def evaluate_quality(video, e2e: dict, edges: list, now: float) -> dict:
-    """Mirror the controller's video-first quality judgment for the dashboard."""
+def evaluate_quality(video, e2e: dict, edges: list, now: float,
+                     link_health: dict = None) -> dict:
+    """Mirror the controller's video-first quality judgment for the dashboard.
+
+    link_health (weakest direct link) is scored here for operator awareness.
+    The motor-stopping control client still omits it until its thresholds are
+    validated against real hardware.
+    """
     video = video or {}
     target_fps = float(video.get("target_fps") or 15.0)
     thresholds = _quality_thresholds(target_fps)
@@ -146,7 +152,8 @@ def evaluate_quality(video, e2e: dict, edges: list, now: float) -> dict:
 
     if score_quality and QualityConfig:
         cfg = QualityConfig(target_fps=target_fps)
-        raw_status, reasons = score_quality(video, ping, batman, cfg, now)
+        raw_status, reasons = score_quality(
+            video, ping, batman, cfg, now, link=link_health or None)
     else:
         raw_status = "UNKNOWN" if not video else "GOOD"
         reasons = ["quality_supervisor unavailable"] if not video else ["healthy"]
@@ -163,6 +170,7 @@ def evaluate_quality(video, e2e: dict, edges: list, now: float) -> dict:
         "video_age_s": video_age_s,
         "ping": ping,
         "batman": batman,
+        "link": link_health or {},
         "thresholds": thresholds,
     }
 
@@ -183,7 +191,11 @@ def merge_state(now: float) -> dict:
             nodes.append({"id": name, "ip": ip, "online": online.get(name, False)})
 
     # Edges: union of all *direct* radio links, deduped undirected.
+    # Also track the weakest link (worst signal, longest peer silence) so the
+    # quality judgment can warn of a reconnect before video/RTT degrade.
     edges_acc: dict = {}
+    link_signals: list = []
+    link_inactives: list = []
     for name, info in latest.items():
         for link in info["snap"].get("links", []):
             if not link.get("direct"):
@@ -193,12 +205,14 @@ def merge_state(now: float) -> dict:
                 continue
             key = _edge_key(name, peer)
             acc = edges_acc.setdefault(key, {"rssi": [], "tq": []})
-            if "signal_avg_dbm" in link:
-                acc["rssi"].append(link["signal_avg_dbm"])
-            elif "signal_dbm" in link:
-                acc["rssi"].append(link["signal_dbm"])
+            sig = link.get("signal_avg_dbm", link.get("signal_dbm"))
+            if sig is not None:
+                acc["rssi"].append(sig)
+                link_signals.append(sig)
             if "tq" in link:
                 acc["tq"].append(link["tq"])
+            if link.get("inactive_ms") is not None:
+                link_inactives.append(link["inactive_ms"])
 
     edges = []
     for key, acc in edges_acc.items():
@@ -223,10 +237,17 @@ def merge_state(now: float) -> dict:
         video = dict(VIDEO.get("stats") or {}) if (
             VIDEO.get("recv") and (now - VIDEO["recv"]) < NODE_TIMEOUT_S) else None
 
-    quality = evaluate_quality(video, e2e, edges, now)
+    link_health: dict = {}
+    if link_signals:
+        link_health["signal_worst_dbm"] = min(link_signals)
+    if link_inactives:
+        link_health["inactive_worst_ms"] = max(link_inactives)
+
+    quality = evaluate_quality(video, e2e, edges, now, link_health)
 
     return {"nodes": nodes, "edges": edges, "e2e": e2e,
             "video": video, "quality": quality,
+            "link_health": link_health,
             "net_rssi_worst": net_rssi_worst}
 
 
