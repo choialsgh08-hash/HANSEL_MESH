@@ -54,7 +54,9 @@ LOCK = threading.Lock()
 LATEST: dict = {}                 # node_name -> {"snap": snapshot, "recv": ts}
 VIDEO: dict = {}                  # {"stats": <sample>, "recv": ts} from video_probe
 HISTORY: deque = deque(maxlen=180)  # merged records for the charts
+EVENTS: deque = deque(maxlen=60)    # reconnect/route-change events from agents
 NODE_TIMEOUT_S = 12.0             # mark a node offline after this much silence
+RECONNECT_WINDOW_S = 6.0         # keep the "reconnecting" banner up this long
 
 QUALITY_LEVELS = {
     "UNKNOWN": 0,
@@ -70,10 +72,16 @@ def _edge_key(a: str, b: str) -> str:
 
 
 def ingest(snapshot: dict, now: float) -> None:
-    """Store one agent snapshot keyed by its node name."""
+    """Store one agent snapshot keyed by its node name, plus its reconnect events."""
     node = snapshot.get("node", "unknown")
     with LOCK:
         LATEST[node] = {"snap": snapshot, "recv": now}
+        for ev in snapshot.get("events", []):
+            record = dict(ev)
+            record["node"] = node
+            record["ts"] = round(now, 1)
+            record["time"] = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
+            EVENTS.append(record)
 
 
 def ingest_video(stats: dict, now: float) -> None:
@@ -245,9 +253,16 @@ def merge_state(now: float) -> dict:
 
     quality = evaluate_quality(video, e2e, edges, now, link_health)
 
+    with LOCK:
+        all_events = list(EVENTS)
+    recent = [e for e in all_events if now - e.get("ts", 0.0) < RECONNECT_WINDOW_S]
+
     return {"nodes": nodes, "edges": edges, "e2e": e2e,
             "video": video, "quality": quality,
             "link_health": link_health,
+            "events": all_events[-15:],
+            "reconnect_active": bool(recent),
+            "reconnect_latest": recent[-1] if recent else None,
             "net_rssi_worst": net_rssi_worst}
 
 
@@ -331,8 +346,10 @@ def _tq_from_rssi(rssi: float) -> int:
 def demo_loop(interval: float) -> None:
     """Synthesize realistic per-node snapshots and feed the real ingest path."""
     print("[collector] DEMO mode: generating a 4-node chain mesh")
+    tick = 0
     while True:
         now = time.time()
+        tick += 1
         jitter = {k: v + random.uniform(-4, 4) for k, v in DEMO_RSSI.items()}
         for idx, node in enumerate(DEMO_CHAIN):
             neighbors = []
@@ -382,6 +399,16 @@ def demo_loop(interval: float) -> None:
             } if node != "base" else {}
 
             snap = build_snapshot(node, "wlan0", links_text, ping_text, now)
+            # Every ~8th cycle, simulate a reconnect on node1 so the banner and
+            # event log are visible in demo mode without real hardware.
+            if node == "node1" and tick % 8 == 0:
+                kind = ["route_changed", "neighbor_lost",
+                        "neighbor_gained"][(tick // 8) % 3]
+                ev = {"type": kind, "peer": "node2", "mac": "02:aa:bb:00:00:0c"}
+                if kind == "route_changed":
+                    ev["from"] = "02:aa:bb:00:00:0c"
+                    ev["to"] = "02:aa:bb:00:00:0a"
+                snap["events"] = [ev]
             ingest(snap, now)
 
         # Synthesize video quality that tracks the weakest link: as the worst
