@@ -44,10 +44,21 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 try:
-    from controller.quality_supervisor import QualityConfig, score_quality
+    from dataclasses import replace as _dc_replace
+    from controller.quality_supervisor import (
+        QualityConfig,
+        score_quality,
+        load_quality_overrides,
+    )
 except ImportError:
     QualityConfig = None
     score_quality = None
+    load_quality_overrides = None
+    _dc_replace = None
+
+# Measured threshold overrides (from calibrate_thresholds output), loaded once
+# at startup so the live judge uses tuned values without any code change.
+QUALITY_OVERRIDES: dict = {}
 
 # Shared state, guarded by LOCK.
 LOCK = threading.Lock()
@@ -160,6 +171,8 @@ def evaluate_quality(video, e2e: dict, edges: list, now: float,
 
     if score_quality and QualityConfig:
         cfg = QualityConfig(target_fps=target_fps)
+        if QUALITY_OVERRIDES and _dc_replace:
+            cfg = _dc_replace(cfg, **QUALITY_OVERRIDES)
         raw_status, reasons = score_quality(
             video, ping, batman, cfg, now, link=link_health or None)
     else:
@@ -470,11 +483,20 @@ def parse_args() -> argparse.Namespace:
                    help="generate synthetic data, no agents needed")
     p.add_argument("--log", default=None,
                    help="save combined comms+video metrics to this JSONL file")
+    p.add_argument("--quality-config",
+                   default=os.environ.get("HANSEL_QUALITY_CONFIG"),
+                   help="env file of measured threshold overrides (KEY=VALUE)")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
+    global QUALITY_OVERRIDES
+    if load_quality_overrides:
+        QUALITY_OVERRIDES = load_quality_overrides(args.quality_config, os.environ)
+        if QUALITY_OVERRIDES:
+            print(f"[collector] quality threshold overrides: {QUALITY_OVERRIDES}")
 
     threading.Thread(target=sampler_loop, args=(args.interval, args.log),
                      daemon=True).start()
