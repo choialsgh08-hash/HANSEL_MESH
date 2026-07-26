@@ -46,7 +46,9 @@ MAC_RE = r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}"
 def parse_station_dump(text: str) -> dict:
     """Parse `iw dev <if> station dump`.
 
-    Returns {mac: {signal_dbm, signal_avg_dbm, tx_mbit, rx_mbit, inactive_ms}}.
+    Returns {mac: {signal_dbm, signal_avg_dbm, tx_mbit, rx_mbit, inactive_ms,
+    tx_retries, tx_failed, expected_mbps}}. tx_retries/tx_failed rising and
+    expected_mbps falling are early signs of a link about to drop.
     """
     stations: dict = {}
     current = None
@@ -79,6 +81,18 @@ def parse_station_dump(text: str) -> dict:
             v = _first_int(line)
             if v is not None:
                 stations[current]["inactive_ms"] = v
+        elif line.startswith("tx retries:"):
+            v = _first_int(line)
+            if v is not None:
+                stations[current]["tx_retries"] = v
+        elif line.startswith("tx failed:"):
+            v = _first_int(line)
+            if v is not None:
+                stations[current]["tx_failed"] = v
+        elif line.startswith("expected throughput:"):
+            v = _first_float(line)
+            if v is not None:
+                stations[current]["expected_mbps"] = v
     return stations
 
 
@@ -141,6 +155,83 @@ def parse_ping(text: str) -> dict:
     return result
 
 
+def parse_bat_stats(text: str) -> dict:
+    """Parse `ip -s link show dev bat0`. Returns rx/tx bytes/packets/dropped.
+
+    The number line directly under the "RX:"/"TX:" header holds:
+    RX: bytes packets errors dropped overrun mcast
+    TX: bytes packets errors dropped carrier collsns
+    """
+    stats: dict = {}
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        header = line.strip()
+        if header.startswith("RX:") and i + 1 < len(lines):
+            nums = lines[i + 1].split()
+            if len(nums) >= 4 and all(n.lstrip("-").isdigit() for n in nums[:4]):
+                stats["rx_bytes"] = int(nums[0])
+                stats["rx_packets"] = int(nums[1])
+                stats["rx_dropped"] = int(nums[3])
+        elif header.startswith("TX:") and i + 1 < len(lines):
+            nums = lines[i + 1].split()
+            if len(nums) >= 4 and all(n.lstrip("-").isdigit() for n in nums[:4]):
+                stats["tx_bytes"] = int(nums[0])
+                stats["tx_packets"] = int(nums[1])
+                stats["tx_dropped"] = int(nums[3])
+    return stats
+
+
+def _links_by_mac(snapshot: dict) -> dict:
+    return {link["mac"]: link for link in snapshot.get("links", []) if "mac" in link}
+
+
+def detect_events(prev: dict, curr: dict) -> list:
+    """Diff two consecutive snapshots into reconnect/route-change events.
+
+    Pure function (no I/O) so it is unit-testable with fixtures. Returns a list
+    of event dicts, each with a "type" the dashboard can show as a banner:
+      route_changed   - a peer's selected next hop changed (path switched)
+      neighbor_lost   - a direct neighbor disappeared (link dropped)
+      neighbor_gained - a direct neighbor (re)appeared (link came back)
+    """
+    events: list = []
+    prev_links = _links_by_mac(prev)
+    curr_links = _links_by_mac(curr)
+
+    for mac, cl in curr_links.items():
+        pl = prev_links.get(mac)
+        if not pl:
+            continue
+        old_hop = pl.get("nexthop")
+        new_hop = cl.get("nexthop")
+        if old_hop and new_hop and old_hop != new_hop:
+            events.append({
+                "type": "route_changed",
+                "peer": cl.get("peer", mac),
+                "mac": mac,
+                "from": old_hop,
+                "to": new_hop,
+            })
+
+    prev_direct = {m for m, l in prev_links.items() if l.get("direct")}
+    curr_direct = {m for m, l in curr_links.items() if l.get("direct")}
+    for mac in sorted(prev_direct - curr_direct):
+        link = prev_links[mac]
+        events.append({
+            "type": "neighbor_lost",
+            "peer": link.get("peer", mac),
+            "mac": mac,
+        })
+    for mac in sorted(curr_direct - prev_direct):
+        link = curr_links[mac]
+        events.append({
+            "type": "neighbor_gained",
+            "peer": link.get("peer", mac),
+            "mac": mac,
+        })
+    return events
+
+
 def _first_int(line: str):
     m = re.search(r"-?\d+", line)
     return int(m.group()) if m else None
@@ -189,6 +280,7 @@ def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
     originators = parse_batctl_o(links_text.get("batctl_o", ""))
     neighbors = parse_batctl_n(links_text.get("batctl_n", ""))
     mac_to_ip = parse_ip_neigh(links_text.get("ip_neigh", ""))
+    bat_stats = parse_bat_stats(links_text.get("bat_stats", ""))
 
     # Union of all MACs we have any data for.
     macs = set(stations) | set(originators) | set(neighbors)
@@ -223,6 +315,7 @@ def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
         "ts": round(timestamp, 3),
         "links": links,
         "end_to_end": e2e,
+        "bat0": bat_stats,
     }
 
 
@@ -233,6 +326,7 @@ def collect_real(self_name: str, mesh_if: str, bat_if: str, ping_list: list,
         "batctl_o": ["batctl", "-m", bat_if, "o"],
         "batctl_n": ["batctl", "-m", bat_if, "n"],
         "ip_neigh": ["ip", "neigh", "show", "dev", bat_if],
+        "bat_stats": ["ip", "-s", "link", "show", "dev", bat_if],
     }
     ping_commands = {}
     for name in ping_list:
@@ -288,6 +382,7 @@ def collect_sample(sample_dir: str, self_name: str, mesh_if: str,
         "batctl_o": read("batctl_o.txt"),
         "batctl_n": read("batctl_n.txt"),
         "ip_neigh": read("ip_neigh.txt"),
+        "bat_stats": read("ip_link_stats.txt"),
     }
     ping_targets = {}
     for name in NODES:
@@ -346,6 +441,8 @@ def main() -> int:
     # Date.now equivalent: time.time() is fine at runtime (not a workflow).
     base_ts = time.time()
 
+    prev_snap = {"prev": None}
+
     def one(ts):
         if args.sample:
             snap = collect_sample(
@@ -363,6 +460,11 @@ def main() -> int:
                 args.ping,
                 ts,
             )
+        if prev_snap["prev"] is not None:
+            events = detect_events(prev_snap["prev"], snap)
+            if events:
+                snap["events"] = events
+        prev_snap["prev"] = snap
         emit(snap, args.send)
 
     if not args.loop:
