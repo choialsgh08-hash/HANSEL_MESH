@@ -216,9 +216,11 @@
   </div>
 
   <div class="panel">
-    <h2>영상 품질 (수신 FPS / 디코드 에러)</h2>
+    <h2>영상 품질 추이 — FPS(↑높을수록 좋음) vs 에러·drop(↓0이 정상)</h2>
     <canvas id="videoChart"></canvas>
     <div class="legend"><span id="vidNow">영상 신호 없음</span></div>
+    <div class="status-legend">읽는 법 — 🟢FPS가 위에 평평하고 🔴에러·🟡drop이 바닥(0)이면 정상.
+      FPS가 점선 아래로 떨어지거나 에러가 점선 위로 솟으면 영상 손상. 아래 상관 차트에서 RSSI도 같이 내려갔으면 통신이 원인.</div>
   </div>
   <div class="panel">
     <h2>통신 ↔ 영상 상관 (최저 RSSI vs 에러/초)</h2>
@@ -368,11 +370,10 @@ function refreshVideoChart(history, quality){
     {key:"vid_err", label:"에러/초", color:"#f85149", axis:"y1"},
     {key:"vid_drop", label:"drop/초", color:"#d29922", axis:"y1"},
   ]);
+  // One danger line per axis keeps the chart readable (was four dashed lines).
   [
-    constantSeries(labels, "FPS WARN", th.fps_warn, "#d29922", "y"),
-    constantSeries(labels, "FPS DANGER", th.fps_danger, "#f85149", "y"),
-    constantSeries(labels, "ERR DANGER", th.err_danger_rate, "#ff7b72", "y1"),
-    constantSeries(labels, "DROP DANGER", th.drop_danger_rate, "#bc8cff", "y1"),
+    constantSeries(labels, "FPS 위험선", th.fps_danger, "#f85149", "y"),
+    constantSeries(labels, "에러 위험선", th.err_danger_rate, "#ff7b72", "y1"),
   ].forEach(ds=>{ if(ds) datasets.push(ds); });
   videoChart.data.labels = labels;
   videoChart.data.datasets = datasets;
