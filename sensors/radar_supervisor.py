@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Callable, Iterable, Mapping, Protocol
 
 from common.sensor_contract import validate_sensor_id
@@ -293,7 +294,16 @@ def write_manifest_atomic(path: Path, payload: Mapping[str, object]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        replace_retry_delays_s = (0.01, 0.02, 0.04, 0.08, 0.16)
+        for delay_s in replace_retry_delays_s:
+            try:
+                os.replace(temporary, path)
+            except PermissionError:
+                time.sleep(delay_s)
+            else:
+                break
+        else:
+            os.replace(temporary, path)
     except BaseException:
         if temporary is not None:
             try:

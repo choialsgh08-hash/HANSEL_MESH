@@ -264,6 +264,132 @@ class RadarSupervisorContractTests(unittest.TestCase):
             self.assertFalse(temp_sources[0].exists())
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
+    def test_atomic_manifest_retries_transient_replace_permission_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime" / "manifest.json"
+            path.parent.mkdir()
+            path.write_text("old destination\n", encoding="utf-8")
+            original_replace = os.replace
+            replace_attempts: list[tuple[Path, Path]] = []
+            sleep_delays: list[float] = []
+
+            def replace_after_transient_collisions(
+                source: object,
+                destination: object,
+            ) -> None:
+                replace_attempts.append((Path(source), Path(destination)))
+                if len(replace_attempts) < 3:
+                    raise PermissionError(
+                        5,
+                        "transient destination sharing collision",
+                        str(destination),
+                    )
+                original_replace(source, destination)
+
+            with mock.patch(
+                "sensors.radar_supervisor.os.replace",
+                replace_after_transient_collisions,
+            ), mock.patch("time.sleep", side_effect=sleep_delays.append):
+                try:
+                    write_manifest_atomic(path, {"new": "manifest"})
+                except PermissionError as exc:
+                    self.fail(
+                        "transient replace PermissionError escaped without "
+                        f"a bounded retry: {exc}"
+                    )
+
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"new": "manifest"},
+            )
+            self.assertEqual(len(replace_attempts), 3)
+            self.assertTrue(
+                all(destination == path for _, destination in replace_attempts)
+            )
+            self.assertEqual(
+                len({source for source, _ in replace_attempts}),
+                1,
+            )
+            self.assertEqual(len(sleep_delays), 2)
+            self.assertTrue(all(delay > 0 for delay in sleep_delays))
+            self.assertLess(sum(sleep_delays), 1.0)
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_atomic_manifest_exhausts_replace_permission_errors(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime" / "manifest.json"
+            path.parent.mkdir()
+            original = b"old destination\n"
+            path.write_bytes(original)
+            errors = [
+                PermissionError(
+                    5,
+                    f"destination sharing collision {attempt}",
+                    str(path),
+                )
+                for attempt in range(1, 7)
+            ]
+            replace_attempts: list[tuple[Path, Path]] = []
+            sleep_delays: list[float] = []
+
+            def reject_every_replace(
+                source: object,
+                destination: object,
+            ) -> None:
+                replace_attempts.append((Path(source), Path(destination)))
+                raise errors[len(replace_attempts) - 1]
+
+            with mock.patch(
+                "sensors.radar_supervisor.os.replace",
+                reject_every_replace,
+            ), mock.patch("time.sleep", side_effect=sleep_delays.append):
+                with self.assertRaises(PermissionError) as raised:
+                    write_manifest_atomic(path, {"new": "manifest"})
+
+            self.assertIs(raised.exception, errors[-1])
+            self.assertEqual(len(replace_attempts), 6)
+            self.assertEqual(len(sleep_delays), 5)
+            self.assertTrue(all(delay > 0 for delay in sleep_delays))
+            self.assertLess(sum(sleep_delays), 1.0)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+    def test_atomic_manifest_does_not_retry_generic_replace_oserror(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runtime" / "manifest.json"
+            path.parent.mkdir()
+            original = b"old destination\n"
+            path.write_bytes(original)
+            error = OSError("generic replace failure")
+            replace_attempts: list[tuple[Path, Path]] = []
+            sleep_delays: list[float] = []
+
+            def reject_replace(
+                source: object,
+                destination: object,
+            ) -> None:
+                replace_attempts.append((Path(source), Path(destination)))
+                raise error
+
+            with mock.patch(
+                "sensors.radar_supervisor.os.replace",
+                reject_replace,
+            ), mock.patch("time.sleep", side_effect=sleep_delays.append):
+                with self.assertRaises(OSError) as raised:
+                    write_manifest_atomic(path, {"new": "manifest"})
+
+            self.assertIs(raised.exception, error)
+            self.assertEqual(len(replace_attempts), 1)
+            self.assertEqual(sleep_delays, [])
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
     def test_atomic_manifest_failure_preserves_destination_and_cleans_temp(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runtime" / "manifest.json"
