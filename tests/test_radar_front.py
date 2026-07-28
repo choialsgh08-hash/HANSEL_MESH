@@ -42,13 +42,14 @@ def radar_frame(
     dropped=0,
     transition="consecutive",
     heatmap=None,
+    producer_id="test-radar",
 ):
     return RadarFrame(
         header=SensorHeader(
             mission_id="test-mission",
             unit_id="head",
             boot_id="test-boot",
-            producer_id="test-radar",
+            producer_id=producer_id,
             stream_id="radar/front",
             seq=frame_number + 1,
             monotonic_ns=1_000_000_000 + frame_number,
@@ -521,6 +522,193 @@ class RadarFrontStateTests(unittest.TestCase):
         self.assertEqual(len(scene["tracks"]), 1)
         self.assertAlmostEqual(scene["tracks"][0]["distance_m"], 0.25)
         self.assertFalse(scene["tracks"][0]["point_confirmed"])
+
+    def test_incomplete_first_frame_from_new_producer_clears_scene(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=2,
+            )
+        )
+        self.assertEqual(
+            state.snapshot()["scene"]["hazard"]["level"],
+            "NORMAL",
+        )
+
+        clock.value += 0.1
+        self.assertFalse(
+            state.ingest(
+                radar_frame(
+                    [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                    frame_number=1,
+                    complete=False,
+                    transition="first",
+                    producer_id="replacement-radar",
+                )
+            )
+        )
+        snapshot = state.snapshot()
+
+        self.assertEqual(snapshot["status"], "degraded")
+        self.assertFalse(snapshot["scene"]["tracks"])
+        self.assertEqual(snapshot["scene"]["hazard"]["level"], "UNKNOWN")
+        self.assertEqual(
+            snapshot["scene"]["diagnostics"]["last_reset_reason"],
+            "producer_change",
+        )
+
+    def test_complete_frame_after_incomplete_producer_change_is_fresh(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+                complete=False,
+                transition="first",
+                producer_id="replacement-radar",
+            )
+        )
+
+        clock.value += 0.1
+        self.assertTrue(
+            state.ingest(
+                radar_frame(
+                    [RadarPoint(0.0, 0.25, 0.0, 0.0)],
+                    frame_number=2,
+                    producer_id="replacement-radar",
+                )
+            )
+        )
+        scene = state.snapshot()["scene"]
+
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertAlmostEqual(scene["tracks"][0]["distance_m"], 0.25)
+        self.assertFalse(scene["tracks"][0]["point_confirmed"])
+
+    def test_complete_producer_change_starts_fresh_scene_evidence(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.25, 0.0, 0.0)],
+                frame_number=1,
+                transition="first",
+                producer_id="replacement-radar",
+            )
+        )
+        scene = state.snapshot()["scene"]
+
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertAlmostEqual(scene["tracks"][0]["distance_m"], 0.25)
+        self.assertFalse(scene["tracks"][0]["point_confirmed"])
+        self.assertEqual(
+            scene["diagnostics"]["last_reset_reason"],
+            "producer_change",
+        )
+
+    def test_replay_loop_reset_forgets_state_producer_boundary(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "replay",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        state.reset_sensor_sequence_tracking()
+
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.25, 0.0, 0.0)],
+                frame_number=1,
+                transition="first",
+                producer_id="replacement-radar",
+            )
+        )
+        scene = state.snapshot()["scene"]
+
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertEqual(
+            scene["diagnostics"]["last_reset_reason"],
+            "replay_loop_restart",
+        )
+
+    def test_source_fault_reset_forgets_state_producer_boundary(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 2.1
+        self.assertEqual(
+            state.snapshot()["scene"]["hazard"]["level"],
+            "SENSOR_FAULT",
+        )
+
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.25, 0.0, 0.0)],
+                frame_number=1,
+                transition="first",
+                producer_id="replacement-radar",
+            )
+        )
+        scene = state.snapshot()["scene"]
+
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertEqual(
+            scene["diagnostics"]["last_reset_reason"],
+            "fault",
+        )
 
     def test_sensor_sequence_gap_marks_live_view_degraded(self):
         clock = FakeClock()

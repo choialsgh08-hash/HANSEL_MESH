@@ -121,6 +121,7 @@ class RadarFrontState:
         self._device_discontinuities_total = 0
         self._log_sequence_errors_total = 0
         self._last_sensor_seq_by_producer: Dict[str, int] = {}
+        self._scene_producer_id: Optional[str] = None
         self._source_error: Optional[str] = None
         self._source_note = "waiting for first radar frame"
         self._degraded_reason: Optional[str] = None
@@ -180,8 +181,15 @@ class RadarFrontState:
             self._replay_ended = False
             self._source_error = None
             self._source_note = "receiving radar frames"
+            producer_id = record.header.producer_id
+            if (
+                self._scene_producer_id is not None
+                and producer_id != self._scene_producer_id
+            ):
+                self.scene_estimator.reset("producer_change")
+            self._scene_producer_id = producer_id
             previous_sensor_seq = self._last_sensor_seq_by_producer.get(
-                record.header.producer_id
+                producer_id
             )
             sensor_sequence_issue: Optional[str] = None
             if previous_sensor_seq is not None:
@@ -194,7 +202,7 @@ class RadarFrontState:
                     self._sensor_sequence_errors_total += 1
                     sensor_sequence_issue = "sensor_sequence_discontinuity"
             self._last_sensor_seq_by_producer[
-                record.header.producer_id
+                producer_id
             ] = record.header.seq
             self._frame_gaps_total += record.dropped_frames_since_previous
             if record.frame_transition in {
@@ -492,6 +500,7 @@ class RadarFrontState:
 
         with self._lock:
             self._last_sensor_seq_by_producer.clear()
+            self._scene_producer_id = None
             self.scene_estimator.reset("replay_loop_restart")
 
     def note_parse_error(self, detail: str) -> None:
@@ -551,6 +560,8 @@ class RadarFrontState:
                 status = "live"
 
             warning = self._warning_for(status, frame)
+            if status in {"waiting", "stale", "fault", "replay_end"}:
+                self._scene_producer_id = None
             scene = self.scene_estimator.snapshot(
                 source_status=status,
                 now=current,
