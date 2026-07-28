@@ -195,6 +195,9 @@ def _watchdog(
 def _shutdown_requested() -> Iterator[object]:
     requested = False
     installed: list[tuple[int, object]] = []
+    primary_error: BaseException | None = None
+    primary_traceback = None
+    restoration_failures: list[tuple[int, BaseException]] = []
 
     def request_shutdown(signum: int, frame: object) -> None:
         del signum, frame
@@ -209,9 +212,32 @@ def _shutdown_requested() -> Iterator[object]:
                 signal.signal(signum, request_shutdown)
                 installed.append((signum, previous))
         yield lambda: requested
-    finally:
-        for signum, handler in reversed(installed):
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+
+    for signum, handler in reversed(installed):
+        try:
             signal.signal(signum, handler)
+        except BaseException as error:
+            restoration_failures.append((signum, error))
+
+    if primary_error is not None:
+        for signum, error in restoration_failures:
+            primary_error.add_note(
+                f"signal handler restoration failed for {signum!s}: "
+                f"{error!r}"
+            )
+        raise primary_error.with_traceback(primary_traceback)
+
+    if restoration_failures:
+        _, first_error = restoration_failures[0]
+        for signum, error in restoration_failures:
+            first_error.add_note(
+                f"signal handler restoration failed for {signum!s}: "
+                f"{error!r}"
+            )
+        raise first_error
 
 
 def main(argv: Sequence[str] | None = None) -> int:

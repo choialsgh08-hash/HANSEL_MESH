@@ -882,6 +882,148 @@ class RadarStackLauncherTests(unittest.TestCase):
             (signal.SIGINT, original_sigint),
         )
 
+    def test_partial_install_and_restore_failures_preserve_install_error(self):
+        launcher = load_launcher()
+        original_sigint = object()
+        installation_error = RuntimeError("INSTALL_ORIGINAL")
+        restoration_error = RuntimeError("RESTORE_FAILURE")
+        signal_calls: list[tuple[int, object]] = []
+
+        def set_signal(signum, handler):
+            signal_calls.append((signum, handler))
+            if signum == signal.SIGTERM and callable(handler):
+                raise installation_error
+            if signum == signal.SIGINT and handler is original_sigint:
+                raise restoration_error
+
+        with (
+            mock.patch.object(
+                launcher.signal,
+                "getsignal",
+                side_effect=lambda signum: {
+                    signal.SIGINT: original_sigint,
+                    signal.SIGTERM: object(),
+                }[signum],
+            ),
+            mock.patch.object(
+                launcher.signal,
+                "signal",
+                side_effect=set_signal,
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                with launcher._shutdown_requested():
+                    self.fail("context body must not run")
+
+        self.assertIs(raised.exception, installation_error)
+        self.assertEqual(
+            signal_calls[-1],
+            (signal.SIGINT, original_sigint),
+        )
+        self.assertTrue(
+            any(
+                "RESTORE_FAILURE" in note
+                for note in getattr(raised.exception, "__notes__", ())
+            )
+        )
+
+    def test_body_failure_survives_restore_failure_and_all_restores_run(self):
+        launcher = load_launcher()
+        originals = {
+            signal.SIGINT: object(),
+            signal.SIGTERM: object(),
+        }
+        supervisor_error = RuntimeError("SUPERVISOR_ORIGINAL")
+        restoration_error = RuntimeError("RESTORE_FAILURE")
+        signal_calls: list[tuple[int, object]] = []
+
+        def set_signal(signum, handler):
+            signal_calls.append((signum, handler))
+            if (
+                signum == signal.SIGTERM
+                and handler is originals[signal.SIGTERM]
+            ):
+                raise restoration_error
+
+        with (
+            mock.patch.object(
+                launcher.signal,
+                "getsignal",
+                side_effect=lambda signum: originals[signum],
+            ),
+            mock.patch.object(
+                launcher.signal,
+                "signal",
+                side_effect=set_signal,
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                with launcher._shutdown_requested():
+                    raise supervisor_error
+
+        self.assertIs(raised.exception, supervisor_error)
+        self.assertEqual(
+            signal_calls[-2:],
+            [
+                (signal.SIGTERM, originals[signal.SIGTERM]),
+                (signal.SIGINT, originals[signal.SIGINT]),
+            ],
+        )
+        self.assertTrue(
+            any(
+                "RESTORE_FAILURE" in note
+                for note in getattr(raised.exception, "__notes__", ())
+            )
+        )
+
+    def test_normal_body_reports_restore_failure_after_all_restores_run(self):
+        launcher = load_launcher()
+        originals = {
+            signal.SIGINT: object(),
+            signal.SIGTERM: object(),
+        }
+        restoration_error = RuntimeError("RESTORE_FAILURE")
+        signal_calls: list[tuple[int, object]] = []
+
+        def set_signal(signum, handler):
+            signal_calls.append((signum, handler))
+            if (
+                signum == signal.SIGTERM
+                and handler is originals[signal.SIGTERM]
+            ):
+                raise restoration_error
+
+        with (
+            mock.patch.object(
+                launcher.signal,
+                "getsignal",
+                side_effect=lambda signum: originals[signum],
+            ),
+            mock.patch.object(
+                launcher.signal,
+                "signal",
+                side_effect=set_signal,
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                with launcher._shutdown_requested():
+                    pass
+
+        self.assertIs(raised.exception, restoration_error)
+        self.assertEqual(
+            signal_calls[-2:],
+            [
+                (signal.SIGTERM, originals[signal.SIGTERM]),
+                (signal.SIGINT, originals[signal.SIGINT]),
+            ],
+        )
+        self.assertTrue(
+            any(
+                "signal handler restoration failed" in note
+                for note in getattr(raised.exception, "__notes__", ())
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
