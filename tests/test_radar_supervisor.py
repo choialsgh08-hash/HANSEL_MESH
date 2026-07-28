@@ -498,6 +498,213 @@ class SupervisorFixture:
         return False
 
 
+def snapshot(
+    *,
+    verified: bool = True,
+    frames: int = 5,
+    fault: str | None = None,
+) -> RadarWatchdogSnapshot:
+    return RadarWatchdogSnapshot(
+        verified,
+        frames,
+        100.0 if frames else None,
+        frames if frames else None,
+        fault,
+    )
+
+
+class RecoveryProcesses:
+    def __init__(self, actions: list[str]) -> None:
+        self.actions = actions
+        self.children: list[FakeChild] = []
+        self.stopped: set[int] = set()
+        self.capture_ports: list[str] = []
+        self.stop_override: FakeStopResult | None = None
+        self.artifact_bytes: dict[Path, bytes] = {}
+
+    def start_capture(
+        self,
+        port: object,
+        paths: EpochPaths,
+        config: RadarSupervisorConfig,
+    ) -> FakeChild:
+        del config
+        child = FakeChild("capture", 51_000 + len(self.children) + 1)
+        self.children.append(child)
+        self.capture_ports.append(str(getattr(port, "device")))
+        self.actions.append(f"capture:{paths.mission.stem[-4:]}")
+        for path, content in (
+            (paths.mission, f"mission-{child.pid}".encode()),
+            (paths.raw, f"raw-{child.pid}".encode()),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            self.artifact_bytes[path] = content
+        return child
+
+    def switch_viewer(
+        self,
+        current: FakeChild | None,
+        paths: EpochPaths,
+        config: RadarSupervisorConfig,
+    ) -> FakeChild:
+        del config
+        self.actions.append(
+            f"viewer:{paths.mission.stem[-4:]}:"
+            f"{'none' if current is None else current.pid}"
+        )
+        child = FakeChild("viewer", 52_000 + len(self.children) + 1)
+        self.children.append(child)
+        return child
+
+    def stop_child(self, child: FakeChild) -> FakeStopResult:
+        self.actions.append(f"stop:{child.role}:{child.pid}")
+        if self.stop_override is not None:
+            return self.stop_override
+        self.stopped.add(child.pid)
+        return FakeStopResult(child.role, child.pid, child.exit_code or 0, "graceful")
+
+    def stop_owned_children(self) -> tuple[FakeStopResult, ...]:
+        results = []
+        for child in self.children:
+            if child.pid in self.stopped:
+                continue
+            self.stopped.add(child.pid)
+            results.append(
+                FakeStopResult(
+                    child.role,
+                    child.pid,
+                    child.exit_code or 0,
+                    "graceful",
+                )
+            )
+        return tuple(results)
+
+
+class RecoveryFixture:
+    def __init__(
+        self,
+        directory: str,
+        *,
+        ports: list[list[object]] | None = None,
+        resets: list[bool | Exception] | None = None,
+        configurations: list[dict[str, object] | Exception] | None = None,
+        watchdogs: list[list[RadarWatchdogSnapshot]] | None = None,
+    ) -> None:
+        self.root = Path(directory)
+        self.actions: list[str] = []
+        self.sleeps: list[float] = []
+        self.now_s = 100.0
+        self.utc = datetime(2026, 7, 29, 1, 0, 0, tzinfo=timezone.utc)
+        self.port_inventories = list(
+            ports
+            if ports is not None
+            else [[application_port("COM3")]]
+        )
+        self.resets = list(resets if resets is not None else [True])
+        self.configurations = list(
+            configurations
+            if configurations is not None
+            else [
+                {
+                    "commands_completed": 2,
+                    "new_baud_prompt_observed": True,
+                    "first_magic_observed": True,
+                }
+            ]
+        )
+        self.watchdogs = list(
+            watchdogs if watchdogs is not None else [[snapshot()]]
+        )
+        self.processes = RecoveryProcesses(self.actions)
+        profile_path = self.root / "profile.cfg"
+        profile_path.write_text("sensorStop\nsensorStart\n", encoding="utf-8")
+        self.config = RadarSupervisorConfig(
+            repository_root=self.root,
+            output_root=self.root / "output",
+            profile_path=profile_path,
+            calibration_path=self.root / "calibration.json",
+            run_id="recovery",
+            xds_serial="RI32",
+        )
+        self.dependencies = RadarSupervisorDependencies(
+            port_provider=self.port_provider,
+            reset_target=self.reset_target,
+            configure=self.configure,
+            processes=self.processes,
+            watchdog_factory=self.watchdog_factory,
+            monotonic=self.monotonic,
+            sleep=self.sleep,
+            utc_now=self.utc_now,
+        )
+
+    @staticmethod
+    def _next(values: list[object]) -> object:
+        return values.pop(0) if len(values) > 1 else values[0]
+
+    def port_provider(self) -> list[object]:
+        inventory = self._next(self.port_inventories)
+        assert isinstance(inventory, list)
+        self.actions.append(
+            "ports:" + ",".join(str(getattr(port, "device")) for port in inventory)
+        )
+        return inventory
+
+    def reset_target(
+        self,
+        port: object,
+        config: RadarSupervisorConfig,
+    ) -> bool:
+        del config
+        self.actions.append(f"reset:{getattr(port, 'device')}")
+        result = self._next(self.resets)
+        if isinstance(result, Exception):
+            raise result
+        assert isinstance(result, bool)
+        return result
+
+    def configure(
+        self,
+        port: object,
+        config: RadarSupervisorConfig,
+    ) -> dict[str, object]:
+        del config
+        self.actions.append(f"configure:{getattr(port, 'device')}")
+        result = self._next(self.configurations)
+        if isinstance(result, Exception):
+            raise result
+        assert isinstance(result, dict)
+        return result
+
+    def watchdog_factory(
+        self,
+        paths: EpochPaths,
+        config: RadarSupervisorConfig,
+        started_at_s: float,
+    ) -> FakeWatchdog:
+        del paths, config, started_at_s
+        values = self._next(self.watchdogs)
+        assert isinstance(values, list)
+        return FakeWatchdog(values, self.actions)
+
+    def monotonic(self) -> float:
+        return self.now_s
+
+    def sleep(self, delay_s: float) -> None:
+        self.sleeps.append(delay_s)
+        self.now_s += delay_s
+
+    def utc_now(self) -> datetime:
+        return self.utc
+
+    @property
+    def manifest(self) -> Path:
+        return manifest_path(self.config.output_root, self.config.run_id)
+
+    def payload(self) -> dict[str, object]:
+        return json.loads(self.manifest.read_text(encoding="utf-8"))
+
+
 class RadarSupervisorStartupTests(unittest.TestCase):
     def test_public_dependency_contracts_and_constructor_are_side_effect_free(self) -> None:
         self.assertEqual(
@@ -661,14 +868,24 @@ class RadarSupervisorStartupTests(unittest.TestCase):
         for result in invalid_results:
             with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
                 fixture = SupervisorFixture(directory, profile_result=result)
+                stopped = False
+
+                def stop_on_retry(delay_s: float) -> None:
+                    nonlocal stopped
+                    fixture.sleep(delay_s)
+                    stopped = True
+
+                dependencies = replace(
+                    fixture.dependencies,
+                    sleep=stop_on_retry,
+                )
                 with mock.patch(
                     "sensors.radar_supervisor.allocate_epoch_paths",
                     wraps=allocate_epoch_paths,
                 ) as allocate:
-                    with self.assertRaises(RuntimeError):
-                        RadarSupervisor(fixture.config, fixture.dependencies).run(
-                            lambda: False
-                        )
+                    RadarSupervisor(fixture.config, dependencies).run(
+                        lambda: stopped
+                    )
                 allocate.assert_not_called()
                 self.assertIsNone(fixture.processes.started_capture)
 
@@ -716,10 +933,20 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                 fixture = SupervisorFixture(directory, snapshots=snapshots)
                 if case == "capture_exit":
                     fixture.processes.capture.exit_code = 7
-                with self.assertRaises(RuntimeError):
-                    RadarSupervisor(fixture.config, fixture.dependencies).run(
-                        lambda: False
-                    )
+                stopped = False
+
+                def stop_on_retry(delay_s: float) -> None:
+                    nonlocal stopped
+                    fixture.sleep(delay_s)
+                    stopped = True
+
+                dependencies = replace(
+                    fixture.dependencies,
+                    sleep=stop_on_retry,
+                )
+                RadarSupervisor(fixture.config, dependencies).run(
+                    lambda: stopped
+                )
                 self.assertIsNone(fixture.processes.started_viewer)
                 self.assertEqual(fixture.processes.stop_calls, 1)
                 payload = json.loads(
@@ -965,7 +1192,7 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                     "STOPPED",
                 ],
             )
-            self.assertEqual(len(running_payloads), 1)
+            self.assertGreaterEqual(len(running_payloads), 1)
             running_payload = running_payloads[0]
             self.assertEqual(running_payload["last_reason"], "verified_frames")
             self.assertEqual(running_payload["verified_consecutive_frames"], 5)
@@ -1044,6 +1271,601 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                     },
                 ],
             )
+
+
+class RadarSupervisorRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _stop_after_running_epoch(
+        fixture: RecoveryFixture,
+        epoch: int,
+    ) -> bool:
+        return (
+            fixture.manifest.exists()
+            and fixture.payload()["state"] == "RUNNING"
+            and fixture.payload()["epoch"] == epoch
+        )
+
+    def test_healthy_running_frames_do_not_reset_configure_or_rotate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[[snapshot(), snapshot(), snapshot()]],
+            )
+
+            def stop_after_one_monitor_poll() -> bool:
+                return bool(fixture.sleeps)
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_one_monitor_poll
+            )
+
+            payload = fixture.payload()
+            self.assertEqual(fixture.actions.count("reset:COM3"), 1)
+            self.assertEqual(fixture.actions.count("configure:COM3"), 1)
+            self.assertEqual(payload["epoch"], 1)
+            self.assertEqual(payload["recovery_count"], 0)
+            self.assertEqual(len(payload["epochs"]), 1)
+
+    def test_watchdog_faults_create_one_recovery_episode_and_switch_e002(self) -> None:
+        for reason in (
+            "radar_frame_timeout",
+            "firmware_low_power_timing_assert",
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                fixture = RecoveryFixture(
+                    directory,
+                    watchdogs=[
+                        [snapshot(), snapshot(verified=False, fault=reason)],
+                        [snapshot()],
+                    ],
+                )
+                stop_checks = 0
+
+                def stop_after_e002_running() -> bool:
+                    nonlocal stop_checks
+                    stop_checks += 1
+                    return (
+                        fixture.manifest.exists()
+                        and fixture.payload()["state"] == "RUNNING"
+                        and fixture.payload()["epoch"] == 2
+                    ) or stop_checks >= 50
+
+                RadarSupervisor(fixture.config, fixture.dependencies).run(
+                    stop_after_e002_running
+                )
+
+                payload = fixture.payload()
+                self.assertEqual(payload["epoch"], 2)
+                self.assertEqual(payload["recovery_count"], 1)
+                self.assertEqual(payload["epochs"][0]["end_reason"], reason)
+                stop_capture = next(
+                    index
+                    for index, action in enumerate(fixture.actions)
+                    if action.startswith("stop:capture:")
+                )
+                recovery_reset = fixture.actions.index("reset:COM3", 2)
+                second_capture = fixture.actions.index("capture:e002")
+                stop_viewer = next(
+                    index
+                    for index, action in enumerate(fixture.actions)
+                    if action.startswith("stop:viewer:")
+                )
+                second_viewer = next(
+                    index
+                    for index, action in enumerate(fixture.actions)
+                    if action.startswith("viewer:e002:")
+                )
+                self.assertLess(stop_capture, recovery_reset)
+                self.assertLess(second_capture, stop_viewer)
+                self.assertLess(stop_viewer, second_viewer)
+
+    def test_port_loss_recovers_on_com9_and_capture_exit_uses_same_flow(self) -> None:
+        cases = ("port_loss", "capture_exit")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                ports = None
+                if case == "port_loss":
+                    ports = [
+                        [application_port("COM3")],
+                        [application_port("COM3")],
+                        [],
+                        [application_port("COM9")],
+                        [application_port("COM9")],
+                    ]
+                fixture = RecoveryFixture(
+                    directory,
+                    ports=ports,
+                    watchdogs=[[snapshot(), snapshot()], [snapshot()]],
+                )
+                armed = False
+                stop_checks = 0
+
+                def stop_after_recovery() -> bool:
+                    nonlocal armed, stop_checks
+                    stop_checks += 1
+                    if (
+                        case == "capture_exit"
+                        and not armed
+                        and fixture.manifest.exists()
+                        and fixture.payload()["state"] == "RUNNING"
+                    ):
+                        capture = next(
+                            child
+                            for child in reversed(fixture.processes.children)
+                            if child.role == "capture"
+                        )
+                        capture.exit_code = 17
+                        armed = True
+                    return (
+                        fixture.manifest.exists()
+                        and fixture.payload()["state"] == "RUNNING"
+                        and fixture.payload()["epoch"] == 2
+                    ) or stop_checks >= 50
+
+                RadarSupervisor(fixture.config, fixture.dependencies).run(
+                    stop_after_recovery
+                )
+
+                payload = fixture.payload()
+                self.assertEqual(payload["recovery_count"], 1)
+                self.assertEqual(payload["epoch"], 2)
+                if case == "port_loss":
+                    self.assertEqual(fixture.processes.capture_ports, ["COM3", "COM9"])
+                    self.assertEqual(payload["port"], "COM9")
+                else:
+                    self.assertEqual(
+                        payload["epochs"][0]["capture_exit_code"],
+                        17,
+                    )
+
+    def test_viewer_exit_restarts_same_epoch_without_radar_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[[snapshot(), snapshot(), snapshot()]],
+            )
+            armed = False
+            stop_checks = 0
+
+            def stop_after_viewer_restart() -> bool:
+                nonlocal armed, stop_checks
+                stop_checks += 1
+                viewers = [
+                    child
+                    for child in fixture.processes.children
+                    if child.role == "viewer"
+                ]
+                if viewers and not armed:
+                    viewers[-1].exit_code = 9
+                    armed = True
+                    return False
+                return len(viewers) == 2 or stop_checks >= 50
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_viewer_restart
+            )
+
+            payload = fixture.payload()
+            self.assertEqual(payload["epoch"], 1)
+            self.assertEqual(payload["recovery_count"], 0)
+            self.assertEqual(fixture.actions.count("reset:COM3"), 1)
+            self.assertEqual(fixture.actions.count("configure:COM3"), 1)
+            self.assertEqual(
+                [action for action in fixture.actions if action.startswith("viewer:")],
+                ["viewer:e001:none", "viewer:e001:none"],
+            )
+
+    def test_old_viewer_stays_active_until_replacement_five_frame_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[
+                    [
+                        snapshot(),
+                        snapshot(verified=False, frames=0, fault="radar_frame_timeout"),
+                    ],
+                    [
+                        snapshot(verified=False, frames=1),
+                        snapshot(verified=False, frames=2),
+                        snapshot(verified=False, frames=0),
+                        snapshot(verified=False, frames=1),
+                        snapshot(verified=False, frames=2),
+                        snapshot(verified=False, frames=3),
+                        snapshot(verified=False, frames=4),
+                        snapshot(),
+                    ],
+                ],
+            )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                lambda: self._stop_after_running_epoch(fixture, 2)
+            )
+
+            verified = [
+                index
+                for index, action in enumerate(fixture.actions)
+                if action == "verified:5"
+            ]
+            old_viewer_stop = next(
+                index
+                for index, action in enumerate(fixture.actions)
+                if action.startswith("stop:viewer:")
+            )
+            self.assertEqual(len(verified), 2)
+            self.assertLess(verified[1], old_viewer_stop)
+            self.assertEqual(fixture.payload()["epochs"][0]["end_reason"], "radar_frame_timeout")
+
+    def test_recovery_attempt_failures_do_not_start_new_fault_episodes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[
+                    [
+                        snapshot(),
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="radar_frame_timeout",
+                        ),
+                    ],
+                    [
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="radar_verification_timeout",
+                        )
+                    ],
+                    [snapshot()],
+                ],
+            )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                lambda: self._stop_after_running_epoch(fixture, 3)
+            )
+
+            payload = fixture.payload()
+            self.assertEqual(payload["recovery_count"], 1)
+            self.assertEqual(
+                [row["epoch"] for row in payload["epochs"]],
+                [1, 2, 3],
+            )
+            first_viewer_stop = next(
+                index
+                for index, action in enumerate(fixture.actions)
+                if action.startswith("stop:viewer:")
+            )
+            third_epoch_verified = [
+                index
+                for index, action in enumerate(fixture.actions)
+                if action == "verified:5"
+            ][1]
+            self.assertLess(third_epoch_verified, first_viewer_stop)
+            self.assertEqual(
+                [
+                    delay
+                    for delay in fixture.sleeps
+                    if delay != fixture.config.poll_interval_s
+                ],
+                [0.5],
+            )
+
+    def test_failures_back_off_with_cap_and_preserve_epoch_rules(self) -> None:
+        invalid_profile = {
+            "commands_completed": 1,
+            "new_baud_prompt_observed": True,
+            "first_magic_observed": False,
+        }
+        valid_profile = {
+            "commands_completed": 2,
+            "new_baud_prompt_observed": True,
+            "first_magic_observed": False,
+        }
+        cases = {
+            "reset": {
+                "resets": [RuntimeError("reset") for _ in range(5)] + [True],
+            },
+            "configuration": {
+                "configurations": [invalid_profile for _ in range(5)]
+                + [valid_profile],
+            },
+            "verification": {
+                "watchdogs": [
+                    [
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="radar_verification_timeout",
+                        )
+                    ]
+                    for _ in range(5)
+                ]
+                + [[snapshot()]],
+            },
+        }
+        for case, options in cases.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = RecoveryFixture(directory, **options)  # type: ignore[arg-type]
+                expected_epoch = 6 if case == "verification" else 1
+
+                RadarSupervisor(fixture.config, fixture.dependencies).run(
+                    lambda: self._stop_after_running_epoch(
+                        fixture,
+                        expected_epoch,
+                    )
+                )
+
+                filtered = [
+                    delay
+                    for delay in fixture.sleeps
+                    if delay != fixture.config.poll_interval_s
+                ]
+                self.assertEqual(filtered[:5], [0.5, 1.0, 2.0, 4.0, 5.0])
+                payload = fixture.payload()
+                if case in ("reset", "configuration"):
+                    self.assertEqual(
+                        [row["epoch"] for row in payload["epochs"]],
+                        [1],
+                    )
+                    self.assertEqual(
+                        [
+                            action
+                            for action in fixture.actions
+                            if action.startswith("capture:")
+                        ],
+                        ["capture:e001"],
+                    )
+                else:
+                    self.assertEqual(
+                        [row["epoch"] for row in payload["epochs"]],
+                        [1, 2, 3, 4, 5, 6],
+                    )
+                    for path, content in fixture.processes.artifact_bytes.items():
+                        self.assertEqual(path.read_bytes(), content)
+
+    def test_no_reset_tool_waits_for_real_usb_cycle_after_silent_fault(self) -> None:
+        ambiguous = [
+            application_port("COM3"),
+            application_port("COM4"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                ports=[
+                    [application_port("COM3")],
+                    [application_port("COM3")],
+                    [application_port("COM3")],
+                    [application_port("COM3")],
+                    ambiguous,
+                    [],
+                    [application_port("COM9")],
+                ],
+                resets=[True, False],
+                watchdogs=[
+                    [
+                        snapshot(),
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="radar_frame_timeout",
+                        ),
+                    ],
+                    [snapshot()],
+                ],
+            )
+            reasons: list[str] = []
+            original_write = write_manifest_atomic
+
+            def recording_write(path: Path, payload: dict[str, object]) -> None:
+                reasons.append(str(payload["last_reason"]))
+                original_write(path, payload)
+
+            with mock.patch(
+                "sensors.radar_supervisor.write_manifest_atomic",
+                recording_write,
+            ):
+                RadarSupervisor(fixture.config, fixture.dependencies).run(
+                    lambda: self._stop_after_running_epoch(fixture, 2)
+                )
+
+            self.assertIn(
+                "reset_tool_unavailable_waiting_for_usb_cycle",
+                reasons,
+            )
+            second_configure = fixture.actions.index("configure:COM9")
+            ambiguous_poll = fixture.actions.index("ports:COM3,COM4")
+            absent_poll = fixture.actions.index("ports:")
+            reappeared_poll = fixture.actions.index("ports:COM9")
+            self.assertLess(ambiguous_poll, absent_poll)
+            self.assertLess(absent_poll, reappeared_poll)
+            self.assertLess(reappeared_poll, second_configure)
+            self.assertEqual(fixture.processes.capture_ports, ["COM3", "COM9"])
+
+    def test_no_reset_tool_uses_already_observed_port_loss(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                ports=[
+                    [application_port("COM3")],
+                    [application_port("COM3")],
+                    [],
+                    [application_port("COM9")],
+                ],
+                resets=[True, False],
+                watchdogs=[[snapshot()], [snapshot()]],
+            )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                lambda: self._stop_after_running_epoch(fixture, 2)
+            )
+
+            self.assertEqual(fixture.processes.capture_ports, ["COM3", "COM9"])
+            self.assertIn("configure:COM9", fixture.actions)
+            self.assertEqual(fixture.payload()["epochs"][0]["end_reason"], "application_port_lost")
+
+    def test_shutdown_during_backoff_and_usb_cycle_wait_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                resets=[RuntimeError("reset unavailable")],
+            )
+            stop = False
+
+            def stop_after_backoff(delay_s: float) -> None:
+                nonlocal stop
+                fixture.sleep(delay_s)
+                stop = True
+
+            dependencies = replace(
+                fixture.dependencies,
+                sleep=stop_after_backoff,
+            )
+            RadarSupervisor(fixture.config, dependencies).run(lambda: stop)
+            self.assertEqual(fixture.payload()["state"], "STOPPED")
+            self.assertEqual(fixture.payload()["epochs"], [])
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                ports=[
+                    [application_port("COM3")],
+                    [application_port("COM3")],
+                    [application_port("COM3")],
+                    [application_port("COM3")],
+                ],
+                resets=[True, False],
+                watchdogs=[
+                    [
+                        snapshot(),
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="radar_frame_timeout",
+                        ),
+                    ]
+                ],
+            )
+
+            def stop_in_usb_gate() -> bool:
+                return (
+                    fixture.manifest.exists()
+                    and fixture.payload()["last_reason"]
+                    == "reset_tool_unavailable_waiting_for_usb_cycle"
+                )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_in_usb_gate
+            )
+            payload = fixture.payload()
+            self.assertEqual(payload["state"], "STOPPED")
+            self.assertEqual(payload["recovery_count"], 1)
+            self.assertEqual(len(payload["epochs"]), 1)
+
+    def test_manifest_after_recovery_has_exact_epoch_and_process_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[
+                    [
+                        snapshot(),
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="firmware_low_power_timing_assert",
+                        ),
+                    ],
+                    [snapshot()],
+                ],
+            )
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                lambda: self._stop_after_running_epoch(fixture, 2)
+            )
+            payload = fixture.payload()
+            e001_mission = (
+                fixture.config.output_root
+                / "missions"
+                / "radar-board-live-recovery-e001.jsonl"
+            )
+            e002_mission = (
+                fixture.config.output_root
+                / "missions"
+                / "radar-board-live-recovery-e002.jsonl"
+            )
+            e002_raw = (
+                fixture.config.output_root
+                / "captures"
+                / "radar-board-live-recovery-e002.bin"
+            )
+            self.assertEqual(payload["epoch"], 2)
+            self.assertEqual(payload["recovery_count"], 1)
+            self.assertEqual(payload["mission_path"], str(e002_mission))
+            self.assertEqual(payload["raw_path"], str(e002_raw))
+            self.assertEqual(
+                [row["epoch"] for row in payload["epochs"]],
+                [1, 2],
+            )
+            self.assertEqual(
+                payload["epochs"][0]["mission_path"],
+                str(e001_mission),
+            )
+            self.assertEqual(
+                payload["epochs"][0]["end_reason"],
+                "firmware_low_power_timing_assert",
+            )
+            self.assertEqual(
+                [
+                    (event["role"], event["pid"], event["action"])
+                    for event in payload["process_events"]
+                ],
+                [
+                    ("capture", 51001, "started"),
+                    ("viewer", 52002, "started"),
+                    ("capture", 51001, "stopped"),
+                    ("capture", 51003, "started"),
+                    ("viewer", 52002, "stopped"),
+                    ("viewer", 52004, "started"),
+                    ("capture", 51003, "stopped"),
+                    ("viewer", 52004, "stopped"),
+                ],
+            )
+
+    def test_mismatched_stop_child_result_raises_and_is_not_recorded(self) -> None:
+        for result in (
+            FakeStopResult("viewer", 99999, 0, "graceful"),
+            FakeStopResult("capture", 52002, 0, "graceful"),
+        ):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                fixture = RecoveryFixture(
+                    directory,
+                    watchdogs=[[snapshot(), snapshot()]],
+                )
+                armed = False
+
+                def trigger_viewer_exit() -> bool:
+                    nonlocal armed
+                    viewers = [
+                        child
+                        for child in fixture.processes.children
+                        if child.role == "viewer"
+                    ]
+                    if viewers and not armed:
+                        viewers[0].exit_code = 9
+                        fixture.processes.stop_override = result
+                        armed = True
+                    return False
+
+                with self.assertRaises(RuntimeError):
+                    RadarSupervisor(fixture.config, fixture.dependencies).run(
+                        trigger_viewer_exit
+                    )
+                payload = fixture.payload()
+                self.assertNotIn(
+                    (result.role, result.pid),
+                    [
+                        (event["role"], event["pid"])
+                        for event in payload["process_events"]
+                        if event["action"] == "stopped"
+                    ],
+                )
 
 
 if __name__ == "__main__":
