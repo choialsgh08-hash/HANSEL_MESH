@@ -177,7 +177,16 @@ class RadarStackProcessesTests(unittest.TestCase):
             if os.name == "nt":
                 self.assertEqual(
                     started[0][1]["creationflags"],
-                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
+                    subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+                self.assertEqual(
+                    started[0][1]["startupinfo"].dwFlags
+                    & subprocess.STARTF_USESHOWWINDOW,
+                    subprocess.STARTF_USESHOWWINDOW,
+                )
+                self.assertEqual(
+                    started[0][1]["startupinfo"].wShowWindow,
+                    subprocess.SW_HIDE,
                 )
             manager.stop_owned_children()
 
@@ -191,6 +200,32 @@ class RadarStackProcessesTests(unittest.TestCase):
             manager.start_capture(self.port, self.paths, self.config)
 
         self.assertTrue(started[0]["start_new_session"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows launch semantics")
+    def test_windows_child_is_hidden_without_disabling_ctrl_break_delivery(self):
+        process = FakeProcess(pid=83, poll_result=0)
+        started = []
+        manager = RadarStackProcesses(
+            popen_factory=lambda command, **kwargs: (
+                started.append(kwargs) or process
+            )
+        )
+
+        manager.start_capture(self.port, self.paths, self.config)
+
+        self.assertEqual(
+            started[0]["creationflags"],
+            subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        startupinfo = started[0]["startupinfo"]
+        self.assertEqual(
+            startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW,
+            subprocess.STARTF_USESHOWWINDOW,
+        )
+        self.assertEqual(startupinfo.wShowWindow, subprocess.SW_HIDE)
+        self.assertFalse(
+            started[0]["creationflags"] & subprocess.CREATE_NO_WINDOW
+        )
 
     def test_stop_uses_windows_ctrl_break_before_waiting(self):
         process = FakeProcess(waits=(0,))

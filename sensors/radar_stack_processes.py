@@ -191,10 +191,11 @@ class RadarStackProcesses:
             "cwd": config.repository_root,
         }
         if os.name == "nt":
-            popen_kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            )
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            popen_kwargs["startupinfo"] = startupinfo
         else:
             popen_kwargs["start_new_session"] = True
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
