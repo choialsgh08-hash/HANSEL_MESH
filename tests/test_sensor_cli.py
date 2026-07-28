@@ -4,7 +4,10 @@ import io
 import hashlib
 import json
 from pathlib import Path
+import signal
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -369,6 +372,85 @@ class SensorCliTests(unittest.TestCase):
             capture.call_args.kwargs["heatmap_range_step_m"],
             0.05,
         )
+
+    def test_radar_live_converts_sigterm_inside_capture_and_writes_final_footer(self):
+        class InterruptingSerial:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *unused):
+                return False
+
+            def read(self, size):
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            mission = directory / "mission.jsonl"
+            raw = directory / "radar.bin"
+            index = directory / "radar.index.jsonl"
+            args = argparse.Namespace(
+                port="COM3", baud=1250000, output=str(mission),
+                mission_id="mission-1", profile_id="sdk5502-profile",
+                calibration_id="uncalibrated", unit_id="head", boot_id="boot-1",
+                raw_output=str(raw), raw_index=str(index), duration=0.0,
+                read_bytes=1024, serial_timeout=0.01, health_interval=0.5,
+                overwrite=False, header_size="40",
+                allow_elided_empty_point_tlv=True, allow_nonzero_padding=True,
+                heatmap_azimuth_bins=4, heatmap_range_bins=2,
+                heatmap_range_step_m=0.05,
+            )
+            previous = signal.getsignal(signal.SIGTERM)
+            with mock.patch.dict(
+                sys.modules,
+                {"serial": types.SimpleNamespace(Serial=lambda **kwargs: InterruptingSerial())},
+            ), contextlib.redirect_stdout(io.StringIO()):
+                command_radar_live(args)
+
+            self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+            self.assertEqual(
+                json.loads(index.read_text("utf-8").splitlines()[-1])["stop_reason"],
+                "keyboard_interrupt",
+            )
+            self.assertIn("health/radar", mission.read_text("utf-8"))
+
+    def test_radar_live_converts_sigbreak_inside_capture_when_available(self):
+        class FakeSignals:
+            SIGTERM = 15
+            SIGBREAK = 21
+
+            def __init__(self):
+                self.handlers = {self.SIGTERM: "term-before", self.SIGBREAK: "break-before"}
+
+            def getsignal(self, signum):
+                return self.handlers[signum]
+
+            def signal(self, signum, handler):
+                self.handlers[signum] = handler
+
+        fake_signals = FakeSignals()
+        args = argparse.Namespace(
+            port="COM3", baud=1250000, output="mission.jsonl",
+            mission_id="mission-1", profile_id="sdk5502-profile",
+            calibration_id="uncalibrated", unit_id="head", boot_id=None,
+            raw_output=None, raw_index=None, duration=0.0, read_bytes=1024,
+            serial_timeout=0.01, health_interval=0.5, overwrite=False,
+            header_size="40", allow_elided_empty_point_tlv=False,
+            allow_nonzero_padding=False, heatmap_azimuth_bins=None,
+            heatmap_range_bins=None, heatmap_range_step_m=None,
+        )
+
+        def capture_with_break(**kwargs):
+            fake_signals.getsignal(fake_signals.SIGBREAK)(fake_signals.SIGBREAK, None)
+
+        with mock.patch("sensors.cli.signal", fake_signals), mock.patch(
+            "sensors.cli.capture_radar_uart", side_effect=capture_with_break
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                command_radar_live(args)
+
+        self.assertEqual(fake_signals.handlers[FakeSignals.SIGTERM], "term-before")
+        self.assertEqual(fake_signals.handlers[FakeSignals.SIGBREAK], "break-before")
 
     def test_radar_index_uses_default_sidecar_and_returns_healthy(self):
         metadata = {

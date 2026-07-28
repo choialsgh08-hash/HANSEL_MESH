@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import math
 import os
 from pathlib import Path
+import signal
 import sys
 import tempfile
 import time
@@ -388,50 +390,70 @@ def command_radar_bin(args: argparse.Namespace) -> int:
     return 0 if usable else 2
 
 
+@contextmanager
+def _radar_shutdown_signals():
+    previous: dict[int, object] = {}
+
+    def interrupt_capture(signum, frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, interrupt_capture)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def command_radar_live(args: argparse.Namespace) -> int:
-    stats = capture_radar_uart(
-        port=args.port,
-        baudrate=args.baud,
-        mission_log=Path(args.output),
-        mission_id=args.mission_id,
-        profile_id=args.profile_id,
-        calibration_id=args.calibration_id,
-        unit_id=args.unit_id,
-        boot_id=args.boot_id,
-        raw_capture=(None if args.raw_output is None else Path(args.raw_output)),
-        raw_index=(None if args.raw_index is None else Path(args.raw_index)),
-        duration_s=args.duration,
-        read_size=args.read_bytes,
-        serial_timeout_s=args.serial_timeout,
-        health_interval_s=getattr(args, "health_interval", 0.5),
-        overwrite=args.overwrite,
-        header_size=int(args.header_size),
-        allow_elided_empty_point_tlv=getattr(
-            args,
-            "allow_elided_empty_point_tlv",
-            False,
-        ),
-        allow_nonzero_padding=getattr(
-            args,
-            "allow_nonzero_padding",
-            False,
-        ),
-        heatmap_azimuth_bins=getattr(
-            args,
-            "heatmap_azimuth_bins",
-            None,
-        ),
-        heatmap_range_bins=getattr(
-            args,
-            "heatmap_range_bins",
-            None,
-        ),
-        heatmap_range_step_m=getattr(
-            args,
-            "heatmap_range_step_m",
-            None,
-        ),
-    )
+    with _radar_shutdown_signals():
+        stats = capture_radar_uart(
+            port=args.port,
+            baudrate=args.baud,
+            mission_log=Path(args.output),
+            mission_id=args.mission_id,
+            profile_id=args.profile_id,
+            calibration_id=args.calibration_id,
+            unit_id=args.unit_id,
+            boot_id=args.boot_id,
+            raw_capture=(None if args.raw_output is None else Path(args.raw_output)),
+            raw_index=(None if args.raw_index is None else Path(args.raw_index)),
+            duration_s=args.duration,
+            read_size=args.read_bytes,
+            serial_timeout_s=args.serial_timeout,
+            health_interval_s=getattr(args, "health_interval", 0.5),
+            overwrite=args.overwrite,
+            header_size=int(args.header_size),
+            allow_elided_empty_point_tlv=getattr(
+                args,
+                "allow_elided_empty_point_tlv",
+                False,
+            ),
+            allow_nonzero_padding=getattr(
+                args,
+                "allow_nonzero_padding",
+                False,
+            ),
+            heatmap_azimuth_bins=getattr(
+                args,
+                "heatmap_azimuth_bins",
+                None,
+            ),
+            heatmap_range_bins=getattr(
+                args,
+                "heatmap_range_bins",
+                None,
+            ),
+            heatmap_range_step_m=getattr(
+                args,
+                "heatmap_range_step_m",
+                None,
+            ),
+        )
     print(
         json.dumps(
             capture_stats_dict(stats),
