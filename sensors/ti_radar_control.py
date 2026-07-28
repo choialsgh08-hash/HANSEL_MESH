@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
+import subprocess
 import time
-from typing import Iterable, List, Mapping, Sequence, Tuple
+from typing import Callable, Iterable, List, Mapping, Sequence, Tuple
 
 
 TI_MAGIC_WORD = b"\x02\x01\x04\x03\x06\x05\x08\x07"
@@ -17,6 +19,128 @@ class ProfileCommands:
     baud_command: str
     target_baud: int
     after_baud: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RadarPortIdentity:
+    device: str
+    vid: int
+    pid: int
+    serial_number: str
+    description: str
+    location: str
+
+
+def select_application_port(
+    ports: Iterable[object],
+    explicit_port: str | None = None,
+    xds_serial: str | None = None,
+) -> RadarPortIdentity:
+    """Select exactly one XDS110 Application/User UART from a port inventory."""
+    candidates = []
+    for port in ports:
+        device = str(getattr(port, "device", ""))
+        if explicit_port is not None and device != explicit_port:
+            continue
+        vid = getattr(port, "vid", None)
+        pid = getattr(port, "pid", None)
+        description = str(getattr(port, "description", ""))
+        serial_number = str(getattr(port, "serial_number", ""))
+        if (vid, pid) != (0x0451, 0xBEF3):
+            continue
+        if "Application/User UART" not in description:
+            continue
+        if "Auxiliary" in description:
+            continue
+        if xds_serial is not None and serial_number != xds_serial:
+            continue
+        candidates.append(
+            RadarPortIdentity(
+                device=device,
+                vid=vid,
+                pid=pid,
+                serial_number=serial_number,
+                description=description,
+                location=str(getattr(port, "location", "")),
+            )
+        )
+
+    if len(candidates) != 1:
+        filters = []
+        if explicit_port is not None:
+            filters.append(f"explicit port {explicit_port!r}")
+        if xds_serial is not None:
+            filters.append(f"serial {xds_serial!r}")
+        filter_text = ", ".join(filters) or "available ports"
+        raise RuntimeError(
+            "expected exactly one XDS110 Application/User UART for "
+            f"{filter_text}; found {len(candidates)}"
+        )
+    return candidates[0]
+
+
+def _uniflash_version(path: Path) -> tuple[int, ...]:
+    version = path.name.removeprefix("uniflash_")
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return ()
+
+
+def find_xds110_reset(
+    explicit: Path | None,
+    search_roots: Iterable[Path],
+) -> Path:
+    """Locate xds110reset, preferring explicit and newest UniFlash installs."""
+    if explicit is not None:
+        if explicit.is_file():
+            return explicit
+        raise RuntimeError(f"explicit xds110reset executable was not found: {explicit}")
+
+    for executable_name in ("xds110reset.exe", "xds110reset"):
+        found = shutil.which(executable_name)
+        if found:
+            return Path(found)
+
+    candidates = []
+    for root in search_roots:
+        for install in root.glob("uniflash_*"):
+            for relative_path in (
+                Path("deskdb/content/TICloudAgent/win/ccs_base/common/uscif/xds110/xds110reset.exe"),
+                Path("simplelink/imagecreator/bin/xds110reset.exe"),
+            ):
+                executable = install / relative_path
+                if executable.is_file():
+                    candidates.append((install, executable))
+    if candidates:
+        return max(candidates, key=lambda candidate: _uniflash_version(candidate[0]))[1]
+    raise RuntimeError(
+        "xds110reset executable was not found; install TI UniFlash or provide its path"
+    )
+
+
+def reset_xds110_target(
+    executable: Path,
+    serial_number: str,
+    runner: Callable[..., object],
+) -> None:
+    """Toggle reset only for the XDS110 identified by *serial_number*."""
+    if not serial_number.strip():
+        raise ValueError("XDS110 serial number must not be empty")
+    command = [
+        str(executable),
+        "-a",
+        "toggle",
+        "-d",
+        "100",
+        "-s",
+        serial_number,
+    ]
+    try:
+        runner(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or ""
+        raise RuntimeError(f"XDS110 reset failed for serial {serial_number!r}: {stderr}") from exc
 
 
 def load_commands(path: Path) -> Tuple[str, ...]:
