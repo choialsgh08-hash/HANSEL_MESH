@@ -234,16 +234,23 @@
         halfWidthM: MAIN_HALF_WIDTH_M,
         rangeStepM: 0.5,
         labelUnit: "m",
+        clipShape: "rectangular",
       });
-      this.drawEvidenceGrid(ctx, transform, scene);
+      ctx.save();
+      this.clipToMapBoundary(ctx, transform, "rectangular");
+      this.drawEvidenceGrid(ctx, transform, scene, {
+        clipShape: "rectangular",
+      });
       this.drawTracks(ctx, transform, scene.tracks, {
         scene,
         labelLimit: 5,
         maxRangeM: MAIN_MAX_RANGE_M,
+        clipShape: "rectangular",
       });
       if (this.rawToggle && this.rawToggle.checked) {
         this.drawRawDebugPoints(ctx, transform, this.snapshot && this.snapshot.frame);
       }
+      ctx.restore();
       this.drawRobot(ctx, transform);
       ctx.fillStyle = "rgba(225, 246, 243, 0.72)";
       ctx.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
@@ -261,14 +268,21 @@
         halfWidthM: CLOSE_MAX_RANGE_M,
         rangeStepM: 0.1,
         labelUnit: "cm",
+        clipShape: "radial",
       });
-      this.drawEvidenceGrid(ctx, transform, scene);
+      ctx.save();
+      this.clipToMapBoundary(ctx, transform, "radial");
+      this.drawEvidenceGrid(ctx, transform, scene, {
+        clipShape: "radial",
+      });
       this.drawTracks(ctx, transform, scene.tracks, {
         scene,
         labelLimit: 3,
         maxRangeM: CLOSE_MAX_RANGE_M,
         close: true,
+        clipShape: "radial",
       });
+      ctx.restore();
       this.drawRobot(ctx, transform);
     }
 
@@ -284,6 +298,7 @@
       const top = transform.originY - forwardMaxM * transform.scale;
 
       ctx.save();
+      this.clipToMapBoundary(ctx, transform, options.clipShape);
       ctx.strokeStyle = "rgba(92, 228, 208, 0.13)";
       ctx.lineWidth = 1;
       ctx.setLineDash([3, 5]);
@@ -292,18 +307,18 @@
         rangeM <= forwardMaxM + 0.0001;
         rangeM += rangeStepM
       ) {
-        const y = transform.originY - rangeM * transform.scale;
-        ctx.beginPath();
-        ctx.moveTo(left, y);
-        ctx.lineTo(right, y);
-        ctx.stroke();
+        this.drawRangeGuideArc(ctx, transform, rangeM);
         ctx.fillStyle = "rgba(176, 210, 206, 0.74)";
         ctx.font = "650 9px ui-monospace, SFMono-Regular, Consolas, monospace";
         ctx.textAlign = "left";
         const label = labelUnit === "cm"
           ? `${Math.round(rangeM * 100)}cm`
           : `${rangeM.toFixed(rangeM % 1 === 0 ? 0 : 1)}m`;
-        ctx.fillText(label, right + 4, y + 3);
+        ctx.fillText(
+          label,
+          transform.originX + 5,
+          transform.originY - rangeM * transform.scale + 10,
+        );
       }
       const lateralStep = labelUnit === "cm" ? 0.1 : 0.5;
       for (
@@ -323,16 +338,92 @@
       ctx.moveTo(transform.originX, top);
       ctx.lineTo(transform.originX, transform.originY);
       ctx.stroke();
-      ctx.strokeStyle = "rgba(156, 198, 194, 0.28)";
-      ctx.strokeRect(left, top, right - left, transform.originY - top);
       ctx.fillStyle = "rgba(114, 150, 148, 0.48)";
       ctx.font = "700 9px ui-monospace, SFMono-Regular, Consolas, monospace";
       ctx.textAlign = "left";
       ctx.fillText("UNKNOWN", left + 7, top + 14);
       ctx.restore();
+      this.strokeMapBoundary(ctx, transform, options.clipShape);
     }
 
-    drawEvidenceGrid(ctx, transform, scene) {
+    drawRangeGuideArc(ctx, transform, rangeM) {
+      ctx.beginPath();
+      ctx.arc(
+        transform.originX,
+        transform.originY,
+        rangeM * transform.scale,
+        Math.PI,
+        Math.PI * 2,
+      );
+      ctx.stroke();
+    }
+
+    clipToMapBoundary(ctx, transform, clipShape) {
+      const left =
+        transform.originX - transform.halfWidthM * transform.scale;
+      const top =
+        transform.originY - transform.forwardMaxM * transform.scale;
+      ctx.beginPath();
+      if (clipShape === "radial") {
+        ctx.moveTo(transform.originX, transform.originY);
+        ctx.lineTo(
+          transform.originX - transform.forwardMaxM * transform.scale,
+          transform.originY,
+        );
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          transform.forwardMaxM * transform.scale,
+          Math.PI,
+          Math.PI * 2,
+        );
+        ctx.closePath();
+      } else {
+        ctx.rect(
+          left,
+          top,
+          transform.halfWidthM * transform.scale * 2,
+          transform.forwardMaxM * transform.scale,
+        );
+      }
+      ctx.clip();
+    }
+
+    strokeMapBoundary(ctx, transform, clipShape) {
+      const left =
+        transform.originX - transform.halfWidthM * transform.scale;
+      const top =
+        transform.originY - transform.forwardMaxM * transform.scale;
+      ctx.save();
+      ctx.strokeStyle = "rgba(156, 198, 194, 0.28)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      if (clipShape === "radial") {
+        ctx.moveTo(
+          transform.originX - transform.forwardMaxM * transform.scale,
+          transform.originY,
+        );
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          transform.forwardMaxM * transform.scale,
+          Math.PI,
+          Math.PI * 2,
+        );
+        ctx.closePath();
+      } else {
+        ctx.rect(
+          left,
+          top,
+          transform.halfWidthM * transform.scale * 2,
+          transform.forwardMaxM * transform.scale,
+        );
+      }
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    drawEvidenceGrid(ctx, transform, scene, options) {
       const grid = scene.grid;
       const meta = scene.gridMeta;
       if (!grid || !meta) {
@@ -371,6 +462,18 @@
           ) {
             continue;
           }
+          if (
+            options.clipShape === "radial" &&
+            !this.cellIntersectsRadialLimit(
+              forward0,
+              forward1,
+              lateral0,
+              lateral1,
+              transform.forwardMaxM,
+            )
+          ) {
+            continue;
+          }
           const confidence = confidenceByte / 255;
           const nearCorner = window.HanselRadarScene.projectMapPoint(
             transform,
@@ -399,14 +502,36 @@
       ctx.restore();
     }
 
+    cellIntersectsRadialLimit(
+      forward0,
+      forward1,
+      lateral0,
+      lateral1,
+      radialLimitM,
+    ) {
+      // Include a 5cm evidence cell when any part intersects the radius;
+      // the canvas clip removes the portion beyond the semicircle.
+      const closestForward = forward0 > 0
+        ? forward0
+        : forward1 < 0
+          ? -forward1
+          : 0;
+      const closestLateral = lateral0 > 0
+        ? lateral0
+        : lateral1 < 0
+          ? -lateral1
+          : 0;
+      return (
+        Math.hypot(closestForward, closestLateral) <= radialLimitM
+      );
+    }
+
     drawTracks(ctx, transform, tracks, options) {
       const freshTracks = (Array.isArray(tracks) ? tracks : [])
         .filter((track) =>
           Number.isFinite(track.forward_m) &&
           Number.isFinite(track.lateral_m) &&
-          track.forward_m >= 0 &&
-          Math.hypot(track.forward_m, track.lateral_m) <= options.maxRangeM &&
-          Math.abs(track.lateral_m) <= transform.halfWidthM)
+          this.trackInsideMapBounds(track, transform, options))
         .sort((left, right) => {
           const leftDistance = Number.isFinite(left.distance_m)
             ? left.distance_m
@@ -417,6 +542,10 @@
           return leftDistance - rightDistance;
         });
       freshTracks.forEach((track, index) => {
+        const visualAlpha = this.trackVisualAlpha(track);
+        if (visualAlpha <= 0) {
+          return;
+        }
         const point = window.HanselRadarScene.projectMapPoint(
           transform,
           track.forward_m,
@@ -424,17 +553,63 @@
         );
         const danger = this.isDangerTrack(track, options.scene);
         if (track.source === "heatmap") {
-          this.drawHeatmapUncertainty(ctx, transform, track, danger);
+          this.drawHeatmapUncertainty(
+            ctx,
+            transform,
+            track,
+            danger,
+            visualAlpha,
+          );
         } else {
-          this.drawPointMarker(ctx, point, track, danger, options.close);
+          this.drawPointMarker(
+            ctx,
+            point,
+            track,
+            danger,
+            options.close,
+            visualAlpha,
+          );
         }
         if (index < options.labelLimit) {
-          this.drawTrackLabel(ctx, point, track, danger, options.close);
+          this.drawTrackLabel(
+            ctx,
+            point,
+            track,
+            danger,
+            options.close,
+            visualAlpha,
+          );
         }
       });
     }
 
-    drawPointMarker(ctx, point, track, danger, close) {
+    trackInsideMapBounds(track, transform, options) {
+      if (
+        track.forward_m < 0 ||
+        track.forward_m > transform.forwardMaxM ||
+        Math.abs(track.lateral_m) > transform.halfWidthM
+      ) {
+        return false;
+      }
+      if (options.clipShape === "radial") {
+        return (
+          Math.hypot(track.forward_m, track.lateral_m) <=
+          options.maxRangeM
+        );
+      }
+      return true;
+    }
+
+    trackVisualAlpha(track) {
+      const ageMs = Number(track.age_ms);
+      if (!Number.isFinite(ageMs) || ageMs < 0) {
+        return 0;
+      }
+      const rawAlpha = 1 - ageMs / TRACK_MAX_AGE_MS;
+      return Math.max(0, Math.min(1, rawAlpha));
+    }
+
+    drawPointMarker(ctx, point, track, danger, close, visualAlpha) {
       const confirmed = track.point_confirmed === true;
       const radius = close ? 5.5 : confirmed ? 5 : 3.5;
       const color = danger
@@ -443,6 +618,7 @@
           ? "#f4ffff"
           : "#66e7d5";
       ctx.save();
+      ctx.globalAlpha = visualAlpha;
       ctx.strokeStyle = color;
       ctx.fillStyle = danger
         ? "rgba(255, 81, 81, 0.34)"
@@ -467,7 +643,13 @@
       ctx.restore();
     }
 
-    drawHeatmapUncertainty(ctx, transform, track, danger) {
+    drawHeatmapUncertainty(
+      ctx,
+      transform,
+      track,
+      danger,
+      visualAlpha,
+    ) {
       const distance = Number.isFinite(track.distance_m)
         ? track.distance_m
         : Math.hypot(track.forward_m, track.lateral_m);
@@ -487,6 +669,7 @@
       const canvasStart = angle - angularHalfWidth - Math.PI / 2;
       const canvasEnd = angle + angularHalfWidth - Math.PI / 2;
       ctx.save();
+      ctx.globalAlpha = visualAlpha;
       ctx.strokeStyle = danger
         ? "#ff5151"
         : "rgba(92, 228, 208, 0.82)";
@@ -522,7 +705,14 @@
       ctx.restore();
     }
 
-    drawTrackLabel(ctx, point, track, danger, close) {
+    drawTrackLabel(
+      ctx,
+      point,
+      track,
+      danger,
+      close,
+      visualAlpha,
+    ) {
       const distance = Number.isFinite(track.distance_m)
         ? track.distance_m
         : Math.hypot(track.forward_m, track.lateral_m);
@@ -539,6 +729,7 @@
       const sourceText = track.source === "point" ? "P" : "H";
       const text = `${sourceText} ${distanceText}${heightText}`;
       ctx.save();
+      ctx.globalAlpha = visualAlpha;
       ctx.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
       const width = ctx.measureText(text).width + 10;
       const x = Math.min(
@@ -712,6 +903,8 @@
       );
 
       const nearest = this.nearestConfirmedPoint(presentation);
+      const collisionNearest =
+        this.nearestConfirmedPoint(presentation, CLOSE_MAX_RANGE_M);
       this.setMetric(
         "metric-nearest",
         nearest === null ? "--" : `${nearest.toFixed(2)} m`,
@@ -735,7 +928,9 @@
           ? "DANGER"
           : hazardLevel;
       document.querySelector("#collision-distance").textContent =
-        nearest === null ? "-- cm" : `${Math.round(nearest * 100)} cm`;
+        collisionNearest === null
+          ? "-- cm"
+          : `${Math.round(collisionNearest * 100)} cm`;
     }
 
     updateDiagnostics(presentation) {
@@ -864,7 +1059,7 @@
       element.querySelector("span").textContent = label;
     }
 
-    nearestConfirmedPoint(presentation) {
+    nearestConfirmedPoint(presentation, maxDistanceM = Infinity) {
       if (!presentation || presentation.blocked) {
         return null;
       }
@@ -873,7 +1068,8 @@
           track.source === "point" &&
           track.point_confirmed === true &&
           Number.isFinite(track.distance_m) &&
-          track.distance_m >= 0)
+          track.distance_m >= 0 &&
+          track.distance_m <= maxDistanceM)
         .map((track) => track.distance_m);
       return distances.length ? Math.min(...distances) : null;
     }

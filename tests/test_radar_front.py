@@ -797,6 +797,26 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertIn("HanselRadarScene.parseRadarScene", javascript)
             self.assertIn("drawLidarTopView", javascript)
             self.assertIn("drawCollisionInset", javascript)
+            self.assertIn("drawRangeGuideArc", javascript)
+            self.assertIn("clipToMapBoundary", javascript)
+            self.assertIn("cellIntersectsRadialLimit", javascript)
+            self.assertIn('clipShape: "rectangular"', javascript)
+            self.assertIn('clipShape: "radial"', javascript)
+            self.assertIn(
+                "nearestConfirmedPoint("
+                "presentation, CLOSE_MAX_RANGE_M",
+                javascript,
+            )
+            self.assertIn("trackVisualAlpha", javascript)
+            self.assertIn(
+                "1 - ageMs / TRACK_MAX_AGE_MS",
+                javascript,
+            )
+            self.assertNotIn(
+                "Math.hypot(track.forward_m, track.lateral_m) "
+                "<= options.maxRangeM",
+                javascript,
+            )
             self.assertIn("DANGER_RANGE_M = 0.1", javascript)
             self.assertIn("UI_BUILD_ID", javascript)
             self.assertIn("requestFullscreen", javascript)
