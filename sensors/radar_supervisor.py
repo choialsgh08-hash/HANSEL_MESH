@@ -381,6 +381,7 @@ class RadarSupervisor:
 
         self._transition(SupervisorState.START_CAPTURE, "starting_capture")
         self._process_manager_engaged = True
+        failure_reason = "initial_startup_failed"
         try:
             capture = self._dependencies.processes.start_capture(
                 port,
@@ -421,8 +422,17 @@ class RadarSupervisor:
                 self._config,
             )
             self._register_started_child(viewer, expected_role="viewer")
+
+            failure_reason = "running_manifest_write_failed"
+            self._transition(SupervisorState.RUNNING, "verified_frames")
+            while True:
+                failure_reason = "running_stop_check_failed"
+                if stop_requested():
+                    break
+                failure_reason = "running_sleep_failed"
+                self._dependencies.sleep(self._config.poll_interval_s)
         except Exception as exc:
-            reason = "initial_startup_failed"
+            reason = failure_reason
             capture_exit_code = None
             if isinstance(exc, _InitialVerificationError):
                 reason = exc.reason
@@ -434,10 +444,6 @@ class RadarSupervisor:
             self._transition(SupervisorState.STOPPED, reason)
             raise
 
-        self._transition(SupervisorState.RUNNING, "verified_frames")
-
-        while not stop_requested():
-            self._dependencies.sleep(self._config.poll_interval_s)
         self._shutdown()
 
     def _wait_for_port(

@@ -787,6 +787,88 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                     [event["pid"] for event in payload["process_events"]],
                 )
 
+    def test_running_transition_and_sleep_errors_stop_and_finalize_e001(self) -> None:
+        cases = (
+            ("manifest", "running_manifest_write_failed", OSError),
+            ("sleep", "running_sleep_failed", RuntimeError),
+        )
+        for case, expected_reason, error_type in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                fixture = SupervisorFixture(directory)
+                original_write = write_manifest_atomic
+                original_error = error_type(f"{case} injected failure")
+                running_write_failed = False
+
+                def fail_running_write_once(
+                    path: Path,
+                    payload: dict[str, object],
+                ) -> None:
+                    nonlocal running_write_failed
+                    if (
+                        payload["state"] == "RUNNING"
+                        and not running_write_failed
+                    ):
+                        running_write_failed = True
+                        raise original_error
+                    original_write(path, payload)
+
+                def fail_running_sleep(delay_s: float) -> None:
+                    if fixture.processes.started_viewer is not None:
+                        raise original_error
+                    fixture.sleep(delay_s)
+
+                dependencies = fixture.dependencies
+                writer = (
+                    fail_running_write_once
+                    if case == "manifest"
+                    else original_write
+                )
+                if case == "sleep":
+                    dependencies = replace(
+                        dependencies,
+                        sleep=fail_running_sleep,
+                    )
+
+                with mock.patch(
+                    "sensors.radar_supervisor.write_manifest_atomic",
+                    writer,
+                ):
+                    with self.assertRaises(error_type) as raised:
+                        RadarSupervisor(fixture.config, dependencies).run(
+                            lambda: False
+                        )
+
+                self.assertIs(raised.exception, original_error)
+                self.assertEqual(fixture.processes.stop_calls, 1)
+                payload = json.loads(
+                    fixture.manifest.read_text(encoding="utf-8")
+                )
+                self.assertEqual(payload["state"], "STOPPED")
+                self.assertEqual(payload["last_reason"], expected_reason)
+                self.assertEqual(
+                    payload["epochs"][0]["end_reason"],
+                    expected_reason,
+                )
+                self.assertEqual(
+                    payload["epochs"][0]["capture_exit_code"],
+                    0,
+                )
+                self.assertIsNotNone(payload["epochs"][0]["ended_at"])
+                self.assertEqual(
+                    [
+                        (event["role"], event["action"], event["exit_code"])
+                        for event in payload["process_events"]
+                    ],
+                    [
+                        ("capture", "started", None),
+                        ("viewer", "started", None),
+                        ("capture", "stopped", 0),
+                        ("viewer", "stopped", 0),
+                    ],
+                )
+                if case == "manifest":
+                    self.assertTrue(running_write_failed)
+
     def test_stop_requested_during_port_wait_and_verification_stops_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = SupervisorFixture(directory)
