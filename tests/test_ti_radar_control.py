@@ -69,6 +69,30 @@ class TiRadarControlTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "RI99"):
             select_application_port([self.application], xds_serial="RI99")
 
+    def test_select_application_port_does_not_treat_missing_serial_as_none_text(self):
+        missing_serial = SimpleNamespace(
+            **{**self.application.__dict__, "serial_number": None}
+        )
+        with self.assertRaisesRegex(RuntimeError, "Application/User"):
+            select_application_port([missing_serial], xds_serial="None")
+
+    def test_select_application_port_rejects_misdescribed_auxiliary_location(self):
+        misleading_auxiliary = SimpleNamespace(
+            **{
+                **self.auxiliary.__dict__,
+                "description": "XDS110 Class Application/User UART(COM4)",
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "Application/User"):
+            select_application_port([misleading_auxiliary], xds_serial="RI32")
+
+    def test_select_application_port_accepts_application_location_zero(self):
+        selected = select_application_port(
+            [self.application],
+            xds_serial="RI32",
+        )
+        self.assertEqual(selected.location, "1-3:x.0")
+
     def test_find_xds110_reset_prefers_existing_explicit_path(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

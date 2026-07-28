@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -20,6 +21,8 @@ from sensors.cli import (
 )
 from common.sensor_json import canonical_json_bytes
 from sensors.mission_log import MissionLogWriter
+from sensors.radar_owner_lock import RADAR_UART_LOCK_ROOT
+from sensors.radar_parent_lease import create_parent_death_lease
 from sensors.radar_capture import RadarCaptureStats
 from tests.test_radar_capture import (
     one_point_heatmap_packet,
@@ -372,6 +375,101 @@ class SensorCliTests(unittest.TestCase):
             capture.call_args.kwargs["heatmap_range_step_m"],
             0.05,
         )
+
+    def test_managed_radar_live_holds_uart_lease_and_watches_parent(self):
+        stats = RadarCaptureStats(
+            frames_decoded=0,
+            point_cloud_frames=0,
+            float_point_frames=0,
+            compressed_point_frames=0,
+            empty_point_frames=0,
+            nonzero_padding_frames=0,
+            missing_point_tlv_frames=0,
+            complete_frames=0,
+            incomplete_frames=0,
+            points_decoded=0,
+            radar_frame_gaps=0,
+            device_discontinuities=0,
+            writer_drops=0,
+            parser_errors=0,
+            parser_discarded_bytes=0,
+            startup_sync_parse_errors=0,
+            startup_sync_discarded_bytes=0,
+            post_sync_parse_errors=0,
+            post_sync_discarded_bytes=0,
+            buffered_tail_bytes=0,
+            raw_bytes=0,
+            max_timing_quality_metric_ns=0,
+            mission_log="mission.jsonl",
+            raw_capture="radar.bin",
+            raw_index="timing.jsonl",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            lease = create_parent_death_lease(
+                Path(directory) / "leases",
+                "capture",
+            )
+            args = argparse.Namespace(
+                port="COM5",
+                baud=115200,
+                output="mission.jsonl",
+                mission_id="mission-1",
+                profile_id="sdk5502-profile",
+                calibration_id="uncalibrated",
+                unit_id="head",
+                boot_id=None,
+                raw_output="radar.bin",
+                raw_index="timing.jsonl",
+                duration=1.0,
+                read_bytes=1024,
+                serial_timeout=0.01,
+                health_interval=0.5,
+                overwrite=False,
+                header_size="40",
+                allow_elided_empty_point_tlv=True,
+                allow_nonzero_padding=True,
+                heatmap_azimuth_bins=4,
+                heatmap_range_bins=2,
+                heatmap_range_step_m=0.05,
+                supervisor_parent_lease=lease.path,
+                xds_owner_serial="RI32",
+                xds_owner_run_id="managed-run",
+            )
+            uart_lock = mock.Mock()
+            observed_stop_requests = []
+
+            def capture_managed(**kwargs):
+                observed_stop_requests.append(
+                    kwargs["stop_requested"]()
+                )
+                return stats
+
+            try:
+                with mock.patch(
+                    "sensors.cli.capture_radar_uart",
+                    side_effect=capture_managed,
+                ) as capture, mock.patch(
+                    "sensors.cli.acquire_radar_owner_lock",
+                    return_value=uart_lock,
+                    create=True,
+                ) as acquire, contextlib.redirect_stdout(io.StringIO()):
+                    result = command_radar_live(args)
+            finally:
+                lease.release()
+                deadline = time.monotonic() + 5.0
+                while lease.path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+
+        self.assertEqual(result, 2)
+        acquire.assert_called_once_with(
+            RADAR_UART_LOCK_ROOT,
+            "RI32",
+            "managed-run",
+        )
+        stop_requested = capture.call_args.kwargs["stop_requested"]
+        self.assertTrue(callable(stop_requested))
+        self.assertEqual(observed_stop_requests, [False])
+        uart_lock.release.assert_called_once_with()
 
     def test_radar_live_converts_sigterm_inside_capture_and_writes_final_footer(self):
         class InterruptingSerial:

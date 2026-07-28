@@ -9,12 +9,17 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
+import time
 from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest import mock
 
 from sensors.radar_watchdog import RadarWatchdogSnapshot
+from sensors.radar_owner_lock import acquire_radar_owner_lock
 from sensors.radar_supervisor import (
     EpochPaths,
     RadarProcessManager,
@@ -347,10 +352,8 @@ class FakeProcesses:
         self.capture_port: object | None = None
         self.viewer_watchdog_poll_count: int | None = None
         self.watchdog: FakeWatchdog | None = None
-        self.stop_results: tuple[FakeStopResult, ...] = (
-            FakeStopResult("capture", 41001, 0, "graceful"),
-            FakeStopResult("viewer", 41002, 0, "graceful"),
-        )
+        self.stop_results: tuple[FakeStopResult, ...] | None = None
+        self.stopped_children: set[int] = set()
         self.stop_calls = 0
         self.switch_error: Exception | None = None
 
@@ -382,11 +385,27 @@ class FakeProcesses:
         return self.viewer
 
     def stop_child(self, child: FakeChild) -> FakeStopResult:
+        self.stopped_children.add(id(child))
         return FakeStopResult(child.role, child.pid, 0, "graceful")
 
     def stop_owned_children(self) -> tuple[FakeStopResult, ...]:
         self.stop_calls += 1
-        return self.stop_results
+        if self.stop_results is not None:
+            return self.stop_results
+        results = []
+        for child in (self.started_capture, self.started_viewer):
+            if child is None or id(child) in self.stopped_children:
+                continue
+            self.stopped_children.add(id(child))
+            results.append(
+                FakeStopResult(
+                    child.role,
+                    child.pid,
+                    child.exit_code or 0,
+                    "graceful",
+                )
+            )
+        return tuple(results)
 
 
 class SupervisorFixture:
@@ -531,6 +550,8 @@ class RecoveryProcesses:
         self.capture_ports: list[str] = []
         self.stop_override: FakeStopResult | None = None
         self.artifact_bytes: dict[Path, bytes] = {}
+        self.viewer_failures_remaining = 0
+        self.reuse_viewer_pid = False
 
     def start_capture(
         self,
@@ -563,7 +584,18 @@ class RecoveryProcesses:
             f"viewer:{paths.mission.stem[-4:]}:"
             f"{'none' if current is None else current.pid}"
         )
-        child = FakeChild("viewer", 52_000 + len(self.children) + 1)
+        if self.viewer_failures_remaining:
+            self.viewer_failures_remaining -= 1
+            raise OSError("transient viewer launch failure")
+        prior_viewers = [
+            child for child in self.children if child.role == "viewer"
+        ]
+        pid = (
+            prior_viewers[0].pid
+            if self.reuse_viewer_pid and prior_viewers
+            else 52_000 + len(self.children) + 1
+        )
+        child = FakeChild("viewer", pid)
         self.children.append(child)
         return child
 
@@ -571,15 +603,15 @@ class RecoveryProcesses:
         self.actions.append(f"stop:{child.role}:{child.pid}")
         if self.stop_override is not None:
             return self.stop_override
-        self.stopped.add(child.pid)
+        self.stopped.add(id(child))
         return FakeStopResult(child.role, child.pid, child.exit_code or 0, "graceful")
 
     def stop_owned_children(self) -> tuple[FakeStopResult, ...]:
         results = []
         for child in self.children:
-            if child.pid in self.stopped:
+            if id(child) in self.stopped:
                 continue
-            self.stopped.add(child.pid)
+            self.stopped.add(id(child))
             results.append(
                 FakeStopResult(
                     child.role,
@@ -802,6 +834,163 @@ class RadarSupervisorStartupTests(unittest.TestCase):
             with self.assertRaises(FrozenInstanceError):
                 dependencies.sleep = lambda delay: None  # type: ignore[misc]
 
+    def test_existing_run_manifest_is_never_replaced_or_started(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SupervisorFixture(directory)
+            fixture.manifest.parent.mkdir(parents=True)
+            original = b'{"historical":"unchanged"}\n'
+            fixture.manifest.write_bytes(original)
+
+            def unexpected_port_access() -> list[object]:
+                raise AssertionError("run-ID collision reached port inventory")
+
+            dependencies = replace(
+                fixture.dependencies,
+                port_provider=unexpected_port_access,
+            )
+            with self.assertRaisesRegex(FileExistsError, "manifest"):
+                RadarSupervisor(fixture.config, dependencies).run(lambda: False)
+
+            self.assertEqual(fixture.manifest.read_bytes(), original)
+            self.assertEqual(fixture.actions, [])
+
+    def test_radar_owner_lock_blocks_contender_and_recovers_stale_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = acquire_radar_owner_lock(root, "RI32", "owner-run")
+            contender_code = (
+                "from pathlib import Path;"
+                "from sensors.radar_owner_lock import acquire_radar_owner_lock;"
+                f"acquire_radar_owner_lock(Path({str(root)!r}),"
+                "'RI32','contender-run')"
+            )
+            try:
+                contender = subprocess.run(
+                    [sys.executable, "-c", contender_code],
+                    cwd=Path(__file__).resolve().parents[1],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertNotEqual(contender.returncode, 0)
+                self.assertIn(f"PID {os.getpid()}", contender.stderr)
+                self.assertIn("owner-run", contender.stderr)
+            finally:
+                lock.release()
+
+            crash_code = (
+                "import os;"
+                "from pathlib import Path;"
+                "from sensors.radar_owner_lock import acquire_radar_owner_lock;"
+                f"acquire_radar_owner_lock(Path({str(root)!r}),"
+                "'RI32','crashed-run');"
+                "os._exit(0)"
+            )
+            crashed = subprocess.run(
+                [sys.executable, "-c", crash_code],
+                cwd=Path(__file__).resolve().parents[1],
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(crashed.returncode, 0)
+            recovered = acquire_radar_owner_lock(root, "RI32", "recovered-run")
+            recovered.release()
+
+    def test_radar_owner_conflict_waits_for_current_owner_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stale = acquire_radar_owner_lock(root, "RI32", "stale-run")
+            stale.release()
+            owner_locked = root / "owner-locked"
+            allow_metadata = root / "allow-metadata"
+            release_owner = root / "release-owner"
+            owner_code = textwrap.dedent(
+                f"""
+                import os
+                from pathlib import Path
+                import time
+                import sensors.radar_owner_lock as owner_lock
+
+                root = Path({str(root)!r})
+                owner_locked = Path({str(owner_locked)!r})
+                allow_metadata = Path({str(allow_metadata)!r})
+                release_owner = Path({str(release_owner)!r})
+                original_write_owner = owner_lock._write_owner
+
+                def delayed_write_owner(path, payload):
+                    owner_locked.write_text(str(os.getpid()), encoding="utf-8")
+                    while not allow_metadata.exists():
+                        time.sleep(0.01)
+                    original_write_owner(path, payload)
+
+                owner_lock._write_owner = delayed_write_owner
+                held = owner_lock.acquire_radar_owner_lock(
+                    root, "RI32", "current-run"
+                )
+                while not release_owner.exists():
+                    time.sleep(0.01)
+                held.release()
+                """
+            )
+            contender_code = textwrap.dedent(
+                f"""
+                from pathlib import Path
+                from sensors.radar_owner_lock import acquire_radar_owner_lock
+                acquire_radar_owner_lock(
+                    Path({str(root)!r}), "RI32", "contender-run"
+                )
+                """
+            )
+            repository = Path(__file__).resolve().parents[1]
+            owner = subprocess.Popen(
+                [sys.executable, "-c", owner_code],
+                cwd=repository,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            contender: subprocess.Popen[str] | None = None
+            try:
+                deadline = time.monotonic() + 10.0
+                while (
+                    not owner_locked.exists()
+                    and owner.poll() is None
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertTrue(owner_locked.exists())
+                owner_pid = int(owner_locked.read_text(encoding="utf-8"))
+
+                contender = subprocess.Popen(
+                    [sys.executable, "-c", contender_code],
+                    cwd=repository,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                time.sleep(0.2)
+                self.assertIsNone(
+                    contender.poll(),
+                    "contender read missing or stale metadata before owner publish",
+                )
+
+                allow_metadata.write_text("continue", encoding="utf-8")
+                _, contender_stderr = contender.communicate(timeout=10)
+                self.assertNotEqual(contender.returncode, 0)
+                self.assertIn(f"PID {owner_pid}", contender_stderr)
+                self.assertIn("current-run", contender_stderr)
+                self.assertNotIn("stale-run", contender_stderr)
+            finally:
+                allow_metadata.touch(exist_ok=True)
+                release_owner.touch(exist_ok=True)
+                if contender is not None and contender.poll() is None:
+                    contender.kill()
+                    contender.wait(timeout=5)
+                if owner.poll() is None:
+                    owner.kill()
+                owner.communicate(timeout=5)
+
     def test_healthy_startup_has_exact_order_and_stops_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = SupervisorFixture(directory)
@@ -822,6 +1011,8 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                     "capture:e001",
                     "verified:5",
                     "viewer:e001",
+                    "wait_port:COM3",
+                    "verified:5",
                     "running:e001",
                 ],
             )
@@ -861,6 +1052,38 @@ class RadarSupervisorStartupTests(unittest.TestCase):
             payload = json.loads(fixture.manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["port"], "COM9")
             self.assertEqual(payload["xds_serial"], "RI32")
+
+    def test_omitted_serial_latches_first_board_and_rejects_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SupervisorFixture(
+                directory,
+                ports=[
+                    [application_port("COM3", "RI32")],
+                    [application_port("COM7", "OTHER")],
+                ],
+            )
+            fixture.config = replace(fixture.config, xds_serial=None)
+            stopped = False
+
+            def stop_after_replacement_is_rejected(delay_s: float) -> None:
+                nonlocal stopped
+                fixture.sleep(delay_s)
+                stopped = True
+
+            dependencies = replace(
+                fixture.dependencies,
+                sleep=stop_after_replacement_is_rejected,
+            )
+            RadarSupervisor(fixture.config, dependencies).run(
+                lambda: stopped or fixture.stop_when_running()
+            )
+
+            self.assertEqual(fixture.actions.count("reset:RI32"), 1)
+            self.assertNotIn("reset:OTHER", fixture.actions)
+            self.assertNotIn("configure:COM7", fixture.actions)
+            payload = json.loads(fixture.manifest.read_text(encoding="utf-8"))
+            self.assertEqual(payload["xds_serial"], "RI32")
+            self.assertEqual(payload["state"], "STOPPED")
 
     def test_reset_unavailable_is_allowed_once_during_initial_startup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -990,49 +1213,41 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                         "radar_verification_timeout",
                     )
 
-    def test_post_capture_dependency_errors_stop_and_finalize_e001(self) -> None:
-        cases = ("watchdog_factory", "switch_viewer")
-        for case in cases:
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                fixture = SupervisorFixture(directory)
-                if case == "watchdog_factory":
-                    def fail_watchdog_factory(
-                        paths: EpochPaths,
-                        config: RadarSupervisorConfig,
-                        started_at_s: float,
-                    ) -> SupervisorWatchdog:
-                        del paths, config, started_at_s
-                        raise LookupError("watchdog factory failed")
+    def test_watchdog_factory_error_stops_and_finalizes_e001(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SupervisorFixture(directory)
 
-                    dependencies = replace(
-                        fixture.dependencies,
-                        watchdog_factory=fail_watchdog_factory,
-                    )
-                else:
-                    fixture.processes.switch_error = LookupError(
-                        "viewer switch failed"
-                    )
-                    dependencies = fixture.dependencies
+            def fail_watchdog_factory(
+                paths: EpochPaths,
+                config: RadarSupervisorConfig,
+                started_at_s: float,
+            ) -> SupervisorWatchdog:
+                del paths, config, started_at_s
+                raise LookupError("watchdog factory failed")
 
-                with self.assertRaises(LookupError):
-                    RadarSupervisor(fixture.config, dependencies).run(
-                        lambda: False
-                    )
+            dependencies = replace(
+                fixture.dependencies,
+                watchdog_factory=fail_watchdog_factory,
+            )
+            with self.assertRaises(LookupError):
+                RadarSupervisor(fixture.config, dependencies).run(
+                    lambda: False
+                )
 
-                self.assertEqual(fixture.processes.stop_calls, 1)
-                payload = json.loads(
-                    fixture.manifest.read_text(encoding="utf-8")
-                )
-                self.assertEqual(payload["state"], "STOPPED")
-                self.assertEqual(
-                    payload["epochs"][0]["end_reason"],
-                    "initial_startup_failed",
-                )
-                self.assertIsNotNone(payload["epochs"][0]["ended_at"])
-                self.assertNotIn(
-                    41002,
-                    [event["pid"] for event in payload["process_events"]],
-                )
+            self.assertEqual(fixture.processes.stop_calls, 1)
+            payload = json.loads(
+                fixture.manifest.read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["state"], "STOPPED")
+            self.assertEqual(
+                payload["epochs"][0]["end_reason"],
+                "initial_startup_failed",
+            )
+            self.assertIsNotNone(payload["epochs"][0]["ended_at"])
+            self.assertNotIn(
+                41002,
+                [event["pid"] for event in payload["process_events"]],
+            )
 
     def test_running_transition_and_sleep_errors_stop_and_finalize_e001(self) -> None:
         cases = (
@@ -1168,12 +1383,11 @@ class RadarSupervisorStartupTests(unittest.TestCase):
             self.assertEqual(payload["state"], "STOPPED")
             self.assertEqual(payload["epochs"][0]["end_reason"], "shutdown")
 
-    def test_manifest_transitions_exact_rows_and_unknown_stop_pid_is_rejected(self) -> None:
+    def test_manifest_transitions_record_exact_owned_stop_rows(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = SupervisorFixture(directory)
             fixture.processes.stop_results = (
                 FakeStopResult("capture", 41001, 23, "terminate"),
-                FakeStopResult("unowned", 99999, 91, "kill"),
                 FakeStopResult("viewer", 41002, 0, "graceful"),
             )
             states: list[str] = []
@@ -1294,6 +1508,463 @@ class RadarSupervisorStartupTests(unittest.TestCase):
 
 
 class RadarSupervisorRecoveryTests(unittest.TestCase):
+    def test_recovery_viewer_switch_retries_without_rotating_verified_e002(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[
+                    [
+                        snapshot(),
+                        snapshot(),
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="radar_frame_timeout",
+                        ),
+                    ],
+                    [snapshot()],
+                ],
+            )
+            armed = False
+
+            def stop_after_recovery_viewer_retry() -> bool:
+                nonlocal armed
+                if fixture.manifest.exists():
+                    payload = fixture.payload()
+                    if (
+                        payload["state"] == "RUNNING"
+                        and payload["epoch"] == 1
+                        and not armed
+                    ):
+                        fixture.processes.viewer_failures_remaining = 1
+                        armed = True
+                        return False
+                    return (
+                        payload["state"] == "RUNNING"
+                        and payload["epoch"] == 2
+                    )
+                return False
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_recovery_viewer_retry
+            )
+
+            self.assertEqual(
+                [
+                    action
+                    for action in fixture.actions
+                    if action.startswith("viewer:e002")
+                ],
+                ["viewer:e002:none", "viewer:e002:none"],
+            )
+            self.assertEqual(fixture.payload()["epoch"], 2)
+            self.assertEqual(fixture.payload()["recovery_count"], 1)
+            self.assertEqual(len(fixture.processes.capture_ports), 2)
+
+    def test_latched_board_is_not_replaced_after_usb_disappearance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                ports=[
+                    [application_port("COM3", "RI32")],
+                    [application_port("COM3", "RI32")],
+                    [application_port("COM3", "RI32")],
+                    [],
+                    [application_port("COM7", "OTHER")],
+                ],
+                watchdogs=[[snapshot(), snapshot()]],
+            )
+            fixture.config = replace(fixture.config, xds_serial=None)
+
+            def stop_after_other_board_is_rejected() -> bool:
+                return bool(
+                    fixture.actions
+                    and fixture.actions[-1] == "ports:COM7"
+                )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_other_board_is_rejected
+            )
+
+            payload = fixture.payload()
+            self.assertEqual(fixture.processes.capture_ports, ["COM3"])
+            self.assertNotIn("reset:COM7", fixture.actions)
+            self.assertNotIn("configure:COM7", fixture.actions)
+            self.assertEqual(payload["xds_serial"], "RI32")
+            self.assertEqual(payload["epoch"], 1)
+            self.assertEqual(payload["recovery_count"], 1)
+            self.assertEqual(payload["state"], "STOPPED")
+
+    def test_initial_viewer_launch_retries_without_restarting_radar_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(directory)
+            fixture.processes.viewer_failures_remaining = 1
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                lambda: (
+                    fixture.manifest.exists()
+                    and fixture.payload()["state"] == "RUNNING"
+                )
+            )
+
+            self.assertEqual(
+                len(
+                    [
+                        child
+                        for child in fixture.processes.children
+                        if child.role == "capture"
+                    ]
+                ),
+                1,
+            )
+            self.assertEqual(
+                [
+                    action
+                    for action in fixture.actions
+                    if action.startswith("viewer:e001")
+                ],
+                ["viewer:e001:none", "viewer:e001:none"],
+            )
+            self.assertIn(0.5, fixture.sleeps)
+            self.assertEqual(fixture.payload()["epoch"], 1)
+
+    def test_initial_viewer_retry_revalidates_capture_before_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(directory)
+            fixture.processes.viewer_failures_remaining = 1
+            retry_sleeps = 0
+
+            def capture_exits_during_viewer_backoff(delay_s: float) -> None:
+                nonlocal retry_sleeps
+                fixture.sleep(delay_s)
+                if delay_s >= fixture.config.retry_initial_s:
+                    retry_sleeps += 1
+                    if retry_sleeps == 1:
+                        capture = next(
+                            child
+                            for child in fixture.processes.children
+                            if child.role == "capture"
+                        )
+                        capture.exit_code = 23
+
+            dependencies = replace(
+                fixture.dependencies,
+                sleep=capture_exits_during_viewer_backoff,
+            )
+
+            def stop_after_fault_or_stale_running() -> bool:
+                if not fixture.manifest.exists():
+                    return False
+                payload = fixture.payload()
+                return (
+                    payload["state"] == "RUNNING"
+                    or retry_sleeps >= 2
+                )
+
+            RadarSupervisor(fixture.config, dependencies).run(
+                stop_after_fault_or_stale_running
+            )
+
+            viewer_attempts = [
+                action
+                for action in fixture.actions
+                if action.startswith("viewer:e001")
+            ]
+            self.assertEqual(viewer_attempts, ["viewer:e001:none"])
+            payload = fixture.payload()
+            self.assertEqual(
+                payload["epochs"][0]["capture_exit_code"],
+                23,
+            )
+            self.assertEqual(
+                payload["epochs"][0]["end_reason"],
+                "capture_exited",
+            )
+            self.assertFalse(
+                any(
+                    event["role"] == "viewer"
+                    and event["action"] == "started"
+                    for event in payload["process_events"]
+                )
+            )
+
+    def test_viewer_retry_revalidates_port_after_successful_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(directory)
+            fixture.processes.viewer_failures_remaining = 1
+            original_switch_viewer = fixture.processes.switch_viewer
+
+            def port_disappears_during_successful_retry(
+                current: FakeChild | None,
+                paths: EpochPaths,
+                config: RadarSupervisorConfig,
+            ) -> FakeChild:
+                viewer = original_switch_viewer(current, paths, config)
+                fixture.port_inventories = [[]]
+                return viewer
+
+            fixture.processes.switch_viewer = port_disappears_during_successful_retry  # type: ignore[method-assign]
+
+            def stop_after_fault_or_stale_running() -> bool:
+                if not fixture.manifest.exists():
+                    return False
+                payload = fixture.payload()
+                return payload["state"] == "RUNNING" or (
+                    payload["state"] == "RECOVERING"
+                    and payload["last_reason"] == "application_port_lost"
+                )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_fault_or_stale_running
+            )
+
+            payload = fixture.payload()
+            self.assertEqual(
+                payload["epochs"][0]["end_reason"],
+                "application_port_lost",
+            )
+            viewer_events = [
+                event["action"]
+                for event in payload["process_events"]
+                if event["role"] == "viewer"
+            ]
+            self.assertEqual(viewer_events, ["started", "stopped"])
+
+    def test_shutdown_during_viewer_retry_stops_verified_epoch_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(directory)
+            fixture.processes.viewer_failures_remaining = 100
+            stopped = False
+
+            def sleep_and_request_stop(delay_s: float) -> None:
+                nonlocal stopped
+                fixture.sleep(delay_s)
+                if delay_s >= fixture.config.retry_initial_s:
+                    stopped = True
+
+            dependencies = replace(
+                fixture.dependencies,
+                sleep=sleep_and_request_stop,
+            )
+            RadarSupervisor(fixture.config, dependencies).run(lambda: stopped)
+
+            payload = fixture.payload()
+            self.assertEqual(payload["state"], "STOPPED")
+            self.assertEqual(payload["epoch"], 1)
+            self.assertEqual(payload["recovery_count"], 0)
+            self.assertEqual(payload["epochs"][0]["end_reason"], "shutdown")
+            self.assertEqual(fixture.actions.count("reset:COM3"), 1)
+            self.assertEqual(fixture.actions.count("configure:COM3"), 1)
+
+    def test_same_epoch_viewer_restart_retries_and_allows_pid_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[[snapshot(), snapshot(), snapshot()]],
+            )
+            fixture.processes.reuse_viewer_pid = True
+            armed = False
+
+            def stop_after_reused_viewer_is_running() -> bool:
+                nonlocal armed
+                viewers = [
+                    child
+                    for child in fixture.processes.children
+                    if child.role == "viewer"
+                ]
+                if viewers and not armed:
+                    viewers[0].exit_code = 9
+                    fixture.processes.viewer_failures_remaining = 1
+                    armed = True
+                    return False
+                return len(viewers) == 2
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_reused_viewer_is_running
+            )
+
+            viewer_pid = next(
+                child.pid
+                for child in fixture.processes.children
+                if child.role == "viewer"
+            )
+            viewer_events = [
+                event["action"]
+                for event in fixture.payload()["process_events"]
+                if event["role"] == "viewer"
+                and event["pid"] == viewer_pid
+            ]
+            self.assertEqual(
+                viewer_events,
+                ["started", "stopped", "started", "stopped"],
+            )
+            self.assertEqual(fixture.payload()["epoch"], 1)
+            self.assertEqual(fixture.payload()["recovery_count"], 0)
+
+    def test_same_epoch_viewer_retry_propagates_watchdog_fault(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[
+                    [
+                        snapshot(),
+                        snapshot(),
+                        snapshot(),
+                        snapshot(
+                            verified=False,
+                            frames=0,
+                            fault="radar_frame_timeout",
+                        ),
+                    ]
+                ],
+            )
+            armed = False
+
+            def stop_after_fault_or_stale_replacement() -> bool:
+                nonlocal armed
+                viewers = [
+                    child
+                    for child in fixture.processes.children
+                    if child.role == "viewer"
+                ]
+                if viewers and not armed:
+                    viewers[0].exit_code = 9
+                    fixture.processes.viewer_failures_remaining = 1
+                    armed = True
+                    return False
+                if fixture.manifest.exists():
+                    payload = fixture.payload()
+                    if (
+                        payload["state"] == "RECOVERING"
+                        and payload["last_reason"] == "radar_frame_timeout"
+                    ):
+                        return True
+                return len(viewers) >= 2
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_fault_or_stale_replacement
+            )
+
+            viewer_attempts = [
+                action
+                for action in fixture.actions
+                if action.startswith("viewer:e001")
+            ]
+            self.assertEqual(
+                viewer_attempts,
+                [
+                    "viewer:e001:none",
+                    "viewer:e001:none",
+                ],
+            )
+            payload = fixture.payload()
+            self.assertEqual(payload["recovery_count"], 1)
+            self.assertEqual(
+                payload["epochs"][0]["end_reason"],
+                "radar_frame_timeout",
+            )
+            viewer_starts = [
+                event
+                for event in payload["process_events"]
+                if event["role"] == "viewer"
+                and event["action"] == "started"
+            ]
+            self.assertEqual(len(viewer_starts), 2)
+            self.assertEqual(payload["epoch"], 2)
+
+    def test_partial_bulk_cleanup_persists_success_before_failure_propagates(self) -> None:
+        class PartialCleanupError(RuntimeError):
+            def __init__(
+                self,
+                results: tuple[FakeStopResult, ...],
+                failed_pid: int,
+            ) -> None:
+                super().__init__("partial owned-child cleanup")
+                self.results = results
+                self.failures = (SimpleNamespace(pid=failed_pid),)
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(directory)
+            attempts = 0
+
+            def partial_cleanup() -> tuple[FakeStopResult, ...]:
+                nonlocal attempts
+                attempts += 1
+                capture = next(
+                    child
+                    for child in fixture.processes.children
+                    if child.role == "capture"
+                )
+                viewer = next(
+                    child
+                    for child in fixture.processes.children
+                    if child.role == "viewer"
+                )
+                results = (
+                    (FakeStopResult("capture", capture.pid, 23, "graceful"),)
+                    if attempts == 1
+                    else ()
+                )
+                raise PartialCleanupError(results, viewer.pid)
+
+            fixture.processes.stop_owned_children = partial_cleanup  # type: ignore[method-assign]
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "partial owned-child cleanup",
+            ):
+                RadarSupervisor(fixture.config, fixture.dependencies).run(
+                    lambda: (
+                        fixture.manifest.exists()
+                        and fixture.payload()["state"] == "RUNNING"
+                    )
+                )
+
+            payload = fixture.payload()
+            self.assertEqual(attempts, 2)
+            self.assertEqual(payload["state"], "STOPPED")
+            self.assertEqual(payload["epochs"][0]["capture_exit_code"], 23)
+            self.assertIsNotNone(payload["epochs"][0]["ended_at"])
+            self.assertIn(
+                ("capture", 23),
+                [
+                    (event["role"], event["exit_code"])
+                    for event in payload["process_events"]
+                    if event["action"] == "stopped"
+                ],
+            )
+
+    def test_bulk_cleanup_rejects_unknown_result_after_recording_valid_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(directory)
+
+            def mismatched_cleanup() -> tuple[FakeStopResult, ...]:
+                capture = next(
+                    child
+                    for child in fixture.processes.children
+                    if child.role == "capture"
+                )
+                return (
+                    FakeStopResult("capture", capture.pid, 31, "graceful"),
+                    FakeStopResult("viewer", 999_999, 0, "graceful"),
+                )
+
+            fixture.processes.stop_owned_children = mismatched_cleanup  # type: ignore[method-assign]
+            with self.assertRaisesRegex(RuntimeError, "cleanup result"):
+                RadarSupervisor(fixture.config, fixture.dependencies).run(
+                    lambda: (
+                        fixture.manifest.exists()
+                        and fixture.payload()["state"] == "RUNNING"
+                    )
+                )
+
+            payload = fixture.payload()
+            self.assertEqual(payload["state"], "STOPPED")
+            self.assertEqual(payload["epochs"][0]["capture_exit_code"], 31)
+            self.assertNotIn(
+                999_999,
+                [event["pid"] for event in payload["process_events"]],
+            )
+
     @staticmethod
     def _stop_after_running_epoch(
         fixture: RecoveryFixture,
@@ -1333,6 +2004,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 watchdogs=[
                     [
                         snapshot(),
+                        snapshot(),
                         snapshot(
                             verified=False,
                             frames=0,
@@ -1366,7 +2038,11 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 fixture = RecoveryFixture(
                     directory,
                     watchdogs=[
-                        [snapshot(), snapshot(verified=False, fault=reason)],
+                        [
+                            snapshot(),
+                            snapshot(),
+                            snapshot(verified=False, fault=reason),
+                        ],
                         [snapshot()],
                     ],
                 )
@@ -1417,6 +2093,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 ports = None
                 if case == "port_loss":
                     ports = [
+                        [application_port("COM3")],
                         [application_port("COM3")],
                         [application_port("COM3")],
                         [],
@@ -1513,6 +2190,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 watchdogs=[
                     [
                         snapshot(),
+                        snapshot(),
                         snapshot(verified=False, frames=0, fault="radar_frame_timeout"),
                     ],
                     [
@@ -1542,8 +2220,9 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 for index, action in enumerate(fixture.actions)
                 if action.startswith("stop:viewer:")
             )
-            self.assertEqual(len(verified), 2)
-            self.assertLess(verified[1], old_viewer_stop)
+            self.assertEqual(len(verified), 4)
+            self.assertLess(verified[-2], old_viewer_stop)
+            self.assertLess(old_viewer_stop, verified[-1])
             self.assertEqual(fixture.payload()["epochs"][0]["end_reason"], "radar_frame_timeout")
 
     def test_recovery_attempt_failures_do_not_start_new_fault_episodes(self) -> None:
@@ -1552,6 +2231,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 directory,
                 watchdogs=[
                     [
+                        snapshot(),
                         snapshot(),
                         snapshot(
                             verified=False,
@@ -1589,7 +2269,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 index
                 for index, action in enumerate(fixture.actions)
                 if action == "verified:5"
-            ][1]
+            ][-2]
             self.assertLess(third_epoch_verified, first_viewer_stop)
             self.assertEqual(
                 [
@@ -1690,6 +2370,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                     [application_port("COM3")],
                     [application_port("COM3")],
                     [application_port("COM3")],
+                    [application_port("COM3")],
                     ambiguous,
                     [],
                     [application_port("COM9")],
@@ -1697,6 +2378,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 resets=[True, False],
                 watchdogs=[
                     [
+                        snapshot(),
                         snapshot(),
                         snapshot(
                             verified=False,
@@ -1753,6 +2435,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 ports=[
                     [application_port("COM3")],
                     [application_port("COM3")],
+                    [application_port("COM3")],
                     [],
                     [application_port("COM9")],
                 ],
@@ -1795,6 +2478,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 "watchdogs": [
                     [
                         snapshot(),
+                        snapshot(),
                         snapshot(
                             verified=False,
                             frames=0,
@@ -1809,6 +2493,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 "configurations": [valid_profile],
                 "watchdogs": [
                     [
+                        snapshot(),
                         snapshot(),
                         snapshot(
                             verified=False,
@@ -1833,6 +2518,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 fixture = RecoveryFixture(
                     directory,
                     ports=[
+                        [application_port("COM3")],
                         [application_port("COM3")],
                         [application_port("COM3")],
                         [application_port("COM3")],
@@ -1884,6 +2570,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 directory,
                 watchdogs=[
                     [
+                        snapshot(),
                         snapshot(),
                         snapshot(
                             verified=False,
@@ -1976,6 +2663,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 watchdogs=[
                     [
                         snapshot(),
+                        snapshot(),
                         snapshot(
                             verified=False,
                             frames=0,
@@ -2006,6 +2694,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 directory,
                 watchdogs=[
                     [
+                        snapshot(),
                         snapshot(),
                         snapshot(
                             verified=False,

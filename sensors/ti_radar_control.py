@@ -31,6 +31,10 @@ class RadarPortIdentity:
     location: str
 
 
+def _port_metadata_text(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
 def select_application_port(
     ports: Iterable[object],
     explicit_port: str | None = None,
@@ -39,18 +43,23 @@ def select_application_port(
     """Select exactly one XDS110 Application/User UART from a port inventory."""
     candidates = []
     for port in ports:
-        device = str(getattr(port, "device", ""))
+        device = _port_metadata_text(getattr(port, "device", ""))
         if explicit_port is not None and device != explicit_port:
             continue
         vid = getattr(port, "vid", None)
         pid = getattr(port, "pid", None)
-        description = str(getattr(port, "description", ""))
-        serial_number = str(getattr(port, "serial_number", ""))
+        description = _port_metadata_text(getattr(port, "description", ""))
+        serial_number = _port_metadata_text(getattr(port, "serial_number", ""))
+        location = _port_metadata_text(getattr(port, "location", ""))
         if (vid, pid) != (0x0451, 0xBEF3):
             continue
         if "Application/User UART" not in description:
             continue
         if "Auxiliary" in description:
+            continue
+        if location.casefold().endswith(".3"):
+            continue
+        if not serial_number:
             continue
         if xds_serial is not None and serial_number != xds_serial:
             continue
@@ -61,7 +70,7 @@ def select_application_port(
                 pid=pid,
                 serial_number=serial_number,
                 description=description,
-                location=str(getattr(port, "location", "")),
+                location=location,
             )
         )
 

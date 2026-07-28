@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const vm = require("node:vm");
 
 const PANEL_PATH = require.resolve("../../monitor/web/radar_panel.js");
+const FRONT_PATH = require.resolve("../../monitor/web/radar_front.html");
 const BLOCKED_CASES = [
   [
     "waiting",
@@ -84,6 +85,8 @@ function makeContext() {
     clearRectCalls: [],
     fillRectCalls: [],
     fillTextCalls: [],
+    fillTextStyles: [],
+    strokeRectStyles: [],
     setTransform() {},
     clearRect(...args) {
       this.clearRectCalls.push(args);
@@ -91,9 +94,12 @@ function makeContext() {
     fillRect(...args) {
       this.fillRectCalls.push(args);
     },
-    strokeRect() {},
+    strokeRect() {
+      this.strokeRectStyles.push(this.strokeStyle);
+    },
     fillText(text, ...args) {
       this.fillTextCalls.push([text, ...args]);
+      this.fillTextStyles.push(this.fillStyle);
     },
   };
 }
@@ -130,6 +136,7 @@ function makeHarness() {
     "fullscreen-button",
     "raw-toggle",
     "radar-status",
+    "warning-strip",
     "warning-text",
     "radar-mode",
     "collision-inset",
@@ -244,9 +251,13 @@ function makeHarness() {
   mainContext.clearRectCalls.length = 0;
   mainContext.fillRectCalls.length = 0;
   mainContext.fillTextCalls.length = 0;
+  mainContext.fillTextStyles.length = 0;
+  mainContext.strokeRectStyles.length = 0;
   collisionContext.clearRectCalls.length = 0;
   collisionContext.fillRectCalls.length = 0;
   collisionContext.fillTextCalls.length = 0;
+  collisionContext.fillTextStyles.length = 0;
+  collisionContext.strokeRectStyles.length = 0;
   return {
     panel,
     elements,
@@ -305,6 +316,16 @@ test("every blocked reason clears stale maps and renders only its stop overlay",
           [heading, explanation],
           `${reason}: reason-specific overlay copy`,
         );
+        assert.deepEqual(
+          context.strokeRectStyles,
+          ["rgba(255, 81, 81, 0.92)"],
+          `${reason}: red stop border`,
+        );
+        assert.equal(
+          context.fillTextStyles[0],
+          "#ff5151",
+          `${reason}: red stop heading`,
+        );
       }
     });
   }
@@ -346,6 +367,43 @@ test("every blocked reason replaces stale live metrics and sectors with sensor f
         "SENSOR_FAULT",
         `${reason}: diagnostic hazard`,
       );
+      assert.equal(
+        elements.get("#radar-status").textContent === "LIVE",
+        false,
+        `${reason}: blocked badge`,
+      );
+      assert.equal(
+        elements.get("#metric-fps").querySelector("strong").textContent,
+        "--",
+        `${reason}: fps`,
+      );
+      assert.equal(
+        elements.get("#metric-age").querySelector("strong").textContent,
+        "--",
+        `${reason}: age`,
+      );
+      assert.equal(
+        elements.get("#collision-distance").textContent,
+        "-- cm",
+        `${reason}: collision distance`,
+      );
+      for (const selector of [
+        "#profile-value",
+        "#calibration-value",
+        "#pose-mode-value",
+        "#frame-value",
+        "#gap-value",
+        "#raw-point-value",
+        "#confirmed-track-value",
+        "#clutter-rejected-value",
+        "#heatmap-rejected-value",
+      ]) {
+        assert.equal(
+          elements.get(selector).textContent,
+          "--",
+          `${reason}: clears ${selector}`,
+        );
+      }
       for (let index = 0; index < 5; index += 1) {
         const sector = elements.get(`#sector-${index}`);
         assert.equal(sector.dataset.level, "invalid", `${reason}: sector ${index}`);
@@ -357,6 +415,57 @@ test("every blocked reason replaces stale live metrics and sectors with sensor f
       }
     });
   }
+});
+
+test("every blocked reason replaces retained live warning with red stop copy", async (t) => {
+  for (const [reason, heading, explanation] of BLOCKED_CASES) {
+    await t.test(reason, () => {
+      const { panel, elements } = makeHarness();
+      panel.snapshot.warning = "STALE LIVE WARNING";
+
+      panel.updateText(staleBlockedPresentation(reason));
+
+      const warning = elements.get("#warning-text").textContent;
+      assert.equal(
+        warning,
+        `${heading} · ${explanation}`,
+        `${reason}: reason-derived stop warning`,
+      );
+      assert.doesNotMatch(
+        warning,
+        /STALE LIVE WARNING/,
+        `${reason}: stale live warning`,
+      );
+      assert.equal(
+        elements.get("#warning-strip").dataset.blocked,
+        "true",
+        `${reason}: red blocked warning state`,
+      );
+    });
+  }
+
+  const { panel, elements } = makeHarness();
+  panel.snapshot.warning = "STALE LIVE WARNING";
+  panel.updateText({
+    blocked: false,
+    hazard: { level: "NORMAL", threshold_m: 0.1 },
+    hazardCopy: "LIVE NORMAL COPY",
+    tracks: [],
+  });
+  assert.equal(elements.get("#warning-text").textContent, "LIVE NORMAL COPY");
+  assert.equal(elements.get("#warning-strip").dataset.blocked, "false");
+});
+
+test("served warning strip has explicit red blocked styling", () => {
+  const html = fs.readFileSync(FRONT_PATH, "utf8");
+  assert.match(
+    html,
+    /\.warning\[data-blocked="true"\]\s*\{[^}]*rgba\(255,\s*81,\s*81,[^)]+\)[^}]*\}/s,
+  );
+  assert.match(
+    html,
+    /\.warning\[data-blocked="true"\]::before\s*\{[^}]*var\(--red\)[^}]*\}/s,
+  );
 });
 
 test("live-input blocking badges follow the presentation reason, not stale snapshot status", () => {

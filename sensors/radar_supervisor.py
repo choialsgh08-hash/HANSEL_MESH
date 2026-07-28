@@ -13,6 +13,12 @@ import tempfile
 from typing import Callable, Iterable, Mapping, Protocol
 
 from common.sensor_contract import validate_sensor_id
+from sensors.radar_owner_lock import (
+    RADAR_OWNER_LOCK_ROOT,
+    RADAR_UART_LOCK_ROOT,
+    RadarOwnerLock,
+    acquire_radar_owner_lock,
+)
 from sensors.radar_watchdog import RadarWatchdogSnapshot
 from sensors.ti_radar_control import (
     RadarPortIdentity,
@@ -297,6 +303,46 @@ def write_manifest_atomic(path: Path, payload: Mapping[str, object]) -> None:
         raise
 
 
+def reserve_manifest(path: Path, payload: Mapping[str, object]) -> None:
+    """Create the first run manifest exclusively without replacing history."""
+
+    path = _require_path(path, "path")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"radar supervisor manifest already exists: {path}"
+        ) from exc
+    try:
+        with os.fdopen(
+            descriptor,
+            "w",
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _utc_timestamp(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("utc_now must return an aware datetime")
@@ -317,6 +363,18 @@ class _InitialVerificationError(RuntimeError):
         self.capture_exit_code = capture_exit_code
 
 
+class _ViewerRetryFault(RuntimeError):
+    def __init__(
+        self,
+        fault: tuple[str, int | None, bool],
+    ) -> None:
+        reason, capture_exit_code, port_absence_seen = fault
+        super().__init__(f"radar fault during viewer retry: {reason}")
+        self.reason = reason
+        self.capture_exit_code = capture_exit_code
+        self.port_absence_seen = port_absence_seen
+
+
 class RadarSupervisor:
     """Supervise verified radar capture epochs using only injected effects."""
 
@@ -331,12 +389,14 @@ class RadarSupervisor:
         self._epoch = 0
         self._recovery_count = 0
         self._port: RadarPortIdentity | None = None
+        self._latched_xds_serial: str | None = None
+        self._owner_lock: RadarOwnerLock | None = None
+        self._uart_lock: RadarOwnerLock | None = None
         self._paths: EpochPaths | None = None
         self._verified_paths: EpochPaths | None = None
         self._epochs: list[dict[str, object]] = []
         self._process_events: list[dict[str, object]] = []
         self._owned_children: dict[int, SupervisorChild] = {}
-        self._stopped_pids: set[int] = set()
         self._active_capture: SupervisorChild | None = None
         self._active_viewer: SupervisorChild | None = None
         self._active_watchdog: SupervisorWatchdog | None = None
@@ -347,42 +407,60 @@ class RadarSupervisor:
         self._fatal_reason = "initial_startup_failed"
 
     def run(self, stop_requested: Callable[[], bool]) -> None:
+        reserve_manifest(
+            manifest_path(self._config.output_root, self._config.run_id),
+            self._manifest_payload(),
+        )
         try:
-            if not self._attempt_until_running(
-                stop_requested,
-                recovering=False,
-                usb_absence_seen=False,
-            ):
-                self._shutdown()
-                return
-
-            while True:
-                fault = self._monitor_until_fault(stop_requested)
-                if fault is None:
-                    self._shutdown()
-                    return
-                reason, capture_exit_code, port_absence_seen = fault
-                self._recovery_count += 1
-                self._transition(SupervisorState.RECOVERING, reason)
-                if capture_exit_code is not None:
-                    self._set_capture_exit_code(capture_exit_code)
-                if self._active_capture is not None:
-                    self._stop_active_child(self._active_capture)
-                self._active_watchdog = None
-                self._finalize_epoch(reason=reason)
+            try:
                 if not self._attempt_until_running(
                     stop_requested,
-                    recovering=True,
-                    usb_absence_seen=port_absence_seen,
+                    recovering=False,
+                    usb_absence_seen=False,
                 ):
                     self._shutdown()
                     return
-        except Exception:
-            self._stop_registered_children()
-            self._finalize_epoch(reason=self._fatal_reason)
-            self._restore_verified_paths()
-            self._transition(SupervisorState.STOPPED, self._fatal_reason)
-            raise
+
+                while True:
+                    fault = self._monitor_until_fault(stop_requested)
+                    if fault is None:
+                        self._shutdown()
+                        return
+                    reason, capture_exit_code, port_absence_seen = fault
+                    self._recovery_count += 1
+                    self._transition(SupervisorState.RECOVERING, reason)
+                    if capture_exit_code is not None:
+                        self._set_capture_exit_code(capture_exit_code)
+                    if self._active_capture is not None:
+                        self._stop_active_child(self._active_capture)
+                    self._active_watchdog = None
+                    self._finalize_epoch(reason=reason)
+                    if not self._attempt_until_running(
+                        stop_requested,
+                        recovering=True,
+                        usb_absence_seen=port_absence_seen,
+                    ):
+                        self._shutdown()
+                        return
+            except Exception:
+                cleanup_error: BaseException | None = None
+                try:
+                    self._stop_registered_children()
+                except BaseException as error:
+                    cleanup_error = error
+                self._finalize_epoch(reason=self._fatal_reason)
+                self._restore_verified_paths()
+                self._transition(SupervisorState.STOPPED, self._fatal_reason)
+                if cleanup_error is not None:
+                    raise cleanup_error
+                raise
+        finally:
+            if self._uart_lock is not None:
+                self._uart_lock.release()
+                self._uart_lock = None
+            if self._owner_lock is not None:
+                self._owner_lock.release()
+                self._owner_lock = None
 
     def _attempt_until_running(
         self,
@@ -399,6 +477,18 @@ class RadarSupervisor:
             if port is None:
                 return False
             self._port = port
+            if self._owner_lock is None:
+                self._owner_lock = acquire_radar_owner_lock(
+                    RADAR_OWNER_LOCK_ROOT,
+                    self._latched_xds_serial or port.serial_number,
+                    self._config.run_id,
+                )
+            if self._uart_lock is None:
+                self._uart_lock = acquire_radar_owner_lock(
+                    RADAR_UART_LOCK_ROOT,
+                    self._latched_xds_serial or port.serial_number,
+                    self._config.run_id,
+                )
 
             reset_reason = "recovery_reset" if recovering else "initial_reset"
             self._transition(SupervisorState.RESET_TARGET, reset_reason)
@@ -470,6 +560,12 @@ class RadarSupervisor:
 
             self._transition(SupervisorState.START_CAPTURE, "starting_capture")
             self._process_manager_engaged = True
+            if self._uart_lock is None:
+                raise RuntimeError(
+                    "capture start requires the verified UART ownership lease"
+                )
+            self._uart_lock.release()
+            self._uart_lock = None
             try:
                 capture = self._dependencies.processes.start_capture(
                     self._port,
@@ -529,11 +625,27 @@ class RadarSupervisor:
                 if recovering
                 else "initial_startup_failed"
             )
-            viewer = self._dependencies.processes.switch_viewer(
-                None,
-                self._paths,
-                self._config,
-            )
+            try:
+                viewer = self._start_viewer_with_retry(
+                    self._paths,
+                    stop_requested,
+                    reason="viewer_switch_failed",
+                )
+            except _ViewerRetryFault as exc:
+                if exc.capture_exit_code is not None:
+                    self._set_capture_exit_code(exc.capture_exit_code)
+                if self._active_capture is not None:
+                    self._stop_active_child(self._active_capture)
+                self._active_watchdog = None
+                self._finalize_epoch(reason=exc.reason)
+                self._restore_verified_paths()
+                self._transition(SupervisorState.RECOVERING, exc.reason)
+                usb_absence_seen = exc.port_absence_seen
+                if not self._backoff(stop_requested):
+                    return False
+                continue
+            if viewer is None:
+                return False
             self._register_started_child(viewer, expected_role="viewer")
             self._active_viewer = viewer
             self._persist_manifest()
@@ -580,11 +692,24 @@ class RadarSupervisor:
                 viewer = self._active_viewer
                 self._stop_active_child(viewer)
                 self._fatal_reason = "viewer_restart_failed"
-                replacement = self._dependencies.processes.switch_viewer(
-                    None,
-                    self._paths,
-                    self._config,
+                self._transition(
+                    SupervisorState.SWITCH_VIEWER,
+                    "viewer_restarting",
                 )
+                try:
+                    replacement = self._start_viewer_with_retry(
+                        self._paths,
+                        stop_requested,
+                        reason="viewer_restart_failed",
+                    )
+                except _ViewerRetryFault as exc:
+                    return (
+                        exc.reason,
+                        exc.capture_exit_code,
+                        exc.port_absence_seen,
+                    )
+                if replacement is None:
+                    return None
                 self._register_started_child(
                     replacement,
                     expected_role="viewer",
@@ -592,19 +717,104 @@ class RadarSupervisor:
                 self._active_viewer = replacement
                 self._persist_manifest()
                 self._transition(SupervisorState.RUNNING, "viewer_restarted")
+                self._retry_delay_s = self._config.retry_initial_s
 
             self._fatal_reason = "running_sleep_failed"
             self._dependencies.sleep(self._config.poll_interval_s)
+
+    def _start_viewer_with_retry(
+        self,
+        paths: EpochPaths,
+        stop_requested: Callable[[], bool],
+        *,
+        reason: str,
+    ) -> SupervisorChild | None:
+        retrying = False
+        while True:
+            if stop_requested():
+                return None
+            if retrying:
+                fault = self._poll_retained_radar_fault()
+                if fault is not None:
+                    raise _ViewerRetryFault(fault)
+            try:
+                viewer = self._dependencies.processes.switch_viewer(
+                    None,
+                    paths,
+                    self._config,
+                )
+            except Exception:
+                self._transition(SupervisorState.SWITCH_VIEWER, reason)
+                fault = self._poll_retained_radar_fault()
+                if fault is not None:
+                    raise _ViewerRetryFault(fault)
+                if not self._backoff(stop_requested):
+                    return None
+                retrying = True
+                continue
+
+            fault = self._poll_retained_radar_fault()
+            if fault is not None:
+                self._register_started_child(
+                    viewer,
+                    expected_role="viewer",
+                )
+                self._active_viewer = viewer
+                self._persist_manifest()
+                self._stop_active_child(viewer)
+                raise _ViewerRetryFault(fault)
+            return viewer
+
+    def _poll_retained_radar_fault(
+        self,
+    ) -> tuple[str, int | None, bool] | None:
+        if self._active_capture is None or self._active_watchdog is None:
+            raise RuntimeError(
+                "viewer retry requires an active capture and watchdog"
+            )
+        capture_exit_code = self._active_capture.poll()
+        if capture_exit_code is not None:
+            return "capture_exited", capture_exit_code, False
+
+        present, _ = self._matching_port_inventory()
+        if not present:
+            return "application_port_lost", None, True
+
+        snapshot = self._active_watchdog.poll(
+            self._dependencies.monotonic()
+        )
+        self._verified_consecutive_frames = (
+            snapshot.consecutive_good_frames
+        )
+        if snapshot.fault_reason is not None:
+            return snapshot.fault_reason, None, False
+        return None
 
     def _matching_port_inventory(
         self,
     ) -> tuple[bool, RadarPortIdentity | None]:
         inventory = tuple(self._dependencies.port_provider())
+        target_serial = self._latched_xds_serial or self._config.xds_serial
         candidates = []
         for port in inventory:
-            device = str(getattr(port, "device", ""))
-            description = str(getattr(port, "description", ""))
-            serial_number = str(getattr(port, "serial_number", ""))
+            device_value = getattr(port, "device", "")
+            description_value = getattr(port, "description", "")
+            serial_value = getattr(port, "serial_number", "")
+            location_value = getattr(port, "location", "")
+            device = "" if device_value is None else str(device_value).strip()
+            description = (
+                ""
+                if description_value is None
+                else str(description_value).strip()
+            )
+            serial_number = (
+                "" if serial_value is None else str(serial_value).strip()
+            )
+            location = (
+                ""
+                if location_value is None
+                else str(location_value).strip()
+            )
             if self._config.explicit_port is not None:
                 if device != self._config.explicit_port:
                     continue
@@ -617,10 +827,9 @@ class RadarSupervisor:
                 continue
             if "Auxiliary" in description:
                 continue
-            if (
-                self._config.xds_serial is not None
-                and serial_number != self._config.xds_serial
-            ):
+            if location.casefold().endswith(".3") or not serial_number:
+                continue
+            if target_serial is not None and serial_number != target_serial:
                 continue
             candidates.append(port)
         if len(candidates) != 1:
@@ -628,8 +837,10 @@ class RadarSupervisor:
         selected = select_application_port(
             candidates,
             explicit_port=self._config.explicit_port,
-            xds_serial=self._config.xds_serial,
+            xds_serial=target_serial,
         )
+        if self._latched_xds_serial is None:
+            self._latched_xds_serial = selected.serial_number
         return True, selected
 
     def _wait_for_port(
@@ -744,16 +955,22 @@ class RadarSupervisor:
             )
         if self._active_capture is child:
             self._set_capture_exit_code(result.exit_code)
-        self._record_stop_result(result)
+        self._record_stop_result(child, result)
+        del self._owned_children[child.pid]
         if self._active_capture is child:
             self._active_capture = None
         if self._active_viewer is child:
             self._active_viewer = None
 
-    def _record_stop_result(self, result: SupervisorStopResult) -> None:
-        if result.pid in self._stopped_pids:
-            return
-        self._stopped_pids.add(result.pid)
+    def _record_stop_result(
+        self,
+        child: SupervisorChild,
+        result: SupervisorStopResult,
+    ) -> None:
+        if child.pid != result.pid or child.role != result.role:
+            raise RuntimeError(
+                "cleanup result does not match registered active child"
+            )
         self._process_events.append(
             {
                 "role": result.role,
@@ -768,18 +985,62 @@ class RadarSupervisor:
     def _stop_registered_children(self) -> None:
         if not self._process_manager_engaged:
             return
-        results = self._dependencies.processes.stop_owned_children()
-        self._process_manager_engaged = False
-        for result in results:
-            child = self._owned_children.get(result.pid)
-            if child is None or child.role != result.role:
-                continue
-            self._record_stop_result(result)
-            if self._active_capture is child:
-                self._set_capture_exit_code(result.exit_code)
-        self._active_capture = None
-        self._active_viewer = None
-        self._active_watchdog = None
+        last_error: BaseException | None = None
+        validation_errors: list[RuntimeError] = []
+        try:
+            for _attempt in range(2):
+                results: tuple[SupervisorStopResult, ...]
+                try:
+                    results = (
+                        self._dependencies.processes.stop_owned_children()
+                    )
+                    last_error = None
+                except BaseException as error:
+                    last_error = error
+                    partial_results = getattr(error, "results", ())
+                    results = (
+                        tuple(partial_results)
+                        if isinstance(partial_results, (list, tuple))
+                        else ()
+                    )
+
+                for result in results:
+                    child = self._owned_children.get(result.pid)
+                    if child is None or child.role != result.role:
+                        validation_errors.append(
+                            RuntimeError(
+                                "cleanup result names an unknown or mismatched "
+                                f"owned child: {result.role!r}/{result.pid!r}"
+                            )
+                        )
+                        continue
+                    if self._active_capture is child:
+                        self._set_capture_exit_code(result.exit_code)
+                    self._record_stop_result(child, result)
+                    del self._owned_children[result.pid]
+                    if self._active_capture is child:
+                        self._active_capture = None
+                    if self._active_viewer is child:
+                        self._active_viewer = None
+
+                if validation_errors or last_error is None:
+                    break
+        finally:
+            self._process_manager_engaged = False
+            self._active_watchdog = None
+
+        if validation_errors:
+            raise validation_errors[0]
+        if last_error is not None:
+            raise last_error
+        if self._owned_children:
+            remaining = sorted(
+                (child.role, child.pid)
+                for child in self._owned_children.values()
+            )
+            raise RuntimeError(
+                f"owned-child cleanup omitted active children: {remaining!r}"
+            )
 
     def _set_capture_exit_code(self, exit_code: int) -> None:
         if (
@@ -806,10 +1067,16 @@ class RadarSupervisor:
         self._persist_manifest()
 
     def _shutdown(self) -> None:
-        self._stop_registered_children()
+        cleanup_error: BaseException | None = None
+        try:
+            self._stop_registered_children()
+        except BaseException as error:
+            cleanup_error = error
         self._finalize_epoch(reason="shutdown")
         self._restore_verified_paths()
         self._transition(SupervisorState.STOPPED, "shutdown")
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def _restore_verified_paths(self) -> None:
         self._paths = self._verified_paths
@@ -834,9 +1101,12 @@ class RadarSupervisor:
             "recovery_count": self._recovery_count,
             "port": self._port.device if self._port is not None else None,
             "xds_serial": (
-                self._port.serial_number
-                if self._port is not None
-                else self._config.xds_serial
+                self._latched_xds_serial
+                or (
+                    self._port.serial_number
+                    if self._port is not None
+                    else self._config.xds_serial
+                )
             ),
             "reset_capability": {
                 "available": self._config.reset_executable is not None,
@@ -873,5 +1143,6 @@ __all__ = [
     "SupervisorWatchdog",
     "allocate_epoch_paths",
     "manifest_path",
+    "reserve_manifest",
     "write_manifest_atomic",
 ]

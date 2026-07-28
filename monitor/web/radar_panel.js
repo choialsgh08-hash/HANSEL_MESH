@@ -19,6 +19,55 @@
     sensor_fault: "SENSOR FAULT",
     http_lost: "HTTP LOST",
   };
+  const BLOCKED_MESSAGES = {
+    waiting: [
+      "RADAR STARTING · DRIVE STOP",
+      "레이더 준비 중 · 주행을 정지하세요",
+    ],
+    stale: [
+      "RADAR RECONNECTING · DRIVE STOP",
+      "레이더 재연결 중 · 주행을 정지하세요",
+    ],
+    fault: [
+      "RADAR RECONNECTING · DRIVE STOP",
+      "레이더 재연결 중 · 주행을 정지하세요",
+    ],
+    sensor_fault: [
+      "RADAR RECONNECTING · DRIVE STOP",
+      "레이더 재연결 중 · 주행을 정지하세요",
+    ],
+    replay_end: [
+      "REPLAY END",
+      "마지막 프레임을 지도처럼 사용하지 마세요",
+    ],
+    calibration_required: [
+      "CALIBRATION REQUIRED",
+      "빈 장면 self-clutter 보정 파일이 필요합니다",
+    ],
+    calibration_unavailable: [
+      "CALIBRATION UNAVAILABLE",
+      "보정되지 않은 반사를 점유로 표시하지 않습니다",
+    ],
+    profile_mismatch: [
+      "PROFILE MISMATCH",
+      "보정 파일과 현재 레이더 프로필이 다릅니다",
+    ],
+    http_lost: [
+      "RADAR RECONNECTING · DRIVE STOP",
+      "레이더 재연결 중 · 주행을 정지하세요",
+    ],
+    invalid_scene: [
+      "SCENE CONTRACT ERROR",
+      "검증되지 않은 장면은 표시하지 않습니다",
+    ],
+  };
+
+  function blockedMessage(reason) {
+    return BLOCKED_MESSAGES[reason] || [
+      "MAP BLOCKED",
+      String(reason || "unknown input state"),
+    ];
+  }
   const SECTOR_NAMES = ["좌측 끝", "좌측", "정면", "우측", "우측 끝"];
 
   class RadarPanel {
@@ -800,49 +849,7 @@
 
     drawBlockingOverlay(ctx, width, height, presentation) {
       const reason = presentation && presentation.reason;
-      const messages = {
-        waiting: [
-          "RADAR STARTING · DRIVE STOP",
-          "레이더 준비 중 · 주행을 정지하세요",
-        ],
-        stale: [
-          "RADAR RECONNECTING · DRIVE STOP",
-          "레이더 재연결 중 · 주행을 정지하세요",
-        ],
-        fault: [
-          "RADAR RECONNECTING · DRIVE STOP",
-          "레이더 재연결 중 · 주행을 정지하세요",
-        ],
-        sensor_fault: [
-          "RADAR RECONNECTING · DRIVE STOP",
-          "레이더 재연결 중 · 주행을 정지하세요",
-        ],
-        replay_end: ["REPLAY END", "마지막 프레임을 지도처럼 사용하지 마세요"],
-        calibration_required: [
-          "CALIBRATION REQUIRED",
-          "빈 장면 self-clutter 보정 파일이 필요합니다",
-        ],
-        calibration_unavailable: [
-          "CALIBRATION UNAVAILABLE",
-          "보정되지 않은 반사를 점유로 표시하지 않습니다",
-        ],
-        profile_mismatch: [
-          "PROFILE MISMATCH",
-          "보정 파일과 현재 레이더 프로필이 다릅니다",
-        ],
-        http_lost: [
-          "RADAR RECONNECTING · DRIVE STOP",
-          "레이더 재연결 중 · 주행을 정지하세요",
-        ],
-        invalid_scene: [
-          "SCENE CONTRACT ERROR",
-          "검증되지 않은 장면은 표시하지 않습니다",
-        ],
-      };
-      const message = messages[reason] || [
-        "MAP BLOCKED",
-        String(reason || "unknown input state"),
-      ];
+      const message = blockedMessage(reason);
       ctx.fillStyle = "#020609";
       ctx.fillRect(0, 0, width, height);
       const boxWidth = Math.max(180, Math.min(480, width - 28));
@@ -850,11 +857,11 @@
       const x = (width - boxWidth) / 2;
       const y = (height - boxHeight) / 2;
       ctx.fillStyle = "rgba(8, 17, 21, 0.98)";
-      ctx.strokeStyle = "rgba(255, 193, 91, 0.84)";
+      ctx.strokeStyle = "rgba(255, 81, 81, 0.92)";
       ctx.lineWidth = 2;
       ctx.fillRect(x, y, boxWidth, boxHeight);
       ctx.strokeRect(x, y, boxWidth, boxHeight);
-      ctx.fillStyle = "#ffc15b";
+      ctx.fillStyle = "#ff5151";
       ctx.textAlign = "center";
       ctx.font = `800 ${width < 300 ? 13 : 20}px system-ui, sans-serif`;
       ctx.fillText(message[0], width / 2, y + boxHeight * 0.43);
@@ -865,9 +872,9 @@
 
     updateText(presentation) {
       const state = this.snapshot;
+      const blocked = Boolean(presentation && presentation.blocked);
       const presentationStatus =
-        presentation &&
-        presentation.blocked &&
+        blocked &&
         [
           "waiting",
           "stale",
@@ -876,7 +883,9 @@
           "http_lost",
         ].includes(presentation.reason)
           ? presentation.reason
-          : null;
+          : blocked
+            ? "sensor_fault"
+            : null;
       const status = presentationStatus || (this.fetchFailed
         ? "fault"
         : state
@@ -886,14 +895,17 @@
       badge.dataset.status = status;
       badge.textContent =
         STATUS_LABELS[status] || String(status).toUpperCase();
+      const warningStrip = document.querySelector("#warning-strip");
+      if (warningStrip) {
+        warningStrip.dataset.blocked = blocked ? "true" : "false";
+      }
       const warning = document.querySelector("#warning-text");
       if (presentation && presentation.blocked) {
+        const message = blockedMessage(presentation.reason);
         const detail = presentation.error
           ? ` · ${presentation.error.message}`
           : "";
-        warning.textContent = state && state.warning
-          ? `${state.warning}${detail}`
-          : `레이더 지도 차단 · ${presentation.reason || "unknown"}${detail}`;
+        warning.textContent = `${message[0]} · ${message[1]}${detail}`;
       } else {
         warning.textContent =
           presentation && presentation.hazardCopy
@@ -943,12 +955,16 @@
       );
       this.setMetric(
         "metric-fps",
-        state && Number.isFinite(state.fps) ? state.fps.toFixed(1) : "--",
+        !blocked && state && Number.isFinite(state.fps)
+          ? state.fps.toFixed(1)
+          : "--",
         "frame/s",
       );
       this.setMetric(
         "metric-age",
-        state && Number.isFinite(state.age_ms) ? String(state.age_ms) : "--",
+        !blocked && state && Number.isFinite(state.age_ms)
+          ? String(state.age_ms)
+          : "--",
         "ms since frame",
       );
 
@@ -966,10 +982,11 @@
 
     updateDiagnostics(presentation) {
       const state = this.snapshot;
-      const frame = state && state.frame;
-      const scene = state && state.scene;
+      const visible = Boolean(presentation && !presentation.blocked);
+      const frame = visible && state && state.frame;
+      const scene = visible && state && state.scene;
       const diagnostics = scene && scene.diagnostics;
-      const counters = state && state.counters;
+      const counters = visible && state && state.counters;
       document.querySelector("#axis-value").textContent = state && state.axes
         ? `${state.axes.forward_sign > 0 ? "+" : "-"}${String(state.axes.forward_axis).toUpperCase()} 전방 · ` +
           `${state.axes.lateral_sign > 0 ? "+" : "-"}${String(state.axes.lateral_axis).toUpperCase()} 우측`
@@ -980,7 +997,7 @@
         scene && scene.calibration_status
           ? scene.calibration_status
           : "--";
-      const poseMode = presentation && !presentation.blocked
+      const poseMode = visible
         ? presentation.poseMode
         : null;
       document.querySelector("#pose-mode-value").textContent =
@@ -1012,7 +1029,7 @@
           track.source === "point" && track.point_confirmed === true,
       ).length;
       document.querySelector("#confirmed-track-value").textContent =
-        String(confirmedCount);
+        visible ? String(confirmedCount) : "--";
       document.querySelector("#clutter-rejected-value").textContent =
         diagnostics && Number.isFinite(diagnostics.clutter_points_rejected)
           ? String(diagnostics.clutter_points_rejected)
@@ -1020,7 +1037,9 @@
       document.querySelector("#heatmap-rejected-value").textContent =
         diagnostics && Number.isFinite(diagnostics.heatmap_cells_rejected)
           ? String(diagnostics.heatmap_cells_rejected)
-          : "-- (API 미제공)";
+          : visible
+            ? "-- (API 미제공)"
+            : "--";
       document.querySelector("#grid-status-value").textContent =
         presentation && !presentation.blocked && presentation.grid
           ? `OK · ${presentation.grid.length} bytes`

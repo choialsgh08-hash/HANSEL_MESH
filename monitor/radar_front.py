@@ -43,6 +43,9 @@ from sensors.mission_log import (  # noqa: E402
     iter_replay,
 )
 from sensors.radar_calibration import load_clutter_model  # noqa: E402
+from sensors.radar_parent_lease import (  # noqa: E402
+    start_parent_death_watcher,
+)
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
@@ -50,6 +53,7 @@ RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
 UI_BUILD_ID = "20260729-lidar-operator-r10"
 RADAR_VALID_MIN_RANGE_M = 0.07
+SUPERVISOR_BLOCKED_WARNING = "RADAR RECONNECTING \u00b7 DRIVE STOP"
 
 
 class RadarFrontState:
@@ -67,6 +71,7 @@ class RadarFrontState:
         fault_after_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
         scene_estimator: Optional[RadarSceneEstimator] = None,
+        supervisor_manifest_path: Optional[Path] = None,
     ) -> None:
         if max_points < 1:
             raise ValueError("max_points must be positive")
@@ -95,6 +100,12 @@ class RadarFrontState:
         self.stale_after_s = stale_after_s
         self.fault_after_s = fault_after_s
         self._clock = clock
+        if (
+            supervisor_manifest_path is not None
+            and not isinstance(supervisor_manifest_path, Path)
+        ):
+            raise ValueError("supervisor_manifest_path must be a Path or None")
+        self.supervisor_manifest_path = supervisor_manifest_path
         self.scene_estimator = scene_estimator or RadarSceneEstimator(
             axes=axes,
             clutter_model=None,
@@ -531,6 +542,27 @@ class RadarFrontState:
 
     def snapshot(self, now: Optional[float] = None) -> Dict[str, object]:
         current = self._clock() if now is None else now
+        supervisor_state: Optional[str] = None
+        supervisor_reason: Optional[str] = None
+        if self.supervisor_manifest_path is not None:
+            try:
+                supervisor_payload = json.loads(
+                    self.supervisor_manifest_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(supervisor_payload, dict):
+                    raise ValueError("supervisor manifest must be an object")
+                supervisor_state = supervisor_payload.get("state")
+                supervisor_reason = supervisor_payload.get("last_reason")
+                if not isinstance(supervisor_state, str):
+                    raise ValueError("supervisor manifest state is missing")
+                if (
+                    supervisor_reason is not None
+                    and not isinstance(supervisor_reason, str)
+                ):
+                    supervisor_reason = None
+            except (OSError, ValueError, TypeError):
+                supervisor_state = "UNAVAILABLE"
+                supervisor_reason = "supervisor_manifest_unavailable"
         with self._lock:
             occupancy = self._occupancy_payload(current)
             frame = self._frame
@@ -560,6 +592,19 @@ class RadarFrontState:
                 status = "live"
 
             warning = self._warning_for(status, frame)
+            supervisor_blocked = (
+                supervisor_state is not None
+                and supervisor_state != "RUNNING"
+            )
+            if supervisor_blocked:
+                status = "fault"
+                warning = SUPERVISOR_BLOCKED_WARNING
+                frame = None
+                age_s = None
+                fps = 0.0
+                occupancy["frames"] = 0
+                occupancy["points"] = []
+                occupancy["truncated"] = False
             if status in {"waiting", "stale", "fault", "replay_end"}:
                 self._scene_producer_id = None
             scene = self.scene_estimator.snapshot(
@@ -571,6 +616,8 @@ class RadarFrontState:
                 "ui_build_id": UI_BUILD_ID,
                 "status": status,
                 "warning": warning,
+                "supervisor_state": supervisor_state,
+                "supervisor_reason": supervisor_reason,
                 "source": {
                     "mode": self.source_mode,
                     "note": self._source_note,
@@ -1124,6 +1171,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--clutter-calibration",
         help="profile-bound radar self-clutter calibration JSON",
     )
+    parser.add_argument(
+        "--supervisor-manifest",
+        type=Path,
+        help="atomic radar supervisor state side channel",
+    )
+    parser.add_argument(
+        "--supervisor-parent-lease",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -1165,6 +1222,16 @@ def parse_args(
 
 
 def run(args: argparse.Namespace) -> int:
+    parent_watcher = None
+    if args.supervisor_parent_lease is not None:
+        parent_watcher = start_parent_death_watcher(
+            args.supervisor_parent_lease
+        )
+        if not parent_watcher.ready.wait(5.0):
+            raise RuntimeError("parent-death watcher did not become ready")
+        if parent_watcher.stop_requested.is_set():
+            return 0
+
     axes = RadarAxes(
         forward_axis=args.forward_axis,
         forward_sign=args.forward_sign,
@@ -1193,6 +1260,7 @@ def run(args: argparse.Namespace) -> int:
         stale_after_s=args.stale_after,
         fault_after_s=args.fault_after,
         scene_estimator=scene_estimator,
+        supervisor_manifest_path=args.supervisor_manifest,
     )
     stop_event = threading.Event()
     if args.demo:
@@ -1228,6 +1296,17 @@ def run(args: argparse.Namespace) -> int:
         build_handler(state, quiet=args.quiet),
     )
     server.daemon_threads = True
+    if parent_watcher is not None:
+        def shutdown_after_parent_exit() -> None:
+            parent_watcher.stop_requested.wait()
+            stop_event.set()
+            server.shutdown()
+
+        threading.Thread(
+            target=shutdown_after_parent_exit,
+            name="radar-front-parent-death",
+            daemon=True,
+        ).start()
     print(
         f"HANSEL front radar: http://{args.bind}:{args.http_port} "
         f"(mode={mode})"

@@ -42,6 +42,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sys
 import time
 
 
@@ -83,7 +84,31 @@ parser.add_argument("--frames")
 parser.add_argument("--health")
 parser.add_argument("--frame-delay", type=float, default=0.04)
 parser.add_argument("--health-delay", type=float, default=0.02)
+parser.add_argument("--parent-lease")
+parser.add_argument("--repository-root")
 args = parser.parse_args()
+
+parent_watcher = None
+if args.parent_lease is not None:
+    if args.repository_root is None:
+        raise RuntimeError("--repository-root is required with --parent-lease")
+    sys.path.insert(0, args.repository_root)
+    from sensors.radar_parent_lease import start_parent_death_watcher
+
+    parent_watcher = start_parent_death_watcher(Path(args.parent_lease))
+    if not parent_watcher.ready.wait(5.0):
+        raise RuntimeError("parent-death watcher did not become ready")
+
+
+def should_run():
+    return (
+        running
+        and (
+            parent_watcher is None
+            or not parent_watcher.stop_requested.is_set()
+        )
+    )
+
 
 for handled_signal in (signal.SIGINT, signal.SIGTERM):
     signal.signal(handled_signal, request_stop)
@@ -116,7 +141,7 @@ try:
             raw_index.open("ab", buffering=0) as index_handle,
         ):
             for frame_number, line in enumerate(frame_lines, 1):
-                if not running:
+                if not should_run():
                     break
                 mission_handle.write(line)
                 raw_bytes = (
@@ -160,7 +185,7 @@ try:
                 count=frames_written,
             )
             health_count = 0
-            while running:
+            while should_run():
                 mission_handle.write(health_line)
                 os.fsync(mission_handle.fileno())
                 health_count += 1
@@ -175,7 +200,7 @@ try:
                     )
                 time.sleep(args.health_delay)
     else:
-        while running:
+        while should_run():
             time.sleep(0.02)
 finally:
     append_event(
@@ -292,6 +317,14 @@ class _HelperPopenRouter:
                 "--mission",
                 str(mission),
             ]
+        helper_command.extend(
+            [
+                "--parent-lease",
+                _argument(command, "--supervisor-parent-lease"),
+                "--repository-root",
+                str(REPOSITORY_ROOT),
+            ]
+        )
         process = subprocess.Popen(helper_command, **kwargs)
         self.processes[process.pid] = process
         self.roles[process.pid] = role
@@ -874,32 +907,13 @@ class RadarSupervisorSubprocessIntegrationTests(unittest.TestCase):
                     processes.viewer_stop_observations[old_viewer_pid],
                     ("e002", 5),
                 )
-                helper_events = _events(events_path)
-                old_viewer_stopped = next(
-                    index
-                    for index, event in enumerate(helper_events)
-                    if event["pid"] == old_viewer_pid
-                    and event["action"] == "stopped"
-                )
-                e002_viewer_started = next(
-                    index
-                    for index, event in enumerate(helper_events)
-                    if event["pid"] == new_viewer_pid
-                    and event["action"] == "started"
-                )
-                fifth_e002_frame = next(
-                    index
-                    for index, event in enumerate(helper_events)
-                    if event["epoch"] == "e002"
-                    and event["action"] == "frame_written"
-                    and event["frame"] == 5
-                )
-                self.assertLess(fifth_e002_frame, old_viewer_stopped)
-                self.assertLess(old_viewer_stopped, e002_viewer_started)
-                e002_viewer_event = helper_events[e002_viewer_started]
                 self.assertEqual(
-                    e002_viewer_event["mission"],
-                    e002["mission_path"],
+                    router.viewer_frame_counts,
+                    [5, 5],
+                )
+                self.assertEqual(
+                    router.viewer_missions[-1],
+                    Path(str(e002["mission_path"])),
                 )
 
                 process_events = final_payload["process_events"]

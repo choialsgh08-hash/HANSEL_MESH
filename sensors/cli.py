@@ -36,6 +36,11 @@ from sensors.radar_capture import (
     capture_stats_dict,
     classify_frame_transition,
 )
+from sensors.radar_owner_lock import (
+    RADAR_UART_LOCK_ROOT,
+    acquire_radar_owner_lock,
+)
+from sensors.radar_parent_lease import start_parent_death_watcher
 from sensors.raw_capture_index import inspect_uart_chunk_index
 from sensors.radar_calibration import build_clutter_model
 from sensors.ti_mmwave import TiMmwavePacketParser, TiMmwaveStreamDecoder
@@ -410,50 +415,102 @@ def _radar_shutdown_signals():
 
 
 def command_radar_live(args: argparse.Namespace) -> int:
-    with _radar_shutdown_signals():
-        stats = capture_radar_uart(
-            port=args.port,
-            baudrate=args.baud,
-            mission_log=Path(args.output),
-            mission_id=args.mission_id,
-            profile_id=args.profile_id,
-            calibration_id=args.calibration_id,
-            unit_id=args.unit_id,
-            boot_id=args.boot_id,
-            raw_capture=(None if args.raw_output is None else Path(args.raw_output)),
-            raw_index=(None if args.raw_index is None else Path(args.raw_index)),
-            duration_s=args.duration,
-            read_size=args.read_bytes,
-            serial_timeout_s=args.serial_timeout,
-            health_interval_s=getattr(args, "health_interval", 0.5),
-            overwrite=args.overwrite,
-            header_size=int(args.header_size),
-            allow_elided_empty_point_tlv=getattr(
-                args,
-                "allow_elided_empty_point_tlv",
-                False,
-            ),
-            allow_nonzero_padding=getattr(
-                args,
-                "allow_nonzero_padding",
-                False,
-            ),
-            heatmap_azimuth_bins=getattr(
-                args,
-                "heatmap_azimuth_bins",
-                None,
-            ),
-            heatmap_range_bins=getattr(
-                args,
-                "heatmap_range_bins",
-                None,
-            ),
-            heatmap_range_step_m=getattr(
-                args,
-                "heatmap_range_step_m",
-                None,
-            ),
+    parent_lease_path = getattr(args, "supervisor_parent_lease", None)
+    xds_owner_serial = getattr(args, "xds_owner_serial", None)
+    xds_owner_run_id = getattr(args, "xds_owner_run_id", None)
+    managed_values = (
+        parent_lease_path,
+        xds_owner_serial,
+        xds_owner_run_id,
+    )
+    if any(value is not None for value in managed_values) and not all(
+        value is not None for value in managed_values
+    ):
+        raise ValueError(
+            "managed radar capture ownership arguments must be supplied "
+            "together"
         )
+
+    parent_watcher = None
+    uart_lock = None
+    if parent_lease_path is not None:
+        parent_watcher = start_parent_death_watcher(
+            Path(parent_lease_path)
+        )
+        if not parent_watcher.ready.wait(5.0):
+            raise RuntimeError("parent-death watcher did not become ready")
+        if parent_watcher.stop_requested.is_set():
+            raise RuntimeError("radar supervisor exited before capture startup")
+        uart_lock = acquire_radar_owner_lock(
+            RADAR_UART_LOCK_ROOT,
+            str(xds_owner_serial),
+            str(xds_owner_run_id),
+        )
+        if parent_watcher.stop_requested.is_set():
+            uart_lock.release()
+            raise RuntimeError("radar supervisor exited before UART open")
+
+    try:
+        with _radar_shutdown_signals():
+            stats = capture_radar_uart(
+                port=args.port,
+                baudrate=args.baud,
+                mission_log=Path(args.output),
+                mission_id=args.mission_id,
+                profile_id=args.profile_id,
+                calibration_id=args.calibration_id,
+                unit_id=args.unit_id,
+                boot_id=args.boot_id,
+                raw_capture=(
+                    None
+                    if args.raw_output is None
+                    else Path(args.raw_output)
+                ),
+                raw_index=(
+                    None
+                    if args.raw_index is None
+                    else Path(args.raw_index)
+                ),
+                duration_s=args.duration,
+                read_size=args.read_bytes,
+                serial_timeout_s=args.serial_timeout,
+                health_interval_s=getattr(args, "health_interval", 0.5),
+                overwrite=args.overwrite,
+                header_size=int(args.header_size),
+                allow_elided_empty_point_tlv=getattr(
+                    args,
+                    "allow_elided_empty_point_tlv",
+                    False,
+                ),
+                allow_nonzero_padding=getattr(
+                    args,
+                    "allow_nonzero_padding",
+                    False,
+                ),
+                heatmap_azimuth_bins=getattr(
+                    args,
+                    "heatmap_azimuth_bins",
+                    None,
+                ),
+                heatmap_range_bins=getattr(
+                    args,
+                    "heatmap_range_bins",
+                    None,
+                ),
+                heatmap_range_step_m=getattr(
+                    args,
+                    "heatmap_range_step_m",
+                    None,
+                ),
+                stop_requested=(
+                    None
+                    if parent_watcher is None
+                    else parent_watcher.stop_requested.is_set
+                ),
+            )
+    finally:
+        if uart_lock is not None:
+            uart_lock.release()
     print(
         json.dumps(
             capture_stats_dict(stats),
@@ -816,6 +873,19 @@ def build_parser() -> argparse.ArgumentParser:
             "accept the official demo's uninitialized packet padding "
             "under strict alignment checks"
         ),
+    )
+    live.add_argument(
+        "--supervisor-parent-lease",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    live.add_argument(
+        "--xds-owner-serial",
+        help=argparse.SUPPRESS,
+    )
+    live.add_argument(
+        "--xds-owner-run-id",
+        help=argparse.SUPPRESS,
     )
     live.add_argument("--overwrite", action="store_true")
     live.set_defaults(func=command_radar_live)

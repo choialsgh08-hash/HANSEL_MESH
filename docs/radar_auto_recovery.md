@@ -38,7 +38,8 @@ Test-Path -LiteralPath $radarReset -PathType Leaf
 
 결과가 `True`여야 한다. 자동 탐색 범위 밖에 설치했다면 이처럼 확인한 정확한
 파일만 `--reset-executable "$radarReset"`로 지정한다. 존재하지 않는 명시 경로는
-사용할 수 없다. 실제 지원 옵션과 기본값은 언제든 다음 명령으로 확인한다.
+사용할 수 없다. 다음 명령은 실제로 지원하는 옵션을 확인한다. 소스에서 정한 모든
+기본값을 출력한다고 가정하지 않는다.
 
 ```powershell
 python scripts\run_radar_stack.py --help

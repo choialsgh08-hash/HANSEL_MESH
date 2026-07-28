@@ -1097,6 +1097,83 @@ class RadarFrontDocumentationTests(unittest.TestCase):
 
 
 class RadarFrontHttpTests(unittest.TestCase):
+    def test_non_running_supervisor_state_blocks_the_very_next_api_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "radar-supervisor-run.json"
+            manifest.write_text(
+                json.dumps({"state": "RUNNING"}),
+                encoding="utf-8",
+            )
+            state = RadarFrontState(
+                "test",
+                supervisor_manifest_path=manifest,
+            )
+            state.ingest(
+                radar_frame([RadarPoint(0.0, 0.25, 0.0, 0.0)])
+            )
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                build_handler(state, quiet=True),
+            )
+            thread = threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+            )
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}/api/radar"
+                with urlopen(url, timeout=2) as response:
+                    running = json.load(response)
+                self.assertEqual(running["status"], "live")
+                self.assertIsNotNone(running["frame"])
+
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "state": "RECOVERING",
+                            "last_reason": "radar_frame_timeout",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with urlopen(url, timeout=2) as response:
+                    blocked = json.load(response)
+
+                self.assertEqual(blocked["status"], "fault")
+                self.assertEqual(
+                    blocked["warning"],
+                    "RADAR RECONNECTING · DRIVE STOP",
+                )
+                self.assertEqual(blocked["supervisor_state"], "RECOVERING")
+                self.assertIsNone(blocked["frame"])
+                self.assertIsNone(blocked["age_ms"])
+                self.assertEqual(blocked["fps"], 0.0)
+                self.assertEqual(blocked["occupancy"]["points"], [])
+                self.assertEqual(blocked["scene"]["tracks"], [])
+                self.assertEqual(
+                    blocked["scene"]["hazard"]["level"],
+                    "SENSOR_FAULT",
+                )
+
+                manifest.write_text("[]", encoding="utf-8")
+                with urlopen(url, timeout=2) as response:
+                    malformed = json.load(response)
+
+                self.assertEqual(malformed["status"], "fault")
+                self.assertEqual(
+                    malformed["warning"],
+                    "RADAR RECONNECTING · DRIVE STOP",
+                )
+                self.assertEqual(
+                    malformed["supervisor_state"],
+                    "UNAVAILABLE",
+                )
+                self.assertIsNone(malformed["frame"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_api_and_offline_assets_are_served(self):
         state = RadarFrontState("test")
         state.ingest(radar_frame([]))
@@ -1141,6 +1218,15 @@ class RadarFrontHttpTests(unittest.TestCase):
             )
             self.assertIn(
                 '#radar-status[data-status="http_lost"]',
+                html,
+            )
+            self.assertIn('id="build-tag">UI R10</span>', html)
+            self.assertIn(
+                '#collision-inset[data-hazard="SENSOR_FAULT"] {',
+                html,
+            )
+            self.assertIn(
+                "border-color: rgba(255, 81, 81, 0.92);",
                 html,
             )
             self.assertIn(
@@ -1243,6 +1329,19 @@ class RadarFrontHttpTests(unittest.TestCase):
             ["--demo", "--clutter-calibration", "model.json"]
         )
         self.assertEqual(args.clutter_calibration, "model.json")
+
+    def test_cli_accepts_owned_parent_death_lease(self):
+        args = parse_args(
+            [
+                "--demo",
+                "--supervisor-parent-lease",
+                "runtime/viewer-parent.lease",
+            ]
+        )
+        self.assertEqual(
+            args.supervisor_parent_lease,
+            Path("runtime/viewer-parent.lease"),
+        )
 
     def test_cli_defaults_main_range_to_three_metres(self):
         args = parse_args(["--demo"])

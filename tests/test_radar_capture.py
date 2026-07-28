@@ -199,6 +199,36 @@ class PeriodicDiagnosticFakeSerial(FakeSerial):
 
 
 class RadarCaptureTests(unittest.TestCase):
+    def test_parent_stop_request_flushes_capture_without_reading_uart(self):
+        class NoReadSerial(FakeSerial):
+            def read(self, size):
+                del size
+                raise AssertionError("stop request must precede UART read")
+
+        fake_serial_module = SimpleNamespace(Serial=NoReadSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            root = Path(directory)
+            mission = root / "mission.jsonl"
+            raw = root / "radar.bin"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=115200,
+                mission_log=mission,
+                mission_id="mission-1",
+                raw_capture=raw,
+                stop_requested=lambda: True,
+            )
+
+            self.assertEqual(stats.frames_decoded, 0)
+            index_lines = Path(stats.raw_index).read_bytes().splitlines()
+            footer = strict_json_loads(index_lines[-1])
+            self.assertEqual(footer["record_type"], "capture_end")
+            self.assertEqual(footer["stop_reason"], "stop_requested")
+            self.assertTrue(mission.is_file())
+
     def test_live_capture_writes_raw_frame_and_health_record(self):
         fake_serial_module = SimpleNamespace(Serial=FakeSerial)
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(

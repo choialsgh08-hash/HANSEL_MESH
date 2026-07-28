@@ -1,16 +1,23 @@
 from datetime import datetime, timezone
 import importlib.util
+import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from sensors.radar_owner_lock import acquire_radar_owner_lock
+from sensors.radar_parent_lease import create_parent_death_lease
 from sensors.radar_watchdog import ExpectedRadarEvidence, RadarEpochWatchdog
+from sensors.mission_log import iter_mission_log
 from sensors.radar_stack_processes import (
     ManagedChild,
     RadarStackProcesses,
@@ -121,15 +128,62 @@ class RadarStackProcessesTests(unittest.TestCase):
             [
                 sys.executable, "monitor/radar_front.py", "--follow",
                 str(self.paths.mission), "--clutter-calibration",
-                str(self.config.calibration_path), "--bind", "127.0.0.1", "--http-port", "8081",
+                str(self.config.calibration_path), "--supervisor-manifest",
+                str(
+                    self.config.output_root
+                    / "runtime"
+                    / "radar-supervisor-run-1.json"
+                ),
+                "--bind", "127.0.0.1", "--http-port", "8081",
                 "--max-range-m", "3", "--history-window", "0.3", "--quiet",
+            ],
+        )
+
+    def test_owned_commands_receive_parent_death_and_uart_handoff(self):
+        parent_lease = self.paths.runtime_dir / "capture-parent.lease"
+        capture = build_capture_command(
+            self.port,
+            self.paths,
+            self.config,
+            parent_lease_path=parent_lease,
+        )
+        self.assertEqual(
+            capture[-6:],
+            [
+                "--supervisor-parent-lease",
+                str(parent_lease),
+                "--xds-owner-serial",
+                "SERIAL",
+                "--xds-owner-run-id",
+                "run-1",
+            ],
+        )
+
+        viewer_lease = self.paths.runtime_dir / "viewer-parent.lease"
+        viewer = build_viewer_command(
+            self.paths,
+            self.config,
+            parent_lease_path=viewer_lease,
+        )
+        self.assertEqual(
+            viewer[-2:],
+            [
+                "--supervisor-parent-lease",
+                str(viewer_lease),
             ],
         )
 
     def test_switch_viewer_stops_registered_current_before_starting_replacement(self):
         events = []
-        old = FakeProcess(pid=10, waits=(0,))
-        new = FakeProcess(pid=11)
+
+        class OrderedStopProcess(FakeProcess):
+            def wait(self, timeout):
+                result = super().wait(timeout)
+                events.append("stop:old-viewer")
+                return result
+
+        old = OrderedStopProcess(pid=10, waits=(0,))
+        new = FakeProcess(pid=11, poll_result=0)
 
         def start(command, **kwargs):
             if not events:
@@ -139,14 +193,16 @@ class RadarStackProcessesTests(unittest.TestCase):
             return new
 
         manager = RadarStackProcesses(popen_factory=start)
-        with mock.patch("sensors.radar_stack_processes.os.name", "posix"), mock.patch("sensors.radar_stack_processes.os.killpg", side_effect=lambda *args: events.append("stop:old-viewer"), create=True), mock.patch(
+        with mock.patch("sensors.radar_stack_processes.os.name", "posix"), mock.patch("sensors.radar_stack_processes.os.killpg", create=True) as killpg, mock.patch(
             "sensors.radar_stack_processes.os.getpgid", return_value=77, create=True
         ):
             current = manager.switch_viewer(None, self.paths, self.config)
             replacement = manager.switch_viewer(current, self.paths, self.config)
 
         self.assertEqual(events, ["start:old-viewer", "stop:old-viewer", "start:new-viewer"])
+        killpg.assert_not_called()
         self.assertEqual(replacement.pid, 11)
+        manager.stop_owned_children()
 
     def test_start_capture_owns_child_and_creates_runtime_log_parents(self):
         child_process = FakeProcess(poll_result=0)
@@ -190,6 +246,412 @@ class RadarStackProcessesTests(unittest.TestCase):
                 )
             manager.stop_owned_children()
 
+    def test_parent_death_lease_blocks_uart_reuse_until_child_closes(self):
+        root = Path(self.temporary_directory.name)
+        parent_lease_root = root / "parent-leases"
+        uart_lock_root = root / "uart-locks"
+        child_ready = root / "child-ready"
+        stop_observed = root / "stop-observed"
+        child_stopped = root / "child-stopped"
+        child_pid_path = root / "child-pid"
+        allow_uart_release = root / "allow-uart-release"
+        child_code = textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+            import sys
+            import time
+            from sensors.radar_owner_lock import acquire_radar_owner_lock
+            from sensors.radar_parent_lease import start_parent_death_watcher
+
+            parent_lease_path = Path(sys.argv[1])
+            uart_lock_root = Path(sys.argv[2])
+            child_ready = Path(sys.argv[3])
+            stop_observed = Path(sys.argv[4])
+            child_stopped = Path(sys.argv[5])
+            child_pid_path = Path(sys.argv[6])
+            allow_uart_release = Path(sys.argv[7])
+            watcher = start_parent_death_watcher(parent_lease_path)
+            if not watcher.ready.wait(5):
+                raise RuntimeError("parent-death watcher did not become ready")
+            if watcher.stop_requested.is_set():
+                raise RuntimeError("parent died before child startup")
+            uart_lock = acquire_radar_owner_lock(
+                uart_lock_root, "RI32", "capture-run"
+            )
+            child_pid_path.write_text(str(os.getpid()), encoding="utf-8")
+            child_ready.write_text("ready", encoding="utf-8")
+            if not watcher.stop_requested.wait(10):
+                raise RuntimeError("parent death was not observed")
+            stop_observed.write_text("stopping", encoding="utf-8")
+            deadline = time.monotonic() + 5
+            while (
+                not allow_uart_release.exists()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            uart_lock.release()
+            child_stopped.write_text("stopped", encoding="utf-8")
+            """
+        )
+        parent_code = textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+            import subprocess
+            import sys
+            import time
+            from sensors.radar_parent_lease import create_parent_death_lease
+
+            root = Path(sys.argv[1])
+            child_code = sys.argv[2]
+            parent_lease_root = Path(sys.argv[3])
+            uart_lock_root = Path(sys.argv[4])
+            child_ready = Path(sys.argv[5])
+            stop_observed = Path(sys.argv[6])
+            child_stopped = Path(sys.argv[7])
+            child_pid_path = Path(sys.argv[8])
+            allow_uart_release = Path(sys.argv[9])
+            lease = create_parent_death_lease(
+                parent_lease_root, "capture"
+            )
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    child_code,
+                    str(lease.path),
+                    str(uart_lock_root),
+                    str(child_ready),
+                    str(stop_observed),
+                    str(child_stopped),
+                    str(child_pid_path),
+                    str(allow_uart_release),
+                ],
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 5
+            while not child_ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not child_ready.exists():
+                raise RuntimeError("child did not acquire UART lease")
+            os._exit(0)
+            """
+        )
+        parent = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                parent_code,
+                str(REPOSITORY_ROOT),
+                child_code,
+                str(parent_lease_root),
+                str(uart_lock_root),
+                str(child_ready),
+                str(stop_observed),
+                str(child_stopped),
+                str(child_pid_path),
+                str(allow_uart_release),
+            ],
+            cwd=REPOSITORY_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        child_pid: int | None = None
+        try:
+            deadline = time.monotonic() + 10
+            while (
+                not child_ready.exists()
+                and parent.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            if not child_ready.exists():
+                _, parent_stderr = parent.communicate(timeout=5)
+                self.fail(
+                    "parent-death child was not ready: "
+                    f"{parent_stderr.strip()}"
+                )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            parent_stdout, parent_stderr = parent.communicate(timeout=5)
+            self.assertEqual(
+                parent.returncode,
+                0,
+                f"{parent_stdout}\n{parent_stderr}",
+            )
+
+            deadline = time.monotonic() + 5
+            while (
+                not stop_observed.exists()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertTrue(stop_observed.exists())
+            with self.assertRaisesRegex(RuntimeError, "capture-run"):
+                acquire_radar_owner_lock(
+                    uart_lock_root,
+                    "RI32",
+                    "replacement-supervisor",
+                )
+            allow_uart_release.write_text("release", encoding="utf-8")
+
+            recovered = None
+            deadline = time.monotonic() + 5
+            while recovered is None and time.monotonic() < deadline:
+                try:
+                    recovered = acquire_radar_owner_lock(
+                        uart_lock_root,
+                        "RI32",
+                        "replacement-supervisor",
+                    )
+                except RuntimeError:
+                    time.sleep(0.02)
+            self.assertIsNotNone(recovered)
+            assert recovered is not None
+            recovered.release()
+            self.assertTrue(child_stopped.exists())
+
+        finally:
+            allow_uart_release.touch(exist_ok=True)
+            if parent.poll() is None:
+                parent.kill()
+            if parent.stdout is not None and not parent.stdout.closed:
+                parent.communicate(timeout=5)
+            if child_pid is not None and not child_stopped.exists():
+                try:
+                    os.kill(child_pid, signal.SIGTERM)
+                except OSError:
+                    pass
+
+    def test_parent_watcher_does_not_treat_repeated_contention_as_death(self):
+        import sensors.radar_owner_lock as owner_lock_module
+        from sensors.radar_parent_lease import start_parent_death_watcher
+
+        path = Path(self.temporary_directory.name) / "parent.lease"
+        attempts = 0
+        repeated_contention = threading.Event()
+        release_allowed = threading.Event()
+
+        def fake_locking(_descriptor, mode, _length):
+            nonlocal attempts
+            if mode == 2:
+                return
+            if mode != 1:
+                raise AssertionError("blocking LK_LOCK must not be used")
+            attempts += 1
+            if not release_allowed.is_set():
+                if attempts >= 12:
+                    repeated_contention.set()
+                raise PermissionError(13, "lease is still locked")
+
+        fake_msvcrt = SimpleNamespace(
+            LK_NBLCK=1,
+            LK_UNLCK=2,
+            LK_LOCK=3,
+            locking=fake_locking,
+        )
+        with mock.patch.object(
+            owner_lock_module,
+            "_IS_WINDOWS",
+            True,
+        ), mock.patch.dict(
+            sys.modules,
+            {"msvcrt": fake_msvcrt},
+        ):
+            watcher = start_parent_death_watcher(path)
+            self.assertTrue(watcher.ready.wait(1.0))
+            self.assertTrue(repeated_contention.wait(2.0))
+            self.assertFalse(watcher.stop_requested.is_set())
+            release_allowed.set()
+            self.assertTrue(watcher.stop_requested.wait(1.0))
+            watcher.thread.join(1.0)
+            self.assertFalse(watcher.thread.is_alive())
+
+    def test_managed_parent_stop_preserves_capture_footer_before_group_signal(self):
+        root = Path(self.temporary_directory.name)
+        lease = create_parent_death_lease(root / "leases", "capture")
+        mission = root / "mission.jsonl"
+        raw = root / "capture.bin"
+        index = root / "capture.index.jsonl"
+        capture_ready = root / "capture-ready"
+        footer_started = root / "footer-started"
+        helper_code = textwrap.dedent(
+            """
+            import sys
+            import time
+            import types
+            from pathlib import Path
+
+            from sensors.cli import _radar_shutdown_signals
+            from sensors.radar_capture import capture_radar_uart
+            import sensors.radar_capture as radar_capture
+            from sensors.radar_parent_lease import start_parent_death_watcher
+
+            lease_path = Path(sys.argv[1])
+            mission = Path(sys.argv[2])
+            raw = Path(sys.argv[3])
+            index = Path(sys.argv[4])
+            capture_ready = Path(sys.argv[5])
+            footer_started = Path(sys.argv[6])
+
+            class EmptySerial:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *unused):
+                    return False
+
+                def read(self, size):
+                    del size
+                    capture_ready.touch(exist_ok=True)
+                    time.sleep(0.01)
+                    return b""
+
+            original_canonical_json_bytes = radar_capture.canonical_json_bytes
+
+            def pause_during_capture_footer(value):
+                if (
+                    isinstance(value, dict)
+                    and value.get("record_type") == "capture_end"
+                ):
+                    footer_started.touch(exist_ok=True)
+                    time.sleep(0.4)
+                return original_canonical_json_bytes(value)
+
+            radar_capture.canonical_json_bytes = pause_during_capture_footer
+            sys.modules["serial"] = types.SimpleNamespace(
+                Serial=lambda **unused: EmptySerial()
+            )
+            watcher = start_parent_death_watcher(lease_path)
+            if not watcher.ready.wait(5.0):
+                raise RuntimeError("parent-death watcher did not become ready")
+            with _radar_shutdown_signals():
+                capture_radar_uart(
+                    port="COM_TEST",
+                    baudrate=115200,
+                    mission_log=mission,
+                    mission_id="mission-1",
+                    profile_id="profile-1",
+                    calibration_id="uncalibrated",
+                    unit_id="head",
+                    boot_id="boot-1",
+                    raw_capture=raw,
+                    raw_index=index,
+                    duration_s=0.0,
+                    serial_timeout_s=0.01,
+                    stop_requested=watcher.stop_requested.is_set,
+                )
+            """
+        )
+        popen_kwargs = {
+            "cwd": REPOSITORY_ROOT,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                helper_code,
+                str(lease.path),
+                str(mission),
+                str(raw),
+                str(index),
+                str(capture_ready),
+                str(footer_started),
+            ],
+            **popen_kwargs,
+        )
+
+        class FooterBarrierProcess:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+                self.pid = wrapped.pid
+                self.signal_sent = False
+
+            def poll(self):
+                return self.wrapped.poll()
+
+            def wait(self, timeout):
+                return self.wrapped.wait(timeout=timeout)
+
+            def send_signal(self, value):
+                if not self._wait_for_footer():
+                    raise RuntimeError("capture footer was not reached")
+                self.signal_sent = True
+                return self.wrapped.send_signal(value)
+
+            def terminate(self):
+                return self.wrapped.terminate()
+
+            def kill(self):
+                return self.wrapped.kill()
+
+            @staticmethod
+            def _wait_for_footer():
+                deadline = time.monotonic() + 5.0
+                while (
+                    not footer_started.exists()
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                return footer_started.exists()
+
+        wrapped = FooterBarrierProcess(process)
+        child = ManagedChild("capture", wrapped, parent_lease=lease)
+        original_killpg = getattr(os, "killpg", None)
+
+        def interrupt_group_after_footer(process_group, signum):
+            if not wrapped._wait_for_footer():
+                raise RuntimeError("capture footer was not reached")
+            wrapped.signal_sent = True
+            assert original_killpg is not None
+            return original_killpg(process_group, signum)
+
+        try:
+            deadline = time.monotonic() + 5.0
+            while (
+                not capture_ready.exists()
+                and process.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertTrue(capture_ready.exists())
+            if os.name == "nt":
+                result = child.stop(grace_s=1.0)
+            else:
+                with mock.patch(
+                    "sensors.radar_stack_processes.os.killpg",
+                    side_effect=interrupt_group_after_footer,
+                ):
+                    result = child.stop(grace_s=1.0)
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.escalation, "graceful")
+            self.assertFalse(wrapped.signal_sent)
+            footer = json.loads(index.read_text("utf-8").splitlines()[-1])
+            self.assertEqual(footer["record_type"], "capture_end")
+            self.assertEqual(footer["stop_reason"], "stop_requested")
+            health_records = [
+                entry.record
+                for entry in iter_mission_log(mission)
+                if type(entry.record).__name__ == "SensorHealth"
+            ]
+            self.assertTrue(health_records)
+            self.assertIn("health_kind=final", health_records[-1].detail)
+        finally:
+            lease.release()
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5.0)
+
     def test_start_capture_uses_posix_session_when_selected(self):
         process = FakeProcess(pid=82, poll_result=0)
         started = []
@@ -200,6 +662,7 @@ class RadarStackProcessesTests(unittest.TestCase):
             manager.start_capture(self.port, self.paths, self.config)
 
         self.assertTrue(started[0]["start_new_session"])
+        manager.stop_owned_children()
 
     @unittest.skipUnless(os.name == "nt", "Windows launch semantics")
     def test_windows_child_is_hidden_without_disabling_ctrl_break_delivery(self):
@@ -226,6 +689,7 @@ class RadarStackProcessesTests(unittest.TestCase):
         self.assertFalse(
             started[0]["creationflags"] & subprocess.CREATE_NO_WINDOW
         )
+        manager.stop_owned_children()
 
     def test_stop_uses_windows_ctrl_break_before_waiting(self):
         process = FakeProcess(waits=(0,))
@@ -293,6 +757,7 @@ class RadarStackProcessesTests(unittest.TestCase):
         replacement = ManagedChild("capture", FakeProcess(pid=12))
         with self.assertRaisesRegex(RuntimeError, "unregistered"):
             manager.stop_child(replacement)
+        self.assertEqual(manager.stop_owned_children()[0].pid, 12)
 
     def test_manager_rejects_same_wrapper_with_replaced_process_before_signal(self):
         original = FakeProcess(pid=16, poll_result=0)
@@ -311,7 +776,10 @@ class RadarStackProcessesTests(unittest.TestCase):
 
     def test_duplicate_pid_registration_stops_new_process_before_raising(self):
         existing = FakeProcess(pid=31, poll_result=0)
-        duplicate = FakeProcess(pid=31, waits=(0,))
+        duplicate = FakeProcess(
+            pid=31,
+            waits=(subprocess.TimeoutExpired("duplicate", 2.0), 0),
+        )
         processes = iter((existing, duplicate))
         manager = RadarStackProcesses(
             popen_factory=lambda *args, **kwargs: next(processes)
@@ -324,7 +792,10 @@ class RadarStackProcessesTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "duplicate owned process pid"):
                 manager.switch_viewer(None, self.paths, self.config)
 
-        self.assertEqual(duplicate.events, [("send_signal", 41), ("wait", 2.0)])
+        self.assertEqual(
+            duplicate.events,
+            [("wait", 2.0), ("send_signal", 41), ("wait", 2.0)],
+        )
         self.assertEqual(manager.stop_owned_children()[0].pid, 31)
 
     def test_owned_shutdown_reports_failure_after_stopping_later_children(self):

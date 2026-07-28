@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 import time
 import uuid
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from common.sensor_contract import (
     MAX_RADAR_HEATMAP_CELLS,
@@ -224,6 +224,7 @@ def capture_radar_uart(
     heatmap_azimuth_bins: Optional[int] = None,
     heatmap_range_bins: Optional[int] = None,
     heatmap_range_step_m: Optional[float] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> RadarCaptureStats:
     """Capture an already-running TI demo stream.
 
@@ -270,6 +271,9 @@ def capture_radar_uart(
         or health_interval_s <= 0
     ):
         raise ValueError("health_interval_s must be positive")
+    if stop_requested is not None and not callable(stop_requested):
+        raise ValueError("stop_requested must be callable or None")
+    should_stop = stop_requested or (lambda: False)
     for name, value in (
         (
             "allow_elided_empty_point_tlv",
@@ -574,6 +578,9 @@ def capture_radar_uart(
 
                 try:
                     while duration_s == 0 or time.monotonic() - start < duration_s:
+                        if should_stop():
+                            stop_reason = "stop_requested"
+                            break
                         read_started_ns = time.monotonic_ns()
                         chunk = serial_port.read(read_size)
                         read_finished_ns = time.monotonic_ns()
