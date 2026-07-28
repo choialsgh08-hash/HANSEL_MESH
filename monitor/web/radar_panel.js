@@ -949,10 +949,15 @@
         scene && scene.calibration_status
           ? scene.calibration_status
           : "--";
+      const poseMode = presentation && !presentation.blocked
+        ? presentation.poseMode
+        : null;
       document.querySelector("#pose-mode-value").textContent =
-        scene && scene.pose_mode === "motion_compensated"
+        poseMode === "motion_compensated"
           ? "MOTION COMPENSATED"
-          : "ROBOT RELATIVE";
+          : poseMode === "robot_relative"
+            ? "ROBOT RELATIVE"
+            : "--";
       document.querySelector("#frame-value").textContent = frame
         ? `${frame.number} · 표시 ${frame.display_point_count}점`
         : "--";

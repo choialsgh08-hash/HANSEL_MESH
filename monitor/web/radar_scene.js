@@ -10,6 +10,16 @@
   "use strict";
   const TRACK_MAX_AGE_MS = 300;
   const HAZARD_LEVELS = new Set(["DANGER", "NORMAL", "UNKNOWN", "SENSOR_FAULT"]);
+  const SCENE_GRID_V1 = Object.freeze({
+    resolution_m: 0.05,
+    forward_cells: 60,
+    lateral_cells: 60,
+    origin_forward_cell: 0,
+    origin_lateral_cell: 30,
+    encoding: "occupancy-u8-base64",
+    layout: "forward-major_lateral-minor",
+    unknown_value: 0,
+  });
 
   function decodeBase64(text) {
     if (typeof text !== "string" ||
@@ -59,6 +69,15 @@
     );
   }
 
+  function decodeSceneV1Grid(grid) {
+    if (!grid || Object.entries(SCENE_GRID_V1).some(
+      ([field, expected]) => grid[field] !== expected,
+    )) {
+      throw new Error("invalid scene grid contract");
+    }
+    return decodeOccupancyGrid(grid);
+  }
+
   function parseRadarScene(snapshot) {
     const scene = snapshot && snapshot.scene;
     if (!scene || scene.schema_version !== 1) {
@@ -70,10 +89,16 @@
     if (!["ok", "synthetic"].includes(scene.calibration_status)) {
       return { blocked: true, reason: scene.calibration_status };
     }
+    if (scene.pose_mode !== "robot_relative") {
+      throw new Error("invalid pose contract");
+    }
     if (!scene.hazard || !HAZARD_LEVELS.has(scene.hazard.level) ||
         !Number.isFinite(scene.hazard.threshold_m) ||
         scene.hazard.threshold_m <= 0) {
       throw new Error("invalid hazard contract");
+    }
+    if (scene.hazard.level === "SENSOR_FAULT") {
+      return { blocked: true, reason: "sensor_fault" };
     }
     const tracks = filterFreshTracks(scene.tracks);
     if (tracks.some((track) => !Number.isFinite(track.forward_m) ||
@@ -90,7 +115,8 @@
     }
     return {
       blocked: false,
-      grid: decodeOccupancyGrid(scene.grid),
+      poseMode: scene.pose_mode,
+      grid: decodeSceneV1Grid(scene.grid),
       gridMeta: { ...scene.grid },
       tracks: tracks.map((track) => ({ ...track })),
       hazard: { ...scene.hazard },

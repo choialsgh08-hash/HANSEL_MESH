@@ -195,7 +195,65 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             scene["calibration_status"],
             "calibration_required",
         )
-        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertFalse(scene["tracks"])
+
+    def test_untrusted_profile_frames_cannot_seed_next_trusted_snapshot(self):
+        estimator = calibrated_estimator()
+        wrong_profile_point = lambda frame_number: radar_frame(
+            (
+                RadarPoint(
+                    x_m=0.0,
+                    y_m=0.20,
+                    z_m=0.01,
+                    radial_velocity_mps=0.0,
+                    snr_db=20.0,
+                ),
+            ),
+            frame_number=frame_number,
+            profile_id="wrong-profile",
+        )
+        estimator.ingest(wrong_profile_point(1), received_at=4.0)
+        estimator.ingest(wrong_profile_point(2), received_at=4.1)
+        estimator.ingest(empty_frame(frame_number=3), received_at=4.2)
+
+        scene = estimator.snapshot(now=4.2)
+
+        self.assertEqual(scene["calibration_status"], "ok")
+        self.assertFalse(scene["tracks"])
+        self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
+        self.assertEqual(scene["diagnostics"]["scene_point_count"], 0)
+
+    def test_untrusted_binding_clears_existing_trusted_evidence(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(point_frame(0.20, frame_number=1), received_at=4.0)
+        estimator.ingest(point_frame(0.20, frame_number=2), received_at=4.1)
+        self.assertEqual(
+            estimator.snapshot(now=4.1)["hazard"]["level"],
+            "NORMAL",
+        )
+
+        estimator.ingest(
+            radar_frame(
+                (
+                    RadarPoint(
+                        x_m=0.0,
+                        y_m=0.20,
+                        z_m=0.01,
+                        radial_velocity_mps=0.0,
+                        snr_db=20.0,
+                    ),
+                ),
+                frame_number=3,
+                profile_id="wrong-profile",
+            ),
+            received_at=4.2,
+        )
+
+        scene = estimator.snapshot(now=4.2)
+        self.assertEqual(scene["calibration_status"], "profile_mismatch")
+        self.assertFalse(scene["tracks"])
+        self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
+        self.assertEqual(scene["diagnostics"]["scene_point_count"], 0)
 
     def test_synthetic_mode_authorizes_confirmed_demo_point_hazard(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
@@ -284,6 +342,31 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             "forward-major_lateral-minor",
         )
         self.assertEqual(set(base64.b64decode(scene["grid"]["data_base64"])), {0})
+
+    def test_scene_v1_declares_robot_relative_pose_and_exact_grid_geometry(self):
+        scene = calibrated_estimator().snapshot()
+
+        self.assertEqual(scene["schema_version"], 1)
+        self.assertEqual(scene["pose_mode"], "robot_relative")
+        self.assertEqual(
+            {
+                key: scene["grid"][key]
+                for key in (
+                    "resolution_m",
+                    "forward_cells",
+                    "lateral_cells",
+                    "origin_forward_cell",
+                    "origin_lateral_cell",
+                )
+            },
+            {
+                "resolution_m": 0.05,
+                "forward_cells": 60,
+                "lateral_cells": 60,
+                "origin_forward_cell": 0,
+                "origin_lateral_cell": 30,
+            },
+        )
 
     def test_heatmap_never_invents_height(self):
         estimator = calibrated_estimator()
@@ -422,7 +505,7 @@ class RadarSceneEstimatorTests(unittest.TestCase):
                 {"calibration_required", "profile_mismatch"},
             )
             self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
-            self.assertTrue(scene["tracks"])
+            self.assertFalse(scene["tracks"])
 
     def test_zero_returns_and_heatmap_only_evidence_remain_unknown(self):
         estimator = calibrated_estimator()
@@ -540,7 +623,7 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             scene["calibration_status"],
             "calibration_unavailable",
         )
-        self.assertTrue(scene["tracks"][0]["point_confirmed"])
+        self.assertFalse(scene["tracks"])
         self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
 
     def test_reset_and_producer_change_clear_confirmation_and_latch(self):

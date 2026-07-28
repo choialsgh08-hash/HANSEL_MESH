@@ -183,10 +183,13 @@ class RadarSceneEstimator:
         self._last_reset_reason: Optional[str] = None
 
     def reset(self, reason: str) -> None:
+        self._clear_evidence(reason)
+        self._producer_id = None
+
+    def _clear_evidence(self, reason: str) -> None:
         self._tracks.clear()
         self._next_track_id = 1
         self._hazard_evaluator.reset()
-        self._producer_id = None
         self._scene_point_count = 0
         self._clutter_points_rejected = 0
         self._heatmap_cells_accepted = 0
@@ -212,6 +215,10 @@ class RadarSceneEstimator:
         }:
             self.reset(frame.frame_transition)
         self._producer_id = producer_id
+        self._calibration_status = self._binding_status(frame)
+        if self._calibration_status not in TRUSTED_CALIBRATION_STATUSES:
+            self._clear_evidence(self._calibration_status)
+            return
         self._expire_tracks(now)
         elapsed_frame_windows = min(
             3,
@@ -224,7 +231,6 @@ class RadarSceneEstimator:
             del hits[:-3]
             track["point_confirmed"] = sum(hits) >= 2
             track["_updated_by_point"] = False
-        self._calibration_status = self._binding_status(frame)
         point_count = 0
         rejected = 0
         heatmap_count = 0
@@ -379,6 +385,7 @@ class RadarSceneEstimator:
                 )
         return {
             "schema_version": SCENE_SCHEMA_VERSION,
+            "pose_mode": "robot_relative",
             "calibration_status": self._calibration_status,
             "grid": {
                 "resolution_m": GRID_RESOLUTION_M,

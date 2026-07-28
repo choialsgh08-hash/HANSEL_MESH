@@ -438,6 +438,90 @@ class RadarFrontStateTests(unittest.TestCase):
         self.assertEqual(snapshot["frame"]["number"], 1)
         self.assertEqual(snapshot["counters"]["incomplete_frames"], 1)
 
+    def test_incomplete_duplicate_immediately_clears_scene_evidence(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=2,
+            )
+        )
+        self.assertEqual(
+            state.snapshot()["scene"]["hazard"]["level"],
+            "NORMAL",
+        )
+
+        clock.value += 0.1
+        self.assertFalse(
+            state.ingest(
+                radar_frame(
+                    [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                    frame_number=2,
+                    complete=False,
+                    transition="duplicate",
+                )
+            )
+        )
+        snapshot = state.snapshot()
+
+        self.assertEqual(snapshot["status"], "degraded")
+        self.assertFalse(snapshot["scene"]["tracks"])
+        self.assertEqual(snapshot["scene"]["hazard"]["level"], "UNKNOWN")
+        self.assertEqual(
+            snapshot["scene"]["diagnostics"]["last_reset_reason"],
+            "duplicate",
+        )
+
+    def test_first_complete_frame_after_incomplete_reset_is_retained(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+                complete=False,
+                transition="reset_or_out_of_order",
+            )
+        )
+
+        clock.value += 0.1
+        self.assertTrue(
+            state.ingest(
+                radar_frame(
+                    [RadarPoint(0.0, 0.25, 0.0, 0.0)],
+                    frame_number=2,
+                )
+            )
+        )
+        scene = state.snapshot()["scene"]
+
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertAlmostEqual(scene["tracks"][0]["distance_m"], 0.25)
+        self.assertFalse(scene["tracks"][0]["point_confirmed"])
+
     def test_sensor_sequence_gap_marks_live_view_degraded(self):
         clock = FakeClock()
         state = RadarFrontState("follow", clock=clock)
@@ -845,6 +929,10 @@ class RadarFrontHttpTests(unittest.TestCase):
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
+            self.assertEqual(
+                payload["scene"]["pose_mode"],
+                "robot_relative",
+            )
             with urlopen(base + "/", timeout=2) as response:
                 html = response.read().decode("utf-8")
             with urlopen(base + "/radar_panel.js", timeout=2) as response:

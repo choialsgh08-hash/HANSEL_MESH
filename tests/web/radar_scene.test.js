@@ -25,11 +25,12 @@ function makeGrid(forwardCells = 2, lateralCells = 3) {
 }
 
 function makeSnapshot(overrides = {}) {
-  const grid = makeGrid(2, 2).payload;
+  const grid = makeGrid(60, 60).payload;
   const snapshot = {
     status: "live",
     scene: {
       schema_version: 1,
+      pose_mode: "robot_relative",
       calibration_status: "ok",
       grid,
       tracks: [],
@@ -107,6 +108,44 @@ test("rejects an unsupported scene schema", () => {
   );
 });
 
+test("requires the robot-relative pose contract and returns validated pose", () => {
+  const parsed = sceneApi.parseRadarScene(makeSnapshot());
+  assert.equal(parsed.poseMode, "robot_relative");
+
+  for (const poseMode of [undefined, null, "motion_compensated"]) {
+    assert.throws(
+      () => sceneApi.parseRadarScene(makeSnapshot({
+        scene: { pose_mode: poseMode },
+      })),
+      /pose contract/,
+      String(poseMode),
+    );
+  }
+});
+
+test("rejects each scene-v1 grid metadata mismatch independently", async (t) => {
+  const mismatches = [
+    ["resolution_m", 0.1],
+    ["forward_cells", 59],
+    ["lateral_cells", 61],
+    ["origin_forward_cell", 1],
+    ["origin_lateral_cell", 29],
+    ["encoding", "occupancy-u8"],
+    ["layout", "lateral-major_forward-minor"],
+    ["unknown_value", 255],
+  ];
+  for (const [field, value] of mismatches) {
+    await t.test(field, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.grid = { ...snapshot.scene.grid, [field]: value };
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /scene grid contract/,
+      );
+    });
+  }
+});
+
 test("blocks waiting, stale, fault, and replay-ended sources", () => {
   for (const status of ["waiting", "stale", "fault", "replay_end"]) {
     const parsed = sceneApi.parseRadarScene(makeSnapshot({ status }));
@@ -138,6 +177,23 @@ test("blocks all non-renderable calibration states", () => {
     assert.equal(parsed.blocked, true, calibrationStatus);
     assert.equal(parsed.reason, calibrationStatus);
   }
+});
+
+test("blocks a trusted live scene whose hazard reports SENSOR_FAULT", () => {
+  const parsed = sceneApi.parseRadarScene(makeSnapshot({
+    status: "live",
+    scene: {
+      calibration_status: "ok",
+      hazard: {
+        level: "SENSOR_FAULT",
+        threshold_m: 0.1,
+        reason: "source_fault",
+      },
+    },
+  }));
+
+  assert.equal(parsed.blocked, true);
+  assert.equal(parsed.reason, "sensor_fault");
 });
 
 test("rejects hazard levels outside the scene vocabulary", () => {
@@ -282,4 +338,60 @@ test("exposes its UMD API and decodes through the browser atob branch", () => {
   });
   assert.equal(browserGlobal.HanselRadarScene.TRACK_MAX_AGE_MS, 300);
   assert.equal(bytes[0], 0);
+});
+
+test("panel diagnostics reads pose only from the validated presentation", () => {
+  const elements = new Map();
+  const document = {
+    querySelector(selector) {
+      if (!elements.has(selector)) {
+        elements.set(selector, {
+          dataset: {},
+          hidden: false,
+          textContent: "",
+        });
+      }
+      return elements.get(selector);
+    },
+  };
+  const browserGlobal = {
+    document,
+    window: {
+      HanselRadarScene: sceneApi,
+    },
+  };
+  const source = fs.readFileSync(
+    require.resolve("../../monitor/web/radar_panel.js"),
+    "utf8",
+  );
+  vm.runInNewContext(source, browserGlobal);
+  const panel = Object.create(browserGlobal.window.HanselRadarPanel.prototype);
+  panel.snapshot = {
+    axes: {
+      forward_axis: "y",
+      forward_sign: 1,
+      lateral_axis: "x",
+      lateral_sign: 1,
+    },
+    frame: null,
+    scene: {
+      pose_mode: "motion_compensated",
+      calibration_status: "ok",
+      diagnostics: {},
+    },
+    counters: {},
+  };
+
+  panel.updateDiagnostics({
+    blocked: false,
+    poseMode: "robot_relative",
+    tracks: [],
+    grid: new Uint8Array(3600),
+    hazard: { level: "UNKNOWN" },
+  });
+
+  assert.equal(
+    elements.get("#pose-mode-value").textContent,
+    "ROBOT RELATIVE",
+  );
 });

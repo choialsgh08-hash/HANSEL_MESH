@@ -203,6 +203,8 @@ class RadarFrontState:
             }:
                 self._device_discontinuities_total += 1
                 self._degraded_reason = "device_frame_discontinuity"
+                if not record.complete:
+                    self.scene_estimator.reset(record.frame_transition)
 
             if not record.complete:
                 self._incomplete_frames += 1
