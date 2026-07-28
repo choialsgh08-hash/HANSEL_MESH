@@ -3,6 +3,7 @@ import subprocess
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from sensors.ti_radar_control import (
     find_xds110_reset,
@@ -92,12 +93,14 @@ class TiRadarControlTest(unittest.TestCase):
             (older / "xds110reset.exe").touch()
             expected = newer / "xds110reset.exe"
             expected.touch()
-            self.assertEqual(find_xds110_reset(None, [root]), expected)
+            with patch("sensors.ti_radar_control.shutil.which", return_value=None):
+                self.assertEqual(find_xds110_reset(None, [root]), expected)
 
     def test_find_xds110_reset_reports_missing_tool(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            with self.assertRaisesRegex(RuntimeError, "xds110reset"):
-                find_xds110_reset(None, [Path(temporary_directory)])
+            with patch("sensors.ti_radar_control.shutil.which", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "xds110reset"):
+                    find_xds110_reset(None, [Path(temporary_directory)])
 
     def test_reset_xds110_target_scopes_toggle_to_serial_number(self):
         reset_executable = Path("C:/tools/xds110reset.exe")
