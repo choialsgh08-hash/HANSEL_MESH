@@ -1,5 +1,7 @@
 import json
 import base64
+import contextlib
+import io
 from pathlib import Path
 import tempfile
 import threading
@@ -14,15 +16,19 @@ from common.sensor_contract import (
     SensorHeader,
     SensorHealth,
 )
+from common.radar_geometry import RadarAxes as CommonRadarAxes
 from sensors.mission_log import encode_log_entry
+from sensors.radar_calibration import RadarClutterModel
 from monitor.radar_front import (
     MissionLogFollower,
     RadarAxes,
     RadarFrontState,
     build_handler,
+    main,
     make_demo_frame,
     parse_args,
 )
+from monitor.radar_scene import RadarSceneEstimator
 from http.server import ThreadingHTTPServer
 
 
@@ -60,6 +66,27 @@ def radar_frame(
     )
 
 
+def calibrated_scene_estimator(
+    profile_id="test-profile",
+) -> RadarSceneEstimator:
+    return RadarSceneEstimator(
+        RadarAxes(),
+        RadarClutterModel(
+            schema_version=1,
+            calibration_id="radar-clutter-front-test",
+            profile_id=profile_id,
+            axes=RadarAxes(),
+            range_bins=2,
+            azimuth_bins=2,
+            range_step_m=0.05,
+            motion_mode="major",
+            point_clusters=(),
+            heatmap_median_db=(0.0, 0.0, 0.0, 0.0),
+            heatmap_mad_db=(0.0, 0.0, 0.0, 0.0),
+        ),
+    )
+
+
 class FakeClock:
     def __init__(self, value=10.0):
         self.value = value
@@ -69,6 +96,229 @@ class FakeClock:
 
 
 class RadarFrontStateTests(unittest.TestCase):
+    def test_radar_axes_is_reexported_from_common_geometry(self):
+        self.assertIs(RadarAxes, CommonRadarAxes)
+
+    def test_snapshot_exposes_scene_and_retains_three_metre_point(self):
+        state = RadarFrontState(
+            "test",
+            max_range_m=3.0,
+            scene_estimator=calibrated_scene_estimator(),
+            clock=FakeClock(),
+        )
+        state.ingest(radar_frame([RadarPoint(0.0, 2.99, 0.0, 0.0)]))
+
+        snapshot = state.snapshot()
+
+        self.assertEqual(snapshot["scene"]["schema_version"], 1)
+        self.assertTrue(
+            any(
+                track["distance_m"] > 2.9
+                for track in snapshot["scene"]["tracks"]
+            )
+        )
+
+    def test_scene_ingests_complete_frame_before_display_limits(self):
+        state = RadarFrontState(
+            "test",
+            max_points=1,
+            max_range_m=1.0,
+            scene_estimator=calibrated_scene_estimator(),
+            clock=FakeClock(),
+        )
+        state.ingest(
+            radar_frame(
+                [
+                    RadarPoint(0.0, 0.5, 0.0, 0.0),
+                    RadarPoint(0.0, 2.99, 0.0, 0.0),
+                ]
+            )
+        )
+
+        snapshot = state.snapshot()
+
+        self.assertEqual(snapshot["frame"]["display_point_count"], 1)
+        self.assertEqual(len(snapshot["scene"]["tracks"]), 2)
+        self.assertTrue(
+            any(
+                track["distance_m"] > 2.9
+                for track in snapshot["scene"]["tracks"]
+            )
+        )
+
+    def test_state_status_fault_overrides_scene_hazard(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                frame_number=2,
+            )
+        )
+        self.assertEqual(
+            state.snapshot()["scene"]["hazard"]["level"],
+            "DANGER",
+        )
+
+        clock.value += 2.1
+        scene = state.snapshot()["scene"]
+
+        self.assertEqual(scene["hazard"]["level"], "SENSOR_FAULT")
+        self.assertFalse(scene["tracks"])
+
+    def test_demo_scene_is_explicitly_synthetic_not_calibration_required(self):
+        state = RadarFrontState("demo", clock=FakeClock())
+        state.ingest(make_demo_frame(1, 1, seed=6432))
+
+        self.assertEqual(
+            state.snapshot()["scene"]["calibration_status"],
+            "synthetic",
+        )
+
+    def test_follow_and_replay_without_model_remain_untrusted(self):
+        for source_mode in ("follow", "replay"):
+            with self.subTest(source_mode=source_mode):
+                clock = FakeClock()
+                state = RadarFrontState(source_mode, clock=clock)
+                state.ingest(
+                    radar_frame(
+                        [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                        frame_number=1,
+                    )
+                )
+                clock.value += 0.1
+                state.ingest(
+                    radar_frame(
+                        [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                        frame_number=2,
+                    )
+                )
+
+                scene = state.snapshot()["scene"]
+
+                self.assertEqual(
+                    scene["calibration_status"],
+                    "calibration_required",
+                )
+                self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
+
+    def test_profile_mismatch_stays_running_and_fails_closed(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "follow",
+            scene_estimator=calibrated_scene_estimator(
+                profile_id="different-profile"
+            ),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                frame_number=2,
+            )
+        )
+
+        snapshot = state.snapshot()
+
+        self.assertEqual(snapshot["status"], "live")
+        self.assertEqual(
+            snapshot["scene"]["calibration_status"],
+            "profile_mismatch",
+        )
+        self.assertEqual(snapshot["scene"]["hazard"]["level"], "UNKNOWN")
+
+    def test_replay_loop_restart_clears_scene_once_then_accepts_new_frame(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "replay",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=clock,
+        )
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                frame_number=2,
+            )
+        )
+        self.assertEqual(
+            state.snapshot()["scene"]["hazard"]["level"],
+            "DANGER",
+        )
+
+        state.reset_sensor_sequence_tracking()
+        reset_scene = state.snapshot()["scene"]
+
+        self.assertFalse(reset_scene["tracks"])
+        self.assertEqual(
+            reset_scene["diagnostics"]["last_reset_reason"],
+            "replay_loop_restart",
+        )
+
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.20, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        restarted_scene = state.snapshot()["scene"]
+
+        self.assertEqual(len(restarted_scene["tracks"]), 1)
+        self.assertAlmostEqual(restarted_scene["tracks"][0]["distance_m"], 0.20)
+
+    def test_scene_extension_retains_legacy_snapshot_fields(self):
+        state = RadarFrontState(
+            "test",
+            scene_estimator=calibrated_scene_estimator(),
+            clock=FakeClock(),
+        )
+        state.ingest(radar_frame([RadarPoint(0.0, 0.5, 0.0, 0.0)]))
+
+        snapshot = state.snapshot()
+
+        for field in (
+            "version",
+            "ui_build_id",
+            "status",
+            "warning",
+            "source",
+            "age_ms",
+            "fps",
+            "axes",
+            "limits",
+            "frame",
+            "occupancy",
+            "counters",
+            "health",
+        ):
+            self.assertIn(field, snapshot)
+        self.assertIn("scene", snapshot)
+
     def test_default_ti_axes_map_y_forward_and_x_right(self):
         clock = FakeClock()
         state = RadarFrontState("test", clock=clock)
@@ -523,8 +773,12 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/api/radar", timeout=2) as response:
                 payload = json.load(response)
             self.assertEqual(payload["version"], 1)
-            self.assertEqual(payload["ui_build_id"], "20260726-depth-camera-r8")
+            self.assertEqual(
+                payload["ui_build_id"],
+                "20260728-lidar-operator-r9",
+            )
             self.assertEqual(payload["frame"]["number"], 7)
+            self.assertEqual(payload["scene"]["schema_version"], 1)
             with urlopen(base + "/", timeout=2) as response:
                 html = response.read().decode("utf-8")
             with urlopen(base + "/radar_panel.js", timeout=2) as response:
@@ -592,6 +846,34 @@ class RadarFrontHttpTests(unittest.TestCase):
     def test_cli_accepts_short_history_for_sharp_mapping(self):
         args = parse_args(["--demo", "--history-window", "0.2"])
         self.assertEqual(args.history_window, 0.2)
+
+    def test_cli_accepts_clutter_calibration_path(self):
+        args = parse_args(
+            ["--demo", "--clutter-calibration", "model.json"]
+        )
+        self.assertEqual(args.clutter_calibration, "model.json")
+
+    def test_cli_defaults_main_range_to_three_metres(self):
+        args = parse_args(["--demo"])
+        self.assertEqual(args.max_range_m, 3.0)
+
+    def test_corrupt_clutter_model_fails_through_cli_error_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "corrupt.json"
+            path.write_text("{not-json", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                result = main(
+                    [
+                        "--demo",
+                        "--clutter-calibration",
+                        str(path),
+                    ]
+                )
+
+        self.assertEqual(result, 1)
+        self.assertIn("invalid clutter model JSON", stderr.getvalue())
 
 
 if __name__ == "__main__":

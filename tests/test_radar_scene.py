@@ -184,6 +184,30 @@ def saturated_near_heatmap_frame(frame_index: int) -> RadarFrame:
 
 
 class RadarSceneEstimatorTests(unittest.TestCase):
+    def test_existing_positional_clock_argument_remains_compatible(self):
+        clock = lambda: 4.0
+        estimator = RadarSceneEstimator(RadarAxes(), None, True, clock)
+        estimator.ingest(point_frame(0.30))
+
+        scene = estimator.snapshot()
+
+        self.assertEqual(
+            scene["calibration_status"],
+            "calibration_required",
+        )
+        self.assertEqual(len(scene["tracks"]), 1)
+
+    def test_synthetic_mode_authorizes_confirmed_demo_point_hazard(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator.ingest(point_frame(0.09, frame_number=1), received_at=5.0)
+        estimator.ingest(point_frame(0.09, frame_number=2), received_at=5.1)
+
+        scene = estimator.snapshot(now=5.1)
+
+        self.assertEqual(scene["calibration_status"], "synthetic")
+        self.assertTrue(scene["tracks"][0]["point_confirmed"])
+        self.assertEqual(scene["hazard"]["level"], "DANGER")
+
     def test_hazard_evaluator_releases_latch_at_track_age_300ms(self):
         evaluator = RadarHazardEvaluator()
         track = {

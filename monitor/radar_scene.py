@@ -34,6 +34,7 @@ FAULT_SOURCE_STATUSES = {
     "replay_end",
     "replay_loop_restart",
 }
+TRUSTED_CALIBRATION_STATUSES = {"ok", "synthetic"}
 
 
 class RadarHazardEvaluator:
@@ -60,7 +61,7 @@ class RadarHazardEvaluator:
                 None,
                 f"source_{source_status}",
             )
-        if calibration_status != "ok":
+        if calibration_status not in TRUSTED_CALIBRATION_STATUSES:
             self.reset()
             return self._result(
                 "UNKNOWN",
@@ -155,14 +156,18 @@ class RadarSceneEstimator:
         clutter_model: Optional[RadarClutterModel] = None,
         require_calibration: bool = True,
         clock: Callable[[], float] = time.monotonic,
+        synthetic: bool = False,
     ) -> None:
         self.axes = axes
         self.clutter_model = clutter_model
         self.require_calibration = require_calibration
+        self.synthetic = synthetic
         self._clock = clock
         self._tracks: List[Dict[str, object]] = []
         self._next_track_id = 1
-        if clutter_model is None:
+        if synthetic:
+            self._calibration_status = "synthetic"
+        elif clutter_model is None:
             self._calibration_status = (
                 "calibration_required"
                 if require_calibration
@@ -402,6 +407,8 @@ class RadarSceneEstimator:
         }
 
     def _binding_status(self, frame: RadarFrame) -> str:
+        if self.synthetic:
+            return "synthetic"
         if self.clutter_model is None:
             return (
                 "calibration_required"

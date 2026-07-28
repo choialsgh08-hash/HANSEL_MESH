@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
-from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -30,67 +29,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from common.radar_geometry import RadarAxes  # noqa: E402
 from common.sensor_contract import (  # noqa: E402
     RadarFrame,
     RadarPoint,
     SensorHeader,
     SensorHealth,
 )
+from monitor.radar_scene import RadarSceneEstimator  # noqa: E402
 from sensors.mission_log import (  # noqa: E402
     DEFAULT_MAX_LINE_BYTES,
     decode_log_entry,
     iter_replay,
 )
+from sensors.radar_calibration import load_clutter_model  # noqa: E402
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
-UI_BUILD_ID = "20260726-depth-camera-r8"
+UI_BUILD_ID = "20260728-lidar-operator-r9"
 RADAR_VALID_MIN_RANGE_M = 0.07
-
-
-@dataclass(frozen=True)
-class RadarAxes:
-    """Map TI/native x-y values into screen forward/lateral coordinates.
-
-    The IWRL6432 demo convention is X right and Y forward.  ``lateral_m`` in
-    the web API is positive to screen/robot right.
-    """
-
-    forward_axis: str = "y"
-    forward_sign: int = 1
-    lateral_axis: str = "x"
-    lateral_sign: int = 1
-
-    def __post_init__(self) -> None:
-        if self.forward_axis not in {"x", "y"}:
-            raise ValueError("forward_axis must be x or y")
-        if self.lateral_axis not in {"x", "y"}:
-            raise ValueError("lateral_axis must be x or y")
-        if self.forward_axis == self.lateral_axis:
-            raise ValueError("forward_axis and lateral_axis must differ")
-        if self.forward_sign not in {-1, 1}:
-            raise ValueError("forward_sign must be -1 or 1")
-        if self.lateral_sign not in {-1, 1}:
-            raise ValueError("lateral_sign must be -1 or 1")
-
-    def map_point(self, point: RadarPoint) -> Tuple[float, float]:
-        values = {"x": point.x_m, "y": point.y_m}
-        return (
-            values[self.forward_axis] * self.forward_sign,
-            values[self.lateral_axis] * self.lateral_sign,
-        )
-
-    def to_dict(self) -> Dict[str, object]:
-        return {
-            "forward_axis": self.forward_axis,
-            "forward_sign": self.forward_sign,
-            "lateral_axis": self.lateral_axis,
-            "lateral_sign": self.lateral_sign,
-            "lateral_positive": "right",
-            "frame": "robot_relative_uncalibrated",
-        }
 
 
 class RadarFrontState:
@@ -101,12 +60,13 @@ class RadarFrontState:
         source_mode: str,
         axes: RadarAxes = RadarAxes(),
         max_points: int = 2048,
-        max_range_m: float = 20.0,
+        max_range_m: float = 3.0,
         min_forward_m: float = 0.0,
-        history_window_s: float = 0.2,
+        history_window_s: float = 0.3,
         stale_after_s: float = 0.75,
         fault_after_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
+        scene_estimator: Optional[RadarSceneEstimator] = None,
     ) -> None:
         if max_points < 1:
             raise ValueError("max_points must be positive")
@@ -135,6 +95,13 @@ class RadarFrontState:
         self.stale_after_s = stale_after_s
         self.fault_after_s = fault_after_s
         self._clock = clock
+        self.scene_estimator = scene_estimator or RadarSceneEstimator(
+            axes=axes,
+            clutter_model=None,
+            require_calibration=(source_mode != "demo"),
+            synthetic=(source_mode == "demo"),
+            clock=clock,
+        )
         self._lock = threading.Lock()
         self._frame: Optional[Dict[str, object]] = None
         self._frame_received_at: Optional[float] = None
@@ -242,6 +209,7 @@ class RadarFrontState:
                 self._degraded_reason = "incomplete_point_cloud"
                 return False
 
+            self.scene_estimator.ingest(record, received_at=now)
             mapped: List[Tuple[float, List[Optional[float]]]] = []
             for point in record.points:
                 forward_m, lateral_m = self.axes.map_point(point)
@@ -522,6 +490,7 @@ class RadarFrontState:
 
         with self._lock:
             self._last_sensor_seq_by_producer.clear()
+            self.scene_estimator.reset("replay_loop_restart")
 
     def note_parse_error(self, detail: str) -> None:
         with self._lock:
@@ -580,6 +549,10 @@ class RadarFrontState:
                 status = "live"
 
             warning = self._warning_for(status, frame)
+            scene = self.scene_estimator.snapshot(
+                source_status=status,
+                now=current,
+            )
             return {
                 "version": API_VERSION,
                 "ui_build_id": UI_BUILD_ID,
@@ -608,6 +581,7 @@ class RadarFrontState:
                 },
                 "frame": frame,
                 "occupancy": occupancy,
+                "scene": scene,
                 "counters": {
                     "frames_received": self._frames_received,
                     "valid_frames": self._valid_frames,
@@ -1082,7 +1056,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8081)
     parser.add_argument("--max-points", type=int, default=2048)
-    parser.add_argument("--max-range-m", type=float, default=20.0)
+    parser.add_argument("--max-range-m", type=float, default=3.0)
     parser.add_argument("--min-forward-m", type=float, default=0.0)
     parser.add_argument(
         "--history-window",
@@ -1128,6 +1102,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--loop",
         action="store_true",
         help="loop completed replay input",
+    )
+    parser.add_argument(
+        "--clutter-calibration",
+        help="profile-bound radar self-clutter calibration JSON",
     )
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -1177,6 +1155,17 @@ def run(args: argparse.Namespace) -> int:
         lateral_sign=args.lateral_sign,
     )
     mode = "demo" if args.demo else ("follow" if args.follow else "replay")
+    clutter_model = (
+        None
+        if args.clutter_calibration is None
+        else load_clutter_model(Path(args.clutter_calibration))
+    )
+    scene_estimator = RadarSceneEstimator(
+        axes=axes,
+        clutter_model=clutter_model,
+        require_calibration=(mode != "demo"),
+        synthetic=(mode == "demo"),
+    )
     state = RadarFrontState(
         source_mode=mode,
         axes=axes,
@@ -1186,6 +1175,7 @@ def run(args: argparse.Namespace) -> int:
         history_window_s=args.history_window,
         stale_after_s=args.stale_after,
         fault_after_s=args.fault_after,
+        scene_estimator=scene_estimator,
     )
     stop_event = threading.Event()
     if args.demo:
