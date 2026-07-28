@@ -972,6 +972,10 @@ def build_handler(
             "radar_panel.js",
             "text/javascript; charset=utf-8",
         ),
+        "/radar_scene.js": (
+            "radar_scene.js",
+            "text/javascript; charset=utf-8",
+        ),
     }
 
     class RadarRequestHandler(BaseHTTPRequestHandler):

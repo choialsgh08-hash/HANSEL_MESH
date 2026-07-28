@@ -783,45 +783,37 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html = response.read().decode("utf-8")
             with urlopen(base + "/radar_panel.js", timeout=2) as response:
                 javascript = response.read().decode("utf-8")
-            self.assertIn("전방 레이더", html)
+            with urlopen(base + "/radar_scene.js", timeout=2) as response:
+                scene_javascript = response.read().decode("utf-8")
+            self.assertIn('id="radar-main-canvas"', html)
+            self.assertIn('id="collision-canvas"', html)
+            self.assertIn("0~3m LiDAR형 전방 점유 지도", html)
+            self.assertIn("0~50cm 충돌 확대", html)
             self.assertIn("UNKNOWN ≠ FREE", html)
-            self.assertIn('option value="0.5" selected', html)
-            self.assertNotIn('option value="1"', html)
-            self.assertNotIn('option value="3"', html)
-            self.assertIn('option value="camera" selected', html)
-            self.assertIn('option value="perspective"', html)
-            self.assertIn("0~50cm 흑백 깊이 영상 + 실측 거리/높이", html)
-            self.assertIn("outline-toggle", html)
-            self.assertIn("안전 경계 빨강: 10cm 이하", html)
-            self.assertIn("UI R8", html)
-            self.assertIn("3D 반구 포인트 맵", html)
+            self.assertIn("ROBOT RELATIVE", html)
+            self.assertIn("/radar_scene.js", html)
             self.assertIn("fullscreen-button", html)
             self.assertIn("HanselRadarPanel", javascript)
-            self.assertIn("data_base64", javascript)
-            self.assertIn("Math.asin", javascript)
-            self.assertIn("drawPerspectiveHeatmap", javascript)
-            self.assertIn("drawPerspectivePoints", javascript)
-            self.assertIn("drawPerspectiveOutline", javascript)
-            self.assertIn("strokeHemisphereLatitude", javascript)
-            self.assertIn("strokeHemisphereMeridian", javascript)
-            self.assertIn("worldSpherical", javascript)
+            self.assertIn("HanselRadarScene.parseRadarScene", javascript)
+            self.assertIn("drawLidarTopView", javascript)
+            self.assertIn("drawCollisionInset", javascript)
             self.assertIn("DANGER_RANGE_M = 0.1", javascript)
-            self.assertIn("CAUTION_RANGE_M = 0.25", javascript)
-            self.assertIn("drawPerspectiveSafetyZones", javascript)
-            self.assertIn("drawPerspectiveSurfaceMesh", javascript)
-            self.assertIn("heatmapColor", javascript)
             self.assertIn("UI_BUILD_ID", javascript)
-            self.assertIn("drawDepthCamera", javascript)
-            self.assertIn("depthContourCandidates", javascript)
-            self.assertIn("stableDepthContour", javascript)
-            self.assertIn("WALL_TRACK_HOLD_MS = 900", javascript)
             self.assertIn("requestFullscreen", javascript)
-            self.assertIn("project3d", javascript)
-            self.assertIn("height: Number(point[2])", javascript)
-            self.assertIn("disabled_nondefault_axes", javascript)
-            self.assertIn("floorDb +", javascript)
+            for forbidden in (
+                "drawDepthCamera",
+                "drawPerspectiveSurfaceMesh",
+                "wallHeight",
+                "depthContourCandidates",
+                "WALL_TRACK_HOLD_MS",
+                "CAUTION_RANGE_M",
+            ):
+                self.assertNotIn(forbidden, javascript)
+            for forbidden in ("view-select", "outline-toggle"):
+                self.assertNotIn(forbidden, html)
             self.assertNotIn("https://", html)
             self.assertNotIn("https://", javascript)
+            self.assertNotIn("https://", scene_javascript)
         finally:
             server.shutdown()
             server.server_close()
