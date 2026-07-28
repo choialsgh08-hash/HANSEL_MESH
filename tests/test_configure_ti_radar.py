@@ -1,8 +1,11 @@
 import importlib.util
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
+
+from sensors import ti_radar_control
 
 
 SCRIPT = (
@@ -18,6 +21,24 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ConfigureTiRadarTest(unittest.TestCase):
+    def test_wrapper_reexports_profile_control_objects(self):
+        self.assertIs(MODULE.ProfileCommands, ti_radar_control.ProfileCommands)
+        self.assertIs(MODULE.load_commands, ti_radar_control.load_commands)
+        self.assertIs(MODULE.partition_at_baud, ti_radar_control.partition_at_baud)
+        self.assertIs(MODULE.apply_profile, ti_radar_control.apply_profile)
+
+    def test_help_runs_outside_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPT), "--help"],
+                cwd=directory,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Apply an xWRL6432 CLI profile", completed.stdout)
+
     def test_low_latency_profile_is_10hz_with_16_azimuth_bins(self):
         cfg = (
             Path(__file__).resolve().parent.parent
