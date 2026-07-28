@@ -146,14 +146,42 @@ class RadarStackProcessesTests(unittest.TestCase):
             self.assertTrue(paths.capture_stdout.parent.exists())
             self.assertEqual(child.role, "capture")
             self.assertEqual(started[0][1]["cwd"], self.root)
-            self.assertIsNotNone(started[0][1]["stdout"])
-            self.assertIsNotNone(started[0][1]["stderr"])
+            self.assertEqual(
+                Path(started[0][1]["stdout"].name), paths.capture_stdout
+            )
+            self.assertEqual(
+                Path(started[0][1]["stderr"].name), paths.capture_stderr
+            )
+            self.assertTrue(started[0][1]["stdout"].closed)
+            self.assertTrue(started[0][1]["stderr"].closed)
             if os.name == "nt":
                 self.assertEqual(
                     started[0][1]["creationflags"],
                     subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
                 )
             manager.stop_owned_children()
+
+    def test_start_capture_uses_posix_session_when_selected(self):
+        process = FakeProcess(pid=82, poll_result=0)
+        started = []
+        manager = RadarStackProcesses(
+            popen_factory=lambda command, **kwargs: started.append(kwargs) or process
+        )
+        with mock.patch("sensors.radar_stack_processes.os.name", "posix"):
+            manager.start_capture(self.port, self.paths, self.config)
+
+        self.assertTrue(started[0]["start_new_session"])
+
+    def test_stop_uses_windows_ctrl_break_before_waiting(self):
+        process = FakeProcess(waits=(0,))
+        child = ManagedChild("capture", process)
+        with mock.patch("sensors.radar_stack_processes.os.name", "nt"), mock.patch(
+            "sensors.radar_stack_processes.signal.CTRL_BREAK_EVENT", 41, create=True
+        ):
+            result = child.stop(0.25)
+
+        self.assertEqual(result.escalation, "graceful")
+        self.assertEqual(process.events, [("send_signal", 41), ("wait", 0.25)])
 
     def test_stop_uses_posix_interrupt_before_terminate_or_kill(self):
         process = FakeProcess(waits=(0,))
@@ -210,6 +238,72 @@ class RadarStackProcessesTests(unittest.TestCase):
         replacement = ManagedChild("capture", FakeProcess(pid=12))
         with self.assertRaisesRegex(RuntimeError, "unregistered"):
             manager.stop_child(replacement)
+
+    def test_manager_rejects_same_wrapper_with_replaced_process_before_signal(self):
+        original = FakeProcess(pid=16, poll_result=0)
+        replacement = FakeProcess(pid=16, poll_result=0)
+        manager = RadarStackProcesses(popen_factory=lambda *args, **kwargs: original)
+        child = manager.start_capture(self.port, self.paths, self.config)
+        child.process = replacement
+
+        with self.assertRaisesRegex(RuntimeError, "unregistered"):
+            manager.stop_child(child)
+
+        self.assertEqual(original.events, [])
+        self.assertEqual(replacement.events, [])
+        child.process = original
+        self.assertEqual(manager.stop_owned_children()[0].pid, 16)
+
+    def test_duplicate_pid_registration_stops_new_process_before_raising(self):
+        existing = FakeProcess(pid=31, poll_result=0)
+        duplicate = FakeProcess(pid=31, waits=(0,))
+        processes = iter((existing, duplicate))
+        manager = RadarStackProcesses(
+            popen_factory=lambda *args, **kwargs: next(processes)
+        )
+        manager.start_capture(self.port, self.paths, self.config)
+
+        with mock.patch("sensors.radar_stack_processes.os.name", "nt"), mock.patch(
+            "sensors.radar_stack_processes.signal.CTRL_BREAK_EVENT", 41, create=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "duplicate owned process pid"):
+                manager.switch_viewer(None, self.paths, self.config)
+
+        self.assertEqual(duplicate.events, [("send_signal", 41), ("wait", 2.0)])
+        self.assertEqual(manager.stop_owned_children()[0].pid, 31)
+
+    def test_owned_shutdown_reports_failure_after_stopping_later_children(self):
+        first = FakeProcess(pid=51, waits=(RuntimeError("wait failed"), 7))
+        second = FakeProcess(pid=52, poll_result=0)
+        processes = iter((first, second))
+        manager = RadarStackProcesses(
+            popen_factory=lambda *args, **kwargs: next(processes)
+        )
+        with mock.patch("sensors.radar_stack_processes.os.name", "posix"), mock.patch(
+            "sensors.radar_stack_processes.os.killpg", create=True
+        ), mock.patch("sensors.radar_stack_processes.os.getpgid", return_value=9, create=True):
+            manager.start_capture(self.port, self.paths, self.config)
+            manager.switch_viewer(None, self.paths, self.config)
+            with self.assertRaises(RuntimeError) as raised:
+                manager.stop_owned_children()
+
+            self.assertEqual(raised.exception.results[0].pid, 52)
+            self.assertEqual(manager.stop_owned_children()[0].pid, 51)
+
+    def test_owned_shutdown_returns_all_successful_stop_results(self):
+        first = FakeProcess(pid=61, poll_result=0)
+        second = FakeProcess(pid=62, poll_result=3)
+        processes = iter((first, second))
+        manager = RadarStackProcesses(
+            popen_factory=lambda *args, **kwargs: next(processes)
+        )
+        manager.start_capture(self.port, self.paths, self.config)
+        manager.switch_viewer(None, self.paths, self.config)
+
+        self.assertEqual(
+            [(result.role, result.pid, result.exit_code) for result in manager.stop_owned_children()],
+            [("capture", 61, 0), ("viewer", 62, 3)],
+        )
 
     def test_stopped_child_is_not_stopped_twice_by_owned_shutdown(self):
         process = FakeProcess(pid=98, poll_result=0)

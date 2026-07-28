@@ -65,6 +65,34 @@ class ManagedChild:
         return ChildStopResult(self.role, self.process.pid, exit_code, escalation)
 
 
+@dataclass(frozen=True)
+class _RegisteredChild:
+    child: ManagedChild
+    process: subprocess.Popen
+    role: str
+    pid: int
+
+
+@dataclass(frozen=True)
+class _ChildStopFailure:
+    role: str
+    pid: int
+    error: BaseException
+
+
+class _OwnedChildrenStopError(RuntimeError):
+    """Reports failures after all owned children have been given a stop attempt."""
+
+    def __init__(
+        self,
+        failures: tuple[_ChildStopFailure, ...],
+        results: tuple[ChildStopResult, ...],
+    ) -> None:
+        super().__init__(f"failed to stop {len(failures)} owned radar child process(es)")
+        self.failures = failures
+        self.results = results
+
+
 def build_capture_command(
     port: RadarPortIdentity,
     paths: EpochPaths,
@@ -133,16 +161,20 @@ class RadarStackProcesses:
         popen_factory: Callable[..., subprocess.Popen] = subprocess.Popen,
     ) -> None:
         self._popen_factory = popen_factory
-        self._owned_by_identity: dict[int, ManagedChild] = {}
-        self._owned_by_pid: dict[int, ManagedChild] = {}
+        self._owned_by_identity: dict[int, _RegisteredChild] = {}
+        self._owned_by_pid: dict[int, _RegisteredChild] = {}
 
     def _register(self, child: ManagedChild) -> ManagedChild:
         if not child.owned:
             raise RuntimeError("refusing to register an unowned process")
-        if child.pid in self._owned_by_pid:
-            raise RuntimeError(f"duplicate owned process pid: {child.pid}")
-        self._owned_by_identity[id(child)] = child
-        self._owned_by_pid[child.pid] = child
+        process = child.process
+        pid = process.pid
+        role = child.role
+        if pid in self._owned_by_pid:
+            raise RuntimeError(f"duplicate owned process pid: {pid}")
+        registered = _RegisteredChild(child, process, role, pid)
+        self._owned_by_identity[id(child)] = registered
+        self._owned_by_pid[pid] = registered
         return child
 
     def _start(
@@ -174,7 +206,17 @@ class RadarStackProcesses:
                 stderr=stderr,
                 **popen_kwargs,
             )
-        return self._register(ManagedChild(role, process))
+        child = ManagedChild(role, process)
+        try:
+            return self._register(child)
+        except BaseException as registration_error:
+            try:
+                child.stop()
+            except BaseException as cleanup_error:
+                registration_error.add_note(
+                    "post-registration cleanup failed: " f"{cleanup_error!r}"
+                )
+            raise
 
     def start_capture(
         self,
@@ -210,17 +252,33 @@ class RadarStackProcesses:
         registered = self._owned_by_identity.get(id(child))
         if (
             not child.owned
-            or registered is not child
-            or self._owned_by_pid.get(child.pid) is not child
+            or registered is None
+            or registered.child is not child
+            or self._owned_by_pid.get(registered.pid) is not registered
+            or child.role != registered.role
+            or child.process is not registered.process
+            or child.pid != registered.pid
+            or registered.process.pid != registered.pid
         ):
             raise RuntimeError("refusing to signal an unregistered child")
-        result = child.stop()
+        result = ManagedChild(registered.role, registered.process).stop()
         del self._owned_by_identity[id(child)]
-        del self._owned_by_pid[child.pid]
+        del self._owned_by_pid[registered.pid]
         return result
 
     def stop_owned_children(self) -> tuple[ChildStopResult, ...]:
-        return tuple(self.stop_child(child) for child in tuple(self._owned_by_pid.values()))
+        results: list[ChildStopResult] = []
+        failures: list[_ChildStopFailure] = []
+        for registered in tuple(self._owned_by_pid.values()):
+            try:
+                results.append(self.stop_child(registered.child))
+            except BaseException as error:
+                failures.append(
+                    _ChildStopFailure(registered.role, registered.pid, error)
+                )
+        if failures:
+            raise _OwnedChildrenStopError(tuple(failures), tuple(results))
+        return tuple(results)
 
 
 __all__ = [
