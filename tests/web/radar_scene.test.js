@@ -2,6 +2,8 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
 const sceneApi = require("../../monitor/web/radar_scene.js");
 
 function makeGrid(forwardCells = 2, lateralCells = 3) {
@@ -113,6 +115,17 @@ test("blocks waiting, stale, fault, and replay-ended sources", () => {
   }
 });
 
+test("renders only live and degraded source statuses", () => {
+  for (const status of ["live", "degraded"]) {
+    assert.equal(sceneApi.parseRadarScene(makeSnapshot({ status })).blocked, false, status);
+  }
+  for (const status of [undefined, "ready", "future_status"]) {
+    const parsed = sceneApi.parseRadarScene(makeSnapshot({ status }));
+    assert.equal(parsed.blocked, true, String(status));
+    assert.equal(parsed.reason, status);
+  }
+});
+
 test("blocks all non-renderable calibration states", () => {
   for (const calibrationStatus of [
     "calibration_required",
@@ -127,6 +140,18 @@ test("blocks all non-renderable calibration states", () => {
   }
 });
 
+test("rejects hazard levels outside the scene vocabulary", () => {
+  for (const level of ["SAFE", "FREE", "unknown"]) {
+    assert.throws(
+      () => sceneApi.parseRadarScene(makeSnapshot({
+        scene: { hazard: { level, threshold_m: 0.1, reason: "forged" } },
+      })),
+      /hazard contract/,
+      level,
+    );
+  }
+});
+
 test("rejects DANGER when only a forged heatmap confirmation is inside threshold", () => {
   const snapshot = makeSnapshot({
     scene: {
@@ -136,12 +161,51 @@ test("rejects DANGER when only a forged heatmap confirmation is inside threshold
         source: "heatmap",
         point_confirmed: true,
         distance_m: 0.09,
+        forward_m: 0.09,
+        lateral_m: 0,
       }],
       hazard: { level: "DANGER", threshold_m: 0.1, reason: "confirmed" },
     },
   });
 
   assert.throws(() => sceneApi.parseRadarScene(snapshot), /DANGER contract/);
+});
+
+test("rejects DANGER backed by a negative point distance", () => {
+  const snapshot = makeSnapshot({
+    scene: {
+      tracks: [{
+        track_id: 10,
+        age_ms: 0,
+        source: "point",
+        point_confirmed: true,
+        distance_m: -1,
+        forward_m: 0,
+        lateral_m: 0,
+      }],
+      hazard: { level: "DANGER", threshold_m: 0.1, reason: "forged" },
+    },
+  });
+
+  assert.throws(() => sceneApi.parseRadarScene(snapshot), /DANGER contract/);
+});
+
+test("rejects a fresh track without finite map coordinates", () => {
+  const snapshot = makeSnapshot({
+    scene: {
+      tracks: [{
+        track_id: 11,
+        age_ms: 0,
+        source: "heatmap",
+        point_confirmed: false,
+        distance_m: 0.4,
+        forward_m: 0.4,
+        lateral_m: Infinity,
+      }],
+    },
+  });
+
+  assert.throws(() => sceneApi.parseRadarScene(snapshot), /track contract/);
 });
 
 test("renders a fresh confirmed point DANGER without mutating the snapshot", () => {
@@ -153,6 +217,8 @@ test("renders a fresh confirmed point DANGER without mutating the snapshot", () 
         source: "point",
         point_confirmed: true,
         distance_m: 0.1,
+        forward_m: 0.1,
+        lateral_m: 0,
       }],
       hazard: { level: "DANGER", threshold_m: 0.1, reason: "confirmed" },
     },
@@ -189,4 +255,31 @@ test("projects forward and lateral meters into a centered forward map", () => {
 
   assert.deepEqual(transform, { originX: 100, originY: 100, scale: 20 });
   assert.deepEqual(sceneApi.projectMapPoint(transform, 1.5, -2), { x: 60, y: 70 });
+});
+
+test("exposes its UMD API and decodes through the browser atob branch", () => {
+  const browserGlobal = {
+    atob: (text) => Buffer.from(text, "base64").toString("binary"),
+    btoa: (text) => Buffer.from(text, "binary").toString("base64"),
+  };
+  const source = fs.readFileSync(
+    require.resolve("../../monitor/web/radar_scene.js"),
+    "utf8",
+  );
+
+  vm.runInNewContext(source, browserGlobal);
+
+  const bytes = browserGlobal.HanselRadarScene.decodeOccupancyGrid({
+    encoding: "occupancy-u8-base64",
+    layout: "forward-major_lateral-minor",
+    unknown_value: 0,
+    resolution_m: 0.05,
+    forward_cells: 1,
+    lateral_cells: 1,
+    origin_forward_cell: 0,
+    origin_lateral_cell: 0,
+    data_base64: "AA==",
+  });
+  assert.equal(browserGlobal.HanselRadarScene.TRACK_MAX_AGE_MS, 300);
+  assert.equal(bytes[0], 0);
 });

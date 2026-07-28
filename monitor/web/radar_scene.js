@@ -9,6 +9,7 @@
 })(typeof globalThis === "object" ? globalThis : this, function () {
   "use strict";
   const TRACK_MAX_AGE_MS = 300;
+  const HAZARD_LEVELS = new Set(["DANGER", "NORMAL", "UNKNOWN", "SENSOR_FAULT"]);
 
   function decodeBase64(text) {
     if (typeof text !== "string" ||
@@ -63,21 +64,26 @@
     if (!scene || scene.schema_version !== 1) {
       throw new Error("unsupported scene schema");
     }
-    if (["waiting", "stale", "fault", "replay_end"].includes(snapshot.status)) {
+    if (!["live", "degraded"].includes(snapshot.status)) {
       return { blocked: true, reason: snapshot.status };
     }
     if (!["ok", "synthetic"].includes(scene.calibration_status)) {
       return { blocked: true, reason: scene.calibration_status };
     }
-    if (!scene.hazard || !Number.isFinite(scene.hazard.threshold_m) ||
+    if (!scene.hazard || !HAZARD_LEVELS.has(scene.hazard.level) ||
+        !Number.isFinite(scene.hazard.threshold_m) ||
         scene.hazard.threshold_m <= 0) {
       throw new Error("invalid hazard contract");
     }
     const tracks = filterFreshTracks(scene.tracks);
+    if (tracks.some((track) => !Number.isFinite(track.forward_m) ||
+        !Number.isFinite(track.lateral_m))) {
+      throw new Error("invalid track contract");
+    }
     if (scene.hazard.level === "DANGER" && !tracks.some(
       (track) => track.source === "point" &&
         track.point_confirmed === true &&
-        Number.isFinite(track.distance_m) &&
+        Number.isFinite(track.distance_m) && track.distance_m >= 0 &&
         track.distance_m <= scene.hazard.threshold_m,
     )) {
       throw new Error("DANGER contract is inconsistent");
