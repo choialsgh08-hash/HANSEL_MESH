@@ -22,6 +22,13 @@ _STABLE_METADATA_FIELDS = (
     "calibration_id",
     "baudrate",
 )
+_COMPATIBILITY_METADATA_FIELDS = (
+    "allow_elided_empty_point_tlv",
+    "allow_nonzero_padding",
+)
+_ALL_METADATA_FIELDS = (
+    _STABLE_METADATA_FIELDS + _COMPATIBILITY_METADATA_FIELDS
+)
 
 
 def _is_integer(value: object) -> bool:
@@ -77,6 +84,28 @@ def _read_metadata(
         metadata[key] = value
     if len(metadata) != len(_STABLE_METADATA_FIELDS):
         return None
+    compatibility_present = [
+        key in record
+        for key in _COMPATIBILITY_METADATA_FIELDS
+    ]
+    if any(compatibility_present) and not all(compatibility_present):
+        missing = [
+            key
+            for key in _COMPATIBILITY_METADATA_FIELDS
+            if key not in record
+        ]
+        errors.append(
+            f"{location}: compatibility metadata must include both fields; "
+            "missing " + ", ".join(missing)
+        )
+        return None
+    if all(compatibility_present):
+        for key in _COMPATIBILITY_METADATA_FIELDS:
+            value = record[key]
+            if not isinstance(value, bool):
+                errors.append(f"{location}: {key} must be a boolean")
+                return None
+            metadata[key] = value
     return metadata
 
 
@@ -211,10 +240,12 @@ def inspect_uart_chunk_index(
                 if metadata is None:
                     metadata = current_metadata
                 elif current_metadata != metadata:
+                    missing = object()
                     changed = [
                         key
-                        for key in _STABLE_METADATA_FIELDS
-                        if current_metadata[key] != metadata[key]
+                        for key in _ALL_METADATA_FIELDS
+                        if current_metadata.get(key, missing)
+                        != metadata.get(key, missing)
                     ]
                     errors.append(
                         f"{location}: capture metadata changed: "
@@ -473,6 +504,10 @@ def _summary(
         "footer_raw_sha256": footer_raw_sha256,
         "actual_raw_sha256": actual_raw_sha256,
     }
-    for key in _STABLE_METADATA_FIELDS:
-        result[key] = None if metadata is None else metadata[key]
+    for key in _ALL_METADATA_FIELDS:
+        result[key] = (
+            None
+            if metadata is None
+            else metadata.get(key)
+        )
     return result

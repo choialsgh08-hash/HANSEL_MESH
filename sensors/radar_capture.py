@@ -12,7 +12,11 @@ import time
 import uuid
 from typing import Optional, Tuple
 
-from common.sensor_contract import SensorHealth, validate_sensor_id
+from common.sensor_contract import (
+    MAX_RADAR_HEATMAP_CELLS,
+    SensorHealth,
+    validate_sensor_id,
+)
 from common.sensor_json import canonical_json_bytes
 from sensors.header_factory import (
     SensorHeaderFactory,
@@ -29,6 +33,8 @@ class RadarCaptureStats:
     point_cloud_frames: int
     float_point_frames: int
     compressed_point_frames: int
+    empty_point_frames: int
+    nonzero_padding_frames: int
     missing_point_tlv_frames: int
     complete_frames: int
     incomplete_frames: int
@@ -38,12 +44,24 @@ class RadarCaptureStats:
     writer_drops: int
     parser_errors: int
     parser_discarded_bytes: int
+    startup_sync_parse_errors: int
+    startup_sync_discarded_bytes: int
+    post_sync_parse_errors: int
+    post_sync_discarded_bytes: int
     buffered_tail_bytes: int
     raw_bytes: int
     max_timing_quality_metric_ns: int
     mission_log: str
     raw_capture: Optional[str]
     raw_index: Optional[str]
+    heatmap_frames: int = 0
+    major_heatmap_frames: int = 0
+    minor_heatmap_frames: int = 0
+    missing_heatmap_frames: int = 0
+    heatmap_cells_decoded: int = 0
+    heatmap_azimuth_bins: Optional[int] = None
+    heatmap_range_bins: Optional[int] = None
+    heatmap_range_step_m: Optional[float] = None
 
 
 def frame_gap(previous: Optional[int], current: int) -> int:
@@ -201,6 +219,11 @@ def capture_radar_uart(
     health_interval_s: float = 0.5,
     overwrite: bool = False,
     header_size: int = 40,
+    allow_elided_empty_point_tlv: bool = False,
+    allow_nonzero_padding: bool = False,
+    heatmap_azimuth_bins: Optional[int] = None,
+    heatmap_range_bins: Optional[int] = None,
+    heatmap_range_step_m: Optional[float] = None,
 ) -> RadarCaptureStats:
     """Capture an already-running TI demo stream.
 
@@ -247,6 +270,57 @@ def capture_radar_uart(
         or health_interval_s <= 0
     ):
         raise ValueError("health_interval_s must be positive")
+    for name, value in (
+        (
+            "allow_elided_empty_point_tlv",
+            allow_elided_empty_point_tlv,
+        ),
+        ("allow_nonzero_padding", allow_nonzero_padding),
+    ):
+        if not isinstance(value, bool):
+            raise ValueError(f"{name} must be a boolean")
+    heatmap_configuration = (
+        heatmap_azimuth_bins,
+        heatmap_range_bins,
+        heatmap_range_step_m,
+    )
+    if any(value is not None for value in heatmap_configuration) and not all(
+        value is not None for value in heatmap_configuration
+    ):
+        raise ValueError(
+            "heatmap_azimuth_bins, heatmap_range_bins, and "
+            "heatmap_range_step_m "
+            "must be supplied together"
+        )
+    if heatmap_azimuth_bins is not None and (
+        isinstance(heatmap_azimuth_bins, bool)
+        or not isinstance(heatmap_azimuth_bins, int)
+        or heatmap_azimuth_bins < 1
+    ):
+        raise ValueError("heatmap_azimuth_bins must be positive")
+    if heatmap_range_bins is not None and (
+        isinstance(heatmap_range_bins, bool)
+        or not isinstance(heatmap_range_bins, int)
+        or heatmap_range_bins < 1
+    ):
+        raise ValueError("heatmap_range_bins must be positive")
+    if heatmap_range_step_m is not None and (
+        isinstance(heatmap_range_step_m, bool)
+        or not isinstance(heatmap_range_step_m, (int, float))
+        or not math.isfinite(float(heatmap_range_step_m))
+        or float(heatmap_range_step_m) <= 0
+    ):
+        raise ValueError("heatmap_range_step_m must be positive")
+    if (
+        heatmap_azimuth_bins is not None
+        and heatmap_range_bins is not None
+        and heatmap_azimuth_bins * heatmap_range_bins
+        > MAX_RADAR_HEATMAP_CELLS
+    ):
+        raise ValueError(
+            "heatmap dimensions exceed limit of "
+            f"{MAX_RADAR_HEATMAP_CELLS} cells"
+        )
     mission_path = Path(mission_log)
     raw_path = None if raw_capture is None else Path(raw_capture)
     if raw_index is not None and raw_path is None:
@@ -308,17 +382,33 @@ def capture_radar_uart(
         stream_id="health/radar",
     )
     decoder = TiMmwaveStreamDecoder(
-        parser=TiMmwavePacketParser(header_size=header_size)
+        parser=TiMmwavePacketParser(
+            header_size=header_size,
+            allow_elided_empty_point_tlv=(
+                allow_elided_empty_point_tlv
+            ),
+            allow_nonzero_padding=allow_nonzero_padding,
+            heatmap_azimuth_bins=heatmap_azimuth_bins,
+            heatmap_range_bins=heatmap_range_bins,
+            heatmap_range_step_m=heatmap_range_step_m,
+        )
     )
 
     frames_decoded = 0
     point_cloud_frames = 0
     float_point_frames = 0
     compressed_point_frames = 0
+    empty_point_frames = 0
+    nonzero_padding_frames = 0
     missing_point_tlv_frames = 0
     complete_frames = 0
     incomplete_frames = 0
     points_decoded = 0
+    heatmap_frames = 0
+    major_heatmap_frames = 0
+    minor_heatmap_frames = 0
+    missing_heatmap_frames = 0
+    heatmap_cells_decoded = 0
     radar_frame_gaps = 0
     device_discontinuities = 0
     writer_drops = 0
@@ -368,14 +458,25 @@ def capture_radar_uart(
                     kind: str,
                     include_buffered_tail: bool,
                 ) -> SensorHealth:
+                    unresolved_startup_failure = bool(
+                        include_buffered_tail
+                        and not decoder.synchronized
+                        and (
+                            decoder.parse_errors
+                            or decoder.discarded_bytes
+                            or decoder.buffered_bytes
+                        )
+                    )
                     degraded = bool(
-                        decoder.parse_errors
-                        or decoder.discarded_bytes
+                        decoder.post_sync_parse_errors
+                        or decoder.post_sync_discarded_bytes
                         or incomplete_frames
                         or missing_point_tlv_frames
+                        or missing_heatmap_frames
                         or writer_drops
                         or radar_frame_gaps
                         or device_discontinuities
+                        or unresolved_startup_failure
                         or (
                             include_buffered_tail
                             and decoder.buffered_bytes
@@ -384,7 +485,11 @@ def capture_radar_uart(
                     if degraded:
                         status = "degraded"
                     elif frames_decoded == 0:
-                        status = "stale"
+                        status = (
+                            "stale"
+                            if include_buffered_tail
+                            else "starting"
+                        )
                     elif point_cloud_frames == 0:
                         status = "degraded"
                     else:
@@ -397,7 +502,9 @@ def capture_radar_uart(
                             last_sample_monotonic_ns
                         ),
                         seq_gaps_total=radar_frame_gaps,
-                        parse_errors_total=decoder.parse_errors,
+                        parse_errors_total=(
+                            decoder.post_sync_parse_errors
+                        ),
                         producer_drops_total=0,
                         writer_drops_total=writer_drops,
                         device_discontinuities_total=(
@@ -409,10 +516,38 @@ def capture_radar_uart(
                             f"frames={frames_decoded},"
                             f"points={points_decoded},"
                             f"point_cloud_frames={point_cloud_frames},"
+                            f"heatmap_frames={heatmap_frames},"
+                            "heatmap_expected="
+                            f"{str(heatmap_azimuth_bins is not None).lower()},"
+                            "heatmap_azimuth_bins="
+                            f"{heatmap_azimuth_bins},"
+                            "heatmap_range_bins="
+                            f"{heatmap_range_bins},"
+                            "heatmap_range_step_m="
+                            f"{heatmap_range_step_m},"
+                            "major_heatmap_frames="
+                            f"{major_heatmap_frames},"
+                            "minor_heatmap_frames="
+                            f"{minor_heatmap_frames},"
+                            "missing_heatmap_frames="
+                            f"{missing_heatmap_frames},"
+                            "heatmap_cells_decoded="
+                            f"{heatmap_cells_decoded},"
+                            "nonzero_padding_frames="
+                            f"{nonzero_padding_frames},"
                             "missing_point_tlv_frames="
                             f"{missing_point_tlv_frames},"
                             f"frame_gaps={radar_frame_gaps},"
-                            "discarded_bytes="
+                            "post_sync_parse_errors="
+                            f"{decoder.post_sync_parse_errors},"
+                            "post_sync_discarded_bytes="
+                            f"{decoder.post_sync_discarded_bytes},"
+                            "startup_sync_parse_errors="
+                            f"{decoder.startup_sync_parse_errors},"
+                            "startup_sync_discarded_bytes="
+                            f"{decoder.startup_sync_discarded_bytes},"
+                            f"raw_parse_errors={decoder.parse_errors},"
+                            "raw_discarded_bytes="
                             f"{decoder.discarded_bytes},"
                             f"buffered_tail={decoder.buffered_bytes},"
                             "device_discontinuities="
@@ -474,6 +609,21 @@ def capture_radar_uart(
                                     "producer_id": producer_id,
                                     "profile_id": profile_id,
                                     "calibration_id": calibration_id,
+                                    "allow_elided_empty_point_tlv": (
+                                        allow_elided_empty_point_tlv
+                                    ),
+                                    "allow_nonzero_padding": (
+                                        allow_nonzero_padding
+                                    ),
+                                    "heatmap_azimuth_bins": (
+                                        heatmap_azimuth_bins
+                                    ),
+                                    "heatmap_range_bins": (
+                                        heatmap_range_bins
+                                    ),
+                                    "heatmap_range_step_m": (
+                                        heatmap_range_step_m
+                                    ),
                                     "chunk_seq": chunk_seq,
                                     "byte_offset": chunk_offset,
                                     "byte_length": len(chunk),
@@ -508,15 +658,35 @@ def capture_radar_uart(
                             previous_frame = frame.header.frame_number
                             radar_frame_gaps += gap
                             frames_decoded += 1
+                            if any(
+                                warning.startswith("nonzero_padding:")
+                                for warning in frame.warnings
+                            ):
+                                nonzero_padding_frames += 1
                             if frame.point_format == "float":
                                 point_cloud_frames += 1
                                 float_point_frames += 1
                             elif frame.point_format == "compressed":
                                 point_cloud_frames += 1
                                 compressed_point_frames += 1
+                            elif frame.point_format == "empty":
+                                point_cloud_frames += 1
+                                empty_point_frames += 1
                             else:
                                 missing_point_tlv_frames += 1
                             points_decoded += len(frame.points)
+                            if frame.heatmap is None:
+                                if heatmap_azimuth_bins is not None:
+                                    missing_heatmap_frames += 1
+                            else:
+                                heatmap_frames += 1
+                                heatmap_cells_decoded += len(
+                                    frame.heatmap.data
+                                )
+                                if frame.heatmap.motion_mode == "major":
+                                    major_heatmap_frames += 1
+                                else:
+                                    minor_heatmap_frames += 1
                             if frame.complete:
                                 complete_frames += 1
                             else:
@@ -555,10 +725,29 @@ def capture_radar_uart(
                             "producer_id": producer_id,
                             "profile_id": profile_id,
                             "calibration_id": calibration_id,
+                            "allow_elided_empty_point_tlv": (
+                                allow_elided_empty_point_tlv
+                            ),
+                            "allow_nonzero_padding": (
+                                allow_nonzero_padding
+                            ),
+                            "heatmap_azimuth_bins": (
+                                heatmap_azimuth_bins
+                            ),
+                            "heatmap_range_bins": (
+                                heatmap_range_bins
+                            ),
+                            "heatmap_range_step_m": (
+                                heatmap_range_step_m
+                            ),
                             "chunks": chunk_seq,
                             "raw_bytes": raw_bytes,
                             "raw_sha256": raw_hasher.hexdigest(),
                             "frames_decoded": frames_decoded,
+                            "heatmap_frames": heatmap_frames,
+                            "missing_heatmap_frames": (
+                                missing_heatmap_frames
+                            ),
                             "ended_monotonic_ns": time.monotonic_ns(),
                             "stop_reason": stop_reason,
                             "baudrate": baudrate,
@@ -584,6 +773,8 @@ def capture_radar_uart(
         point_cloud_frames=point_cloud_frames,
         float_point_frames=float_point_frames,
         compressed_point_frames=compressed_point_frames,
+        empty_point_frames=empty_point_frames,
+        nonzero_padding_frames=nonzero_padding_frames,
         missing_point_tlv_frames=missing_point_tlv_frames,
         complete_frames=complete_frames,
         incomplete_frames=incomplete_frames,
@@ -593,6 +784,12 @@ def capture_radar_uart(
         writer_drops=writer_drops,
         parser_errors=decoder.parse_errors,
         parser_discarded_bytes=decoder.discarded_bytes,
+        startup_sync_parse_errors=decoder.startup_sync_parse_errors,
+        startup_sync_discarded_bytes=(
+            decoder.startup_sync_discarded_bytes
+        ),
+        post_sync_parse_errors=decoder.post_sync_parse_errors,
+        post_sync_discarded_bytes=decoder.post_sync_discarded_bytes,
         buffered_tail_bytes=decoder.buffered_bytes,
         raw_bytes=raw_bytes,
         max_timing_quality_metric_ns=max_timing_quality_metric_ns,
@@ -602,6 +799,18 @@ def capture_radar_uart(
         ),
         raw_index=(
             None if index_path is None else str(index_path)
+        ),
+        heatmap_frames=heatmap_frames,
+        major_heatmap_frames=major_heatmap_frames,
+        minor_heatmap_frames=minor_heatmap_frames,
+        missing_heatmap_frames=missing_heatmap_frames,
+        heatmap_cells_decoded=heatmap_cells_decoded,
+        heatmap_azimuth_bins=heatmap_azimuth_bins,
+        heatmap_range_bins=heatmap_range_bins,
+        heatmap_range_step_m=(
+            None
+            if heatmap_range_step_m is None
+            else float(heatmap_range_step_m)
         ),
     )
 

@@ -95,7 +95,10 @@ Windows에서 개발하고 parser·logger·replay를 검증하는 데 문제없�
 이미 저장한 UART binary가 있다면:
 
 ```powershell
-python -m sensors radar-bin captures\iwrl6432.bin --frames
+python -m sensors radar-bin captures\iwrl6432.bin --frames `
+  --allow-startup-resync `
+  --allow-elided-empty-point-tlv `
+  --allow-nonzero-padding
 ```
 
 출력의 다음 값이 먼저 확인 대상이다.
@@ -104,8 +107,8 @@ python -m sensors radar-bin captures\iwrl6432.bin --frames
 - `point_cloud_frames > 0`
 - `radar_frame_gaps = 0`
 - `device_discontinuities = 0`
-- `discarded_bytes = 0`
-- `parse_errors = 0`
+- `post_sync_discarded_bytes = 0`
+- `post_sync_parse_errors = 0`
 - `buffered_tail_bytes = 0`
 - frame별 `complete = true`
 - `header_sizes = {"40": ...}`
@@ -118,7 +121,7 @@ python -m sensors radar-bin captures\iwrl6432.bin --frames
 
 1. 사용 중인 appimage와 MMWAVE-L-SDK version, `.cfg` 파일을 복사해 실험과 함께 보관한다.
 2. J5 XDS110 application/user UART가 어느 `COM` 또는 `/dev/serial/by-id/...`인지 확인한다.
-3. 처음에는 115200 baud로 연결한다. 프로파일에서 `baudRate 1250000`을 적용한 경우에만 1250000으로 다시 연다.
+3. Visualizer는 처음 115200 baud로 cfg를 전송한다. 현재 `parking_5m.cfg`가 `baudRate 1250000`을 적용한 뒤에는 Visualizer를 종료하고, 리셋 없이 Python을 1250000으로 연다.
 4. SLAM용 첫 profile은 point cloud를 fixed/compressed mode 2로 설정하고 heatmap·raw ADC 같은 불필요 TLV는 끈다.
 5. 정적 구조물을 지도와 Doppler ego-motion에 사용해야 하므로 `clutterRemoval`은 끈 상태부터 시험한다.
 
@@ -133,9 +136,11 @@ python3 -m pip install -r requirements-sensors.txt
 ```bash
 python3 -m sensors radar-live \
   --port /dev/serial/by-id/REPLACE_WITH_REAL_DEVICE \
-  --baud 115200 \
+  --baud 1250000 \
+  --allow-elided-empty-point-tlv \
+  --allow-nonzero-padding \
   --mission-id rubble-bench-001 \
-  --profile-id lsdk-05.05.00.02-appcfg-REPLACE_WITH_HASH \
+  --profile-id lsdk-05.05.04.02-mmwave-demo-parking5m-80c1a085ce91 \
   --duration 60 \
   --output missions/rubble-bench-001.jsonl \
   --raw-output captures/rubble-bench-001.bin
@@ -147,15 +152,17 @@ Windows bench PC의 예:
 python -m pip install -r requirements-sensors.txt
 python -m sensors radar-live `
   --port COM5 `
-  --baud 115200 `
+  --baud 1250000 `
+  --allow-elided-empty-point-tlv `
+  --allow-nonzero-padding `
   --mission-id rubble-bench-001 `
-  --profile-id lsdk-05.05.00.02-appcfg-REPLACE_WITH_HASH `
+  --profile-id lsdk-05.05.04.02-mmwave-demo-parking5m-80c1a085ce91 `
   --duration 60 `
   --output missions\rubble-bench-001.jsonl `
   --raw-output captures\rubble-bench-001.bin
 ```
 
-이 명령은 `.cfg`를 보내거나 radar 설정을 바꾸지 않는다. IWRL6432의 한 UART를 CLI 설정과 processed data가 함께 사용하므로, 실제 appimage/profile을 확정하기 전에 자동 설정 전송을 넣지 않았다. `--profile-id`에는 SDK·appimage·`.cfg` 조합을 식별할 수 있는 고정 이름이나 짧은 hash를 넣어야 한다.
+이 명령은 `.cfg`를 보내거나 radar 설정을 바꾸지 않는다. IWRL6432의 한 UART를 CLI 설정과 processed data가 함께 사용하므로 Visualizer가 cfg를 전송한 다음 COM 포트를 닫아야 한다. `--allow-elided-empty-point-tlv`는 헤더의 감지점 수가 0이고 side-info가 없으며 다른 TLV가 존재할 때만 공식 demo가 생략한 point TLV를 빈 정상 프레임으로 해석한다. `--allow-nonzero-padding`은 패킷 끝의 최대 31바이트, 32바이트 정렬 패딩만 허용하며 누락된 TLV header처럼 보이는 suffix는 거부한다. 허용된 frame 수도 `nonzero_padding_frames`에 남는다.
 
 `--raw-output`을 사용하면 기본적으로 `<raw-output>.chunks.jsonl`도 만들어진다. 이 index에는 각 pyserial read의 byte offset·길이·시작/종료·중간 시각과 profile/calibration/baud가 기록되고, 정상 종료 시 raw 전체의 SHA-256을 포함한 `capture_end` footer가 붙는다. 다른 경로가 필요하면 `--raw-index`로 지정한다. `radar-index`는 실제 raw의 크기와 SHA-256, 연속 offset, read 시각, 고정 메타데이터, footer를 함께 검사한다. raw와 index를 먼저 `fsync`한 뒤 mission log에 최종 health를 기록하므로 정상 종료 표시가 raw보다 먼저 내구화되지 않는다.
 
@@ -165,7 +172,10 @@ capture 후:
 
 ```bash
 python3 -m sensors inspect missions/rubble-bench-001.jsonl
-python3 -m sensors radar-bin captures/rubble-bench-001.bin --frames
+python3 -m sensors radar-bin captures/rubble-bench-001.bin --frames \
+  --allow-startup-resync \
+  --allow-elided-empty-point-tlv \
+  --allow-nonzero-padding
 python3 -m sensors radar-index captures/rubble-bench-001.bin
 ```
 

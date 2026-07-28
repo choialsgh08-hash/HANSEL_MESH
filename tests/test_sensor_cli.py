@@ -13,14 +13,38 @@ from sensors.cli import (
     command_radar_bin,
     command_radar_index,
     command_radar_live,
+    main,
 )
 from common.sensor_json import canonical_json_bytes
 from sensors.mission_log import MissionLogWriter
 from sensors.radar_capture import RadarCaptureStats
-from tests.test_radar_capture import one_point_packet
+from tests.test_radar_capture import (
+    one_point_heatmap_packet,
+    one_point_packet,
+)
 
 
 class SensorCliTests(unittest.TestCase):
+    def test_heatmap_cli_requires_range_bins_with_other_settings(self):
+        stderr = io.StringIO()
+        with mock.patch(
+            "sys.argv",
+            [
+                "sensors",
+                "radar-bin",
+                "unused.bin",
+                "--heatmap-azimuth-bins",
+                "4",
+                "--heatmap-range-step-m",
+                "0.05",
+            ],
+        ), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                main()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("must be supplied together", stderr.getvalue())
+
     def test_empty_radar_binary_is_not_reported_usable(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "empty.bin"
@@ -63,6 +87,72 @@ class SensorCliTests(unittest.TestCase):
             self.assertEqual(result, 2)
             self.assertEqual(report["radar_frame_gaps"], 1)
 
+    def test_radar_binary_startup_resync_requires_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mid-stream.bin"
+            prefix = b"garbage-prefix"
+            path.write_bytes(prefix + one_point_packet())
+            args = argparse.Namespace(
+                path=str(path),
+                header_size="40",
+                float_point_tlv=1,
+                side_info_tlv=7,
+                compressed_point_tlv=301,
+                tlv_length_includes_header=False,
+                chunk_bytes=4096,
+                frames=False,
+                allow_startup_resync=False,
+            )
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                strict_result = command_radar_bin(args)
+            report = json.loads(output.getvalue())
+            self.assertEqual(strict_result, 2)
+            self.assertEqual(
+                report["startup_sync_discarded_bytes"],
+                len(prefix),
+            )
+            self.assertEqual(report["post_sync_discarded_bytes"], 0)
+
+            args.allow_startup_resync = True
+            with contextlib.redirect_stdout(io.StringIO()):
+                resync_result = command_radar_bin(args)
+            self.assertEqual(resync_result, 0)
+
+    def test_radar_binary_reports_decoded_heatmap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "heatmap.bin"
+            path.write_bytes(one_point_heatmap_packet())
+            args = argparse.Namespace(
+                path=str(path),
+                header_size="40",
+                float_point_tlv=1,
+                side_info_tlv=7,
+                compressed_point_tlv=301,
+                heatmap_azimuth_bins=4,
+                heatmap_range_bins=2,
+                heatmap_range_step_m=0.05,
+                tlv_length_includes_header=False,
+                chunk_bytes=4096,
+                frames=False,
+            )
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = command_radar_bin(args)
+            report = json.loads(output.getvalue())
+
+            self.assertEqual(result, 0)
+            self.assertEqual(report["heatmap_frames"], 1)
+            self.assertEqual(report["major_heatmap_frames"], 1)
+            self.assertEqual(report["missing_heatmap_frames"], 0)
+            self.assertEqual(report["heatmap_cells_decoded"], 8)
+            self.assertTrue(report["heatmap_expected"])
+            self.assertEqual(report["heatmap_azimuth_bins"], 4)
+            self.assertEqual(report["heatmap_range_bins"], 2)
+            self.assertEqual(report["heatmap_range_step_m"], 0.05)
+
     def test_empty_mission_log_is_not_reported_healthy(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "empty.jsonl"
@@ -79,6 +169,8 @@ class SensorCliTests(unittest.TestCase):
             point_cloud_frames=0,
             float_point_frames=0,
             compressed_point_frames=0,
+            empty_point_frames=0,
+            nonzero_padding_frames=0,
             missing_point_tlv_frames=0,
             complete_frames=0,
             incomplete_frames=0,
@@ -88,6 +180,10 @@ class SensorCliTests(unittest.TestCase):
             writer_drops=0,
             parser_errors=0,
             parser_discarded_bytes=0,
+            startup_sync_parse_errors=0,
+            startup_sync_discarded_bytes=0,
+            post_sync_parse_errors=0,
+            post_sync_discarded_bytes=0,
             buffered_tail_bytes=0,
             raw_bytes=0,
             max_timing_quality_metric_ns=0,
@@ -111,6 +207,11 @@ class SensorCliTests(unittest.TestCase):
             serial_timeout=0.01,
             overwrite=False,
             header_size="40",
+            allow_elided_empty_point_tlv=True,
+            allow_nonzero_padding=True,
+            heatmap_azimuth_bins=4,
+            heatmap_range_bins=2,
+            heatmap_range_step_m=0.05,
         )
         with mock.patch(
             "sensors.cli.capture_radar_uart",
@@ -122,6 +223,22 @@ class SensorCliTests(unittest.TestCase):
         self.assertEqual(
             capture.call_args.kwargs["raw_index"],
             Path("timing.jsonl"),
+        )
+        self.assertTrue(
+            capture.call_args.kwargs["allow_elided_empty_point_tlv"]
+        )
+        self.assertTrue(capture.call_args.kwargs["allow_nonzero_padding"])
+        self.assertEqual(
+            capture.call_args.kwargs["heatmap_azimuth_bins"],
+            4,
+        )
+        self.assertEqual(
+            capture.call_args.kwargs["heatmap_range_bins"],
+            2,
+        )
+        self.assertEqual(
+            capture.call_args.kwargs["heatmap_range_step_m"],
+            0.05,
         )
 
     def test_radar_index_uses_default_sidecar_and_returns_healthy(self):

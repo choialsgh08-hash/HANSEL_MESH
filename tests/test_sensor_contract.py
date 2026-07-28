@@ -5,6 +5,7 @@ from common.sensor_contract import (
     DropEvent,
     ImuSample,
     RadarFrame,
+    RadarHeatmap,
     RadarPoint,
     SensorHeader,
     SensorHealth,
@@ -46,6 +47,16 @@ class SensorContractTests(unittest.TestCase):
                 frame_transition="consecutive",
                 profile_id="sdk5502-test",
                 capture_baudrate=1_250_000,
+                heatmap=RadarHeatmap(
+                    data=b"\x00\x40\x80\xff",
+                    range_bins=2,
+                    azimuth_bins=2,
+                    range_step_m=0.05,
+                    tlv_type=304,
+                    motion_mode="major",
+                    floor_db=10.0,
+                    ceiling_db=50.0,
+                ),
             ),
             ImuSample(
                 header=header("imu/body"),
@@ -104,6 +115,49 @@ class SensorContractTests(unittest.TestCase):
             points=(),
         )
         self.assertEqual(decode_sensor_record(encode_sensor_record(record)), record)
+
+    def test_heatmap_bytes_use_base64_and_round_trip(self):
+        record = self.records()[0]
+        encoded = encode_sensor_record(record)
+        wire = json.loads(encoded)
+
+        self.assertEqual(
+            wire["payload"]["heatmap"]["data_base64"],
+            "AECA/w==",
+        )
+        self.assertEqual(wire["payload"]["heatmap"]["floor_db"], 10.0)
+        self.assertEqual(wire["payload"]["heatmap"]["ceiling_db"], 50.0)
+        self.assertNotIn("[0,64,128,255]", encoded.decode("ascii"))
+        self.assertEqual(decode_sensor_record(encoded), record)
+
+    def test_heatmap_shape_mode_and_base64_are_strict(self):
+        with self.assertRaisesRegex(ValueError, "data length"):
+            RadarHeatmap(
+                data=b"\x00",
+                range_bins=2,
+                azimuth_bins=2,
+                range_step_m=0.05,
+                tlv_type=304,
+                motion_mode="major",
+                floor_db=0.0,
+                ceiling_db=1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            RadarHeatmap(
+                data=b"\x00",
+                range_bins=1,
+                azimuth_bins=1,
+                range_step_m=0.05,
+                tlv_type=305,
+                motion_mode="major",
+                floor_db=0.0,
+                ceiling_db=1.0,
+            )
+
+        wire = record_to_dict(self.records()[0])
+        wire["payload"]["heatmap"]["data_base64"] = "***"
+        with self.assertRaisesRegex(ValueError, "valid base64"):
+            decode_sensor_record(json.dumps(wire).encode("utf-8"))
 
     def test_anchor_updated_requires_keyframe_pose_and_covariance(self):
         with self.assertRaisesRegex(ValueError, "anchor_updated requires"):

@@ -10,6 +10,7 @@ Without IMU/odometry this is a current, robot-relative view rather than a map.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -45,6 +46,8 @@ from sensors.mission_log import (  # noqa: E402
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
+UI_BUILD_ID = "20260726-depth-camera-r8"
+RADAR_VALID_MIN_RANGE_M = 0.07
 
 
 @dataclass(frozen=True)
@@ -97,9 +100,10 @@ class RadarFrontState:
         self,
         source_mode: str,
         axes: RadarAxes = RadarAxes(),
-        max_points: int = 768,
+        max_points: int = 2048,
         max_range_m: float = 20.0,
-        min_forward_m: float = 0.05,
+        min_forward_m: float = 0.0,
+        history_window_s: float = 0.2,
         stale_after_s: float = 0.75,
         fault_after_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
@@ -110,6 +114,13 @@ class RadarFrontState:
             raise ValueError("max_range_m must be finite and positive")
         if min_forward_m < 0 or not math.isfinite(min_forward_m):
             raise ValueError("min_forward_m must be finite and non-negative")
+        if (
+            not math.isfinite(history_window_s)
+            or not 0.1 <= history_window_s <= 1.2
+        ):
+            raise ValueError(
+                "history_window_s must be between 0.1 and 1.2 seconds"
+            )
         if stale_after_s <= 0 or not math.isfinite(stale_after_s):
             raise ValueError("stale_after_s must be finite and positive")
         if fault_after_s <= stale_after_s or not math.isfinite(fault_after_s):
@@ -120,6 +131,7 @@ class RadarFrontState:
         self.max_points = max_points
         self.max_range_m = max_range_m
         self.min_forward_m = min_forward_m
+        self.history_window_s = history_window_s
         self.stale_after_s = stale_after_s
         self.fault_after_s = fault_after_s
         self._clock = clock
@@ -127,6 +139,9 @@ class RadarFrontState:
         self._frame: Optional[Dict[str, object]] = None
         self._frame_received_at: Optional[float] = None
         self._arrival_times: Deque[float] = deque(maxlen=64)
+        self._point_history: Deque[
+            Tuple[float, List[List[Optional[float]]]]
+        ] = deque()
         self._frames_received = 0
         self._valid_frames = 0
         self._incomplete_frames = 0
@@ -269,6 +284,25 @@ class RadarFrontState:
                 ),
                 default=None,
             )
+            source_heatmap = getattr(record, "heatmap", None)
+            default_heatmap_axes = self.axes == RadarAxes()
+            heatmap = (
+                self._heatmap_payload(source_heatmap)
+                if default_heatmap_axes
+                else None
+            )
+            if heatmap is None and self.source_mode == "demo":
+                heatmap = self._demo_heatmap_payload(display_points)
+            if source_heatmap is None:
+                heatmap_status = "not_provided"
+            elif not default_heatmap_axes:
+                heatmap_status = "disabled_nondefault_axes"
+            elif heatmap is None:
+                heatmap_status = "invalid_metadata"
+            else:
+                heatmap_status = "available"
+            if self.source_mode == "demo" and heatmap is not None:
+                heatmap_status = "synthetic"
             self._frame = {
                 "number": record.frame_number,
                 "subframe": record.subframe_number,
@@ -301,15 +335,183 @@ class RadarFrontState:
                     else round(nearest_corridor, 3)
                 ),
                 "points": display_points,
+                "heatmap": heatmap,
+                "heatmap_status": heatmap_status,
             }
             self._frame_received_at = now
             self._arrival_times.append(now)
+            self._point_history.append((now, display_points))
+            self._trim_history(now)
             self._valid_frames += 1
             if record.dropped_frames_since_previous:
                 self._degraded_reason = "frame_gap"
             elif sensor_sequence_issue is not None:
                 self._degraded_reason = sensor_sequence_issue
         return True
+
+    def _heatmap_payload(self, heatmap: object) -> Optional[Dict[str, object]]:
+        """Encode a canonical heatmap for JSON transport without expanding it."""
+
+        if heatmap is None:
+            return None
+        try:
+            range_bins = int(getattr(heatmap, "range_bins"))
+            azimuth_bins = int(getattr(heatmap, "azimuth_bins"))
+            range_step_m = float(getattr(heatmap, "range_step_m"))
+            encoding = str(getattr(heatmap, "encoding", "log-u8"))
+            raw_values = getattr(heatmap, "values", None)
+            if raw_values is None:
+                raw_values = getattr(heatmap, "data")
+            values = bytes(raw_values)
+            floor_db = float(getattr(heatmap, "floor_db"))
+            ceiling_db = float(getattr(heatmap, "ceiling_db"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if (
+            range_bins < 1
+            or azimuth_bins < 1
+            or len(values) != range_bins * azimuth_bins
+            or range_step_m <= 0
+            or not math.isfinite(range_step_m)
+            or not math.isfinite(floor_db)
+            or not math.isfinite(ceiling_db)
+            or ceiling_db <= floor_db
+        ):
+            return None
+        mode = getattr(
+            heatmap,
+            "mode",
+            getattr(
+                heatmap,
+                "motion_mode",
+                getattr(heatmap, "type", "range-azimuth"),
+            ),
+        )
+        payload: Dict[str, object] = {
+            "range_bins": range_bins,
+            "azimuth_bins": azimuth_bins,
+            "range_step_m": round(range_step_m, 9),
+            "encoding": encoding,
+            "data_base64": base64.b64encode(values).decode("ascii"),
+            "floor_db": round(floor_db, 3),
+            "ceiling_db": round(ceiling_db, 3),
+            "motion_mode": str(mode),
+            "source": "radar",
+            "azimuth_layout": "fft-shifted-spatial-frequency",
+            "lambda_over_d_x": 2.0,
+            "azimuth_min_deg": -70.0,
+            "azimuth_max_deg": 70.0,
+            "valid_min_range_m": RADAR_VALID_MIN_RANGE_M,
+            "valid_max_range_m": 7.5,
+            "layout": "range-major_azimuth-minor",
+        }
+        tlv_type = getattr(heatmap, "tlv_type", None)
+        if isinstance(tlv_type, int):
+            payload["tlv_type"] = tlv_type
+        return payload
+
+    @staticmethod
+    def _demo_heatmap_payload(
+        points: Sequence[Sequence[Optional[float]]],
+    ) -> Dict[str, object]:
+        """Create a deterministic intensity fan for UI-only demo mode."""
+
+        range_bins = 100
+        azimuth_bins = 81
+        range_step_m = 0.05
+        values = bytearray(range_bins * azimuth_bins)
+        for point in points:
+            forward = float(point[0] or 0.0)
+            lateral = float(point[1] or 0.0)
+            distance = math.hypot(forward, lateral)
+            if forward <= 0 or distance >= range_bins * range_step_m:
+                continue
+            angle_deg = math.degrees(math.atan2(lateral, forward))
+            if not -60.0 <= angle_deg <= 60.0:
+                continue
+            range_index = min(
+                range_bins - 1,
+                int(distance / range_step_m),
+            )
+            azimuth_index = min(
+                azimuth_bins - 1,
+                max(
+                    0,
+                    int((angle_deg + 60.0) / 120.0 * azimuth_bins),
+                ),
+            )
+            snr = 14.0 if point[4] is None else float(point[4])
+            peak = round(max(76.0, min(255.0, 70.0 + snr * 6.0)))
+            for range_offset in range(-2, 3):
+                target_range = range_index + range_offset
+                if not 0 <= target_range < range_bins:
+                    continue
+                for angle_offset in range(-2, 3):
+                    target_angle = azimuth_index + angle_offset
+                    if not 0 <= target_angle < azimuth_bins:
+                        continue
+                    falloff = 1.0 - (
+                        abs(range_offset) + abs(angle_offset)
+                    ) / 6.0
+                    value = round(peak * max(0.22, falloff))
+                    offset = target_range * azimuth_bins + target_angle
+                    values[offset] = max(values[offset], value)
+        return {
+            "range_bins": range_bins,
+            "azimuth_bins": azimuth_bins,
+            "range_step_m": range_step_m,
+            "encoding": "log-u8",
+            "data_base64": base64.b64encode(bytes(values)).decode("ascii"),
+            "floor_db": -40.0,
+            "ceiling_db": 30.0,
+            "motion_mode": "synthetic-point-derived",
+            "source": "synthetic-point-derived",
+            "azimuth_layout": "linear-degrees",
+            "azimuth_min_deg": -60.0,
+            "azimuth_max_deg": 60.0,
+            "valid_min_range_m": 0.05,
+            "valid_max_range_m": 5.0,
+            "layout": "range-major_azimuth-minor",
+        }
+
+    def _trim_history(self, now: float) -> None:
+        oldest = now - self.history_window_s
+        while self._point_history and self._point_history[0][0] < oldest:
+            self._point_history.popleft()
+
+    def _occupancy_payload(self, now: float) -> Dict[str, object]:
+        self._trim_history(now)
+        history_points: List[List[Optional[float]]] = []
+        for received_at, points in self._point_history:
+            age_s = max(0.0, now - received_at)
+            persistence = max(0.0, 1.0 - age_s / self.history_window_s)
+            age_ms = round(age_s * 1000.0)
+            for point in points:
+                history_points.append(
+                    list(point)
+                    + [age_ms, round(persistence, 3)]
+                )
+        history_limit = min(8192, self.max_points * 12)
+        truncated = len(history_points) > history_limit
+        if truncated:
+            history_points = history_points[-history_limit:]
+        return {
+            "mode": "temporal-return-evidence",
+            "semantics": "return_evidence_only_unknown_elsewhere",
+            "history_window_ms": round(self.history_window_s * 1000.0),
+            "frames": len(self._point_history),
+            "point_fields": [
+                "forward_m",
+                "lateral_m",
+                "height_m",
+                "radial_velocity_mps",
+                "snr_db",
+                "age_ms",
+                "persistence",
+            ],
+            "points": history_points,
+            "truncated": truncated,
+        }
 
     def reset_sensor_sequence_tracking(self) -> None:
         """Forget replay-only sequence baselines without clearing diagnostics.
@@ -350,6 +552,7 @@ class RadarFrontState:
     def snapshot(self, now: Optional[float] = None) -> Dict[str, object]:
         current = self._clock() if now is None else now
         with self._lock:
+            occupancy = self._occupancy_payload(current)
             frame = self._frame
             received_at = self._frame_received_at
             age_s = None if received_at is None else max(0.0, current - received_at)
@@ -379,6 +582,7 @@ class RadarFrontState:
             warning = self._warning_for(status, frame)
             return {
                 "version": API_VERSION,
+                "ui_build_id": UI_BUILD_ID,
                 "status": status,
                 "warning": warning,
                 "source": {
@@ -395,11 +599,15 @@ class RadarFrontState:
                     "max_points": self.max_points,
                     "max_range_m": self.max_range_m,
                     "min_forward_m": self.min_forward_m,
+                    "history_window_ms": round(
+                        self.history_window_s * 1000.0
+                    ),
                     "stale_after_ms": round(self.stale_after_s * 1000.0),
                     "fault_after_ms": round(self.fault_after_s * 1000.0),
                     "display_limit_only": True,
                 },
                 "frame": frame,
+                "occupancy": occupancy,
                 "counters": {
                     "frames_received": self._frames_received,
                     "valid_frames": self._valid_frames,
@@ -434,25 +642,28 @@ class RadarFrontState:
         frame: Optional[Dict[str, object]],
     ) -> str:
         if status == "waiting":
-            return "레이더 프레임 대기 중 — 주행하지 마세요"
+            return "레이더 프레임 대기 중 · 주행하지 마세요"
         if status == "fault":
-            return "RADAR FAULT — 즉시 정지"
+            return "RADAR FAULT · 즉시 정지"
         if status == "stale":
-            return "RADAR STALE — 오래된 화면, 즉시 정지"
+            return "RADAR STALE · 오래된 화면, 즉시 정지"
         if status == "replay_end":
-            return "REPLAY END — 마지막 프레임이 고정되어 있습니다"
+            return "REPLAY END · 마지막 프레임이 고정되어 있습니다"
         if status == "degraded":
             if (
                 frame is not None
                 and frame.get("source_format") == "ti-mmwave-none"
             ):
                 return (
-                    "RADAR DEGRADED — point-cloud TLV 없음, cfg 확인"
+                    "RADAR DEGRADED · point-cloud TLV 없음, cfg 확인"
                 )
-            return "RADAR DEGRADED — 누락/불완전 프레임 확인"
+            return "RADAR DEGRADED · 누락/불완전 프레임 확인"
         if frame is not None and frame["display_point_count"] == 0:
-            return "NO RETURNS — 빈 공간이라는 뜻이 아닙니다"
-        return "현재 프레임 · 로봇 상대 좌표 (SLAM 아님)"
+            return "NO RETURNS · 빈 공간이라는 뜻이 아니라 미확인입니다"
+        return (
+            f"반사 강도와 {self.history_window_s:.2f}초 단기 누적 · "
+            "로봇 상대 좌표 (SLAM 아님)"
+        )
 
 
 def make_demo_frame(
@@ -465,6 +676,28 @@ def make_demo_frame(
     generator = random.Random(seed + frame_number)
     points: List[RadarPoint] = []
     if frame_number % 120 != 90:
+        # Close-range tilted panel for the 0-50 cm operator-view demo.
+        for row in range(4):
+            for column in range(7):
+                lateral = -0.18 + column * 0.06
+                height = -0.09 + row * 0.06
+                forward = (
+                    0.18
+                    + column * 0.012
+                    + row * 0.008
+                    + generator.uniform(-0.004, 0.004)
+                )
+                points.append(
+                    RadarPoint(
+                        x_m=lateral,
+                        y_m=forward,
+                        z_m=height,
+                        radial_velocity_mps=generator.uniform(-0.02, 0.02),
+                        snr_db=generator.uniform(18.0, 31.0),
+                        noise_db=generator.uniform(3.0, 7.0),
+                    )
+                )
+
         for side in (-1.0, 1.0):
             for index in range(24):
                 forward = 0.65 + index * 0.31
@@ -848,9 +1081,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8081)
-    parser.add_argument("--max-points", type=int, default=768)
+    parser.add_argument("--max-points", type=int, default=2048)
     parser.add_argument("--max-range-m", type=float, default=20.0)
-    parser.add_argument("--min-forward-m", type=float, default=0.05)
+    parser.add_argument("--min-forward-m", type=float, default=0.0)
+    parser.add_argument(
+        "--history-window",
+        type=float,
+        default=0.2,
+        help="point evidence persistence in seconds (0.1 to 1.2)",
+    )
     parser.add_argument("--stale-after", type=float, default=0.75)
     parser.add_argument("--fault-after", type=float, default=2.0)
     parser.add_argument(
@@ -907,6 +1146,11 @@ def parse_args(
         parser.error("--max-range-m must be finite and positive")
     if not math.isfinite(args.min_forward_m) or args.min_forward_m < 0:
         parser.error("--min-forward-m must be finite and non-negative")
+    if (
+        not math.isfinite(args.history_window)
+        or not 0.1 <= args.history_window <= 1.2
+    ):
+        parser.error("--history-window must be between 0.1 and 1.2")
     if not math.isfinite(args.stale_after) or args.stale_after <= 0:
         parser.error("--stale-after must be finite and positive")
     if (
@@ -939,6 +1183,7 @@ def run(args: argparse.Namespace) -> int:
         max_points=args.max_points,
         max_range_m=args.max_range_m,
         min_forward_m=args.min_forward_m,
+        history_window_s=args.history_window,
         stale_after_s=args.stale_after,
         fault_after_s=args.fault_after,
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
 import time
@@ -193,12 +194,44 @@ def command_radar_bin(args: argparse.Namespace) -> int:
         float_point_tlv=args.float_point_tlv,
         side_info_tlv=args.side_info_tlv,
         compressed_point_tlv=args.compressed_point_tlv,
+        heatmap_azimuth_bins=getattr(
+            args,
+            "heatmap_azimuth_bins",
+            None,
+        ),
+        heatmap_range_bins=getattr(
+            args,
+            "heatmap_range_bins",
+            None,
+        ),
+        heatmap_range_step_m=getattr(
+            args,
+            "heatmap_range_step_m",
+            None,
+        ),
         tlv_length_includes_header=args.tlv_length_includes_header,
+        allow_elided_empty_point_tlv=getattr(
+            args,
+            "allow_elided_empty_point_tlv",
+            False,
+        ),
+        allow_nonzero_padding=getattr(
+            args,
+            "allow_nonzero_padding",
+            False,
+        ),
     )
     decoder = TiMmwaveStreamDecoder(parser=parser)
     frame_count = 0
     point_cloud_frames = 0
+    empty_point_frames = 0
+    nonzero_padding_frames = 0
     point_count = 0
+    heatmap_frames = 0
+    major_heatmap_frames = 0
+    minor_heatmap_frames = 0
+    missing_heatmap_frames = 0
+    heatmap_cells_decoded = 0
     incomplete_count = 0
     missing_point_tlv_frames = 0
     radar_frame_gaps = 0
@@ -220,11 +253,28 @@ def command_radar_bin(args: argparse.Namespace) -> int:
                 if transition in {"duplicate", "reset_or_out_of_order"}:
                     device_discontinuities += 1
                 frame_count += 1
-                if frame.point_format in {"float", "compressed"}:
+                if any(
+                    warning.startswith("nonzero_padding:")
+                    for warning in frame.warnings
+                ):
+                    nonzero_padding_frames += 1
+                if frame.point_format in {"float", "compressed", "empty"}:
                     point_cloud_frames += 1
+                    if frame.point_format == "empty":
+                        empty_point_frames += 1
                 else:
                     missing_point_tlv_frames += 1
                 point_count += len(frame.points)
+                if frame.heatmap is None:
+                    if getattr(args, "heatmap_azimuth_bins", None) is not None:
+                        missing_heatmap_frames += 1
+                else:
+                    heatmap_frames += 1
+                    heatmap_cells_decoded += len(frame.heatmap.data)
+                    if frame.heatmap.motion_mode == "major":
+                        major_heatmap_frames += 1
+                    else:
+                        minor_heatmap_frames += 1
                 incomplete_count += 0 if frame.complete else 1
                 header_sizes[str(frame.header_size)] = (
                     header_sizes.get(str(frame.header_size), 0) + 1
@@ -240,6 +290,27 @@ def command_radar_bin(args: argparse.Namespace) -> int:
                                 "complete": frame.complete,
                                 "frame_transition": transition,
                                 "dropped_frames_since_previous": gap,
+                                "heatmap": (
+                                    None
+                                    if frame.heatmap is None
+                                    else {
+                                        "azimuth_bins": (
+                                            frame.heatmap.azimuth_bins
+                                        ),
+                                        "range_bins": (
+                                            frame.heatmap.range_bins
+                                        ),
+                                        "cells": len(frame.heatmap.data),
+                                        "motion_mode": (
+                                            frame.heatmap.motion_mode
+                                        ),
+                                        "tlv_type": frame.heatmap.tlv_type,
+                                        "floor_db": frame.heatmap.floor_db,
+                                        "ceiling_db": (
+                                            frame.heatmap.ceiling_db
+                                        ),
+                                    }
+                                ),
                                 "warnings": list(frame.warnings),
                             },
                             ensure_ascii=False,
@@ -251,7 +322,20 @@ def command_radar_bin(args: argparse.Namespace) -> int:
             {
                 "frames": frame_count,
                 "point_cloud_frames": point_cloud_frames,
+                "empty_point_frames": empty_point_frames,
+                "nonzero_padding_frames": nonzero_padding_frames,
                 "points": point_count,
+                "heatmap_frames": heatmap_frames,
+                "major_heatmap_frames": major_heatmap_frames,
+                "minor_heatmap_frames": minor_heatmap_frames,
+                "missing_heatmap_frames": missing_heatmap_frames,
+                "heatmap_cells_decoded": heatmap_cells_decoded,
+                "heatmap_expected": (
+                    parser.heatmap_azimuth_bins is not None
+                ),
+                "heatmap_azimuth_bins": parser.heatmap_azimuth_bins,
+                "heatmap_range_bins": parser.heatmap_range_bins,
+                "heatmap_range_step_m": parser.heatmap_range_step_m,
                 "incomplete_frames": incomplete_count,
                 "missing_point_tlv_frames": missing_point_tlv_frames,
                 "radar_frame_gaps": radar_frame_gaps,
@@ -259,6 +343,18 @@ def command_radar_bin(args: argparse.Namespace) -> int:
                 "header_sizes": header_sizes,
                 "discarded_bytes": decoder.discarded_bytes,
                 "parse_errors": decoder.parse_errors,
+                "startup_sync_discarded_bytes": (
+                    decoder.startup_sync_discarded_bytes
+                ),
+                "startup_sync_parse_errors": (
+                    decoder.startup_sync_parse_errors
+                ),
+                "post_sync_discarded_bytes": (
+                    decoder.post_sync_discarded_bytes
+                ),
+                "post_sync_parse_errors": (
+                    decoder.post_sync_parse_errors
+                ),
                 "buffered_tail_bytes": decoder.buffered_bytes,
             },
             ensure_ascii=False,
@@ -270,11 +366,19 @@ def command_radar_bin(args: argparse.Namespace) -> int:
         frame_count > 0
         and point_cloud_frames > 0
         and missing_point_tlv_frames == 0
+        and missing_heatmap_frames == 0
         and incomplete_count == 0
         and radar_frame_gaps == 0
         and device_discontinuities == 0
-        and decoder.discarded_bytes == 0
-        and decoder.parse_errors == 0
+        and (
+            getattr(args, "allow_startup_resync", False)
+            or (
+                decoder.startup_sync_discarded_bytes == 0
+                and decoder.startup_sync_parse_errors == 0
+            )
+        )
+        and decoder.post_sync_discarded_bytes == 0
+        and decoder.post_sync_parse_errors == 0
         and decoder.buffered_bytes == 0
     )
     return 0 if usable else 2
@@ -298,6 +402,31 @@ def command_radar_live(args: argparse.Namespace) -> int:
         health_interval_s=getattr(args, "health_interval", 0.5),
         overwrite=args.overwrite,
         header_size=int(args.header_size),
+        allow_elided_empty_point_tlv=getattr(
+            args,
+            "allow_elided_empty_point_tlv",
+            False,
+        ),
+        allow_nonzero_padding=getattr(
+            args,
+            "allow_nonzero_padding",
+            False,
+        ),
+        heatmap_azimuth_bins=getattr(
+            args,
+            "heatmap_azimuth_bins",
+            None,
+        ),
+        heatmap_range_bins=getattr(
+            args,
+            "heatmap_range_bins",
+            None,
+        ),
+        heatmap_range_step_m=getattr(
+            args,
+            "heatmap_range_step_m",
+            None,
+        ),
     )
     print(
         json.dumps(
@@ -311,11 +440,12 @@ def command_radar_live(args: argparse.Namespace) -> int:
         stats.frames_decoded > 0
         and stats.point_cloud_frames > 0
         and stats.missing_point_tlv_frames == 0
+        and stats.missing_heatmap_frames == 0
         and stats.incomplete_frames == 0
         and stats.radar_frame_gaps == 0
         and stats.writer_drops == 0
-        and stats.parser_discarded_bytes == 0
-        and stats.parser_errors == 0
+        and stats.post_sync_discarded_bytes == 0
+        and stats.post_sync_parse_errors == 0
         and stats.buffered_tail_bytes == 0
         and stats.device_discontinuities == 0
     )
@@ -398,7 +528,55 @@ def build_parser() -> argparse.ArgumentParser:
     radar.add_argument("--float-point-tlv", type=int, default=1)
     radar.add_argument("--side-info-tlv", type=int, default=7)
     radar.add_argument("--compressed-point-tlv", type=int, default=301)
+    radar.add_argument(
+        "--heatmap-azimuth-bins",
+        type=int,
+        help=(
+            "decode TI TLV 304/305 as a range-azimuth heatmap with this "
+            "azimuth dimension; omitted leaves those TLVs unknown"
+        ),
+    )
+    radar.add_argument(
+        "--heatmap-range-bins",
+        type=int,
+        help=(
+            "configured number of heatmap range bins; required with "
+            "--heatmap-azimuth-bins and --heatmap-range-step-m"
+        ),
+    )
+    radar.add_argument(
+        "--heatmap-range-step-m",
+        type=float,
+        help=(
+            "metres per heatmap range bin; required with "
+            "--heatmap-azimuth-bins and --heatmap-range-bins"
+        ),
+    )
     radar.add_argument("--tlv-length-includes-header", action="store_true")
+    radar.add_argument(
+        "--allow-elided-empty-point-tlv",
+        action="store_true",
+        help=(
+            "accept a missing point-cloud TLV only when the packet header "
+            "reports zero detected objects"
+        ),
+    )
+    radar.add_argument(
+        "--allow-nonzero-padding",
+        action="store_true",
+        help=(
+            "accept non-zero trailing bytes only as <=31-byte, "
+            "32-byte-aligned packet padding"
+        ),
+    )
+    radar.add_argument(
+        "--allow-startup-resync",
+        action="store_true",
+        help=(
+            "allow bytes discarded before the first valid frame; intended "
+            "for captures that began mid-stream"
+        ),
+    )
     radar.add_argument("--chunk-bytes", type=int, default=4096)
     radar.add_argument(
         "--frames",
@@ -461,6 +639,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds between live parser/writer health records",
     )
     live.add_argument("--header-size", choices=("40", "52"), default="40")
+    live.add_argument(
+        "--heatmap-azimuth-bins",
+        type=int,
+        help=(
+            "decode TI TLV 304/305 using this configured azimuth FFT size"
+        ),
+    )
+    live.add_argument(
+        "--heatmap-range-bins",
+        type=int,
+        help=(
+            "configured number of heatmap range bins; required with "
+            "--heatmap-azimuth-bins and --heatmap-range-step-m"
+        ),
+    )
+    live.add_argument(
+        "--heatmap-range-step-m",
+        type=float,
+        help=(
+            "metres per heatmap range bin; required with "
+            "--heatmap-azimuth-bins and --heatmap-range-bins"
+        ),
+    )
+    live.add_argument(
+        "--allow-elided-empty-point-tlv",
+        action="store_true",
+        help=(
+            "accept the official demo's omitted point TLV when zero "
+            "objects are detected"
+        ),
+    )
+    live.add_argument(
+        "--allow-nonzero-padding",
+        action="store_true",
+        help=(
+            "accept the official demo's uninitialized packet padding "
+            "under strict alignment checks"
+        ),
+    )
     live.add_argument("--overwrite", action="store_true")
     live.set_defaults(func=command_radar_live)
     return parser
@@ -475,6 +692,31 @@ def main() -> int:
         parser.error("--chunk-bytes must be positive")
     if getattr(args, "read_bytes", 1) < 1:
         parser.error("--read-bytes must be positive")
+    heatmap_azimuth_bins = getattr(args, "heatmap_azimuth_bins", None)
+    heatmap_range_bins = getattr(args, "heatmap_range_bins", None)
+    heatmap_range_step_m = getattr(args, "heatmap_range_step_m", None)
+    heatmap_configuration = (
+        heatmap_azimuth_bins,
+        heatmap_range_bins,
+        heatmap_range_step_m,
+    )
+    if any(value is not None for value in heatmap_configuration) and not all(
+        value is not None for value in heatmap_configuration
+    ):
+        parser.error(
+            "--heatmap-azimuth-bins, --heatmap-range-bins, and "
+            "--heatmap-range-step-m "
+            "must be supplied together"
+        )
+    if heatmap_azimuth_bins is not None and heatmap_azimuth_bins < 1:
+        parser.error("--heatmap-azimuth-bins must be positive")
+    if heatmap_range_bins is not None and heatmap_range_bins < 1:
+        parser.error("--heatmap-range-bins must be positive")
+    if heatmap_range_step_m is not None and (
+        not math.isfinite(heatmap_range_step_m)
+        or heatmap_range_step_m <= 0
+    ):
+        parser.error("--heatmap-range-step-m must be positive")
     try:
         return int(args.func(args))
     except (OSError, RuntimeError, ValueError) as exc:
