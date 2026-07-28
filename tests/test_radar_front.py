@@ -32,6 +32,9 @@ from monitor.radar_scene import RadarSceneEstimator
 from http.server import ThreadingHTTPServer
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 def radar_frame(
     points,
     frame_number=7,
@@ -756,6 +759,21 @@ class MissionLogFollowerTests(unittest.TestCase):
             stop_event.set()
             thread.join(1.0)
             self.assertEqual(state.snapshot()["frame"]["number"], 2)
+
+
+class RadarFrontDocumentationTests(unittest.TestCase):
+    def test_operator_guide_documents_the_calibrated_r9_contract(self):
+        docs = (
+            REPO_ROOT / "docs" / "radar_front_view.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("radar-calibrate", docs)
+        self.assertIn("--clutter-calibration", docs)
+        self.assertIn("0~3m", docs)
+        self.assertIn("0~50cm", docs)
+        self.assertIn("10cm", docs)
+        self.assertIn("UNKNOWN", docs)
+        self.assertNotIn("흑백 벽면", docs)
 
 
 class RadarFrontHttpTests(unittest.TestCase):

@@ -1290,7 +1290,7 @@ git commit -m "feat: replace radar camera facade with LiDAR operator view"
 - Produces: reproducible Windows commands, fresh test evidence, desktop/browser
   verification, and checked plan boxes.
 
-- [ ] **Step 1: Write failing documentation contract assertions**
+- [x] **Step 1: Write failing documentation contract assertions**
 
 Add to `tests/test_radar_front.py` HTTP/static checks or a focused docs test:
 
@@ -1305,7 +1305,7 @@ self.assertIn("UNKNOWN", docs)
 self.assertNotIn("흑백 벽면", docs)
 ```
 
-- [ ] **Step 2: Run the docs assertion and verify RED**
+- [x] **Step 2: Run the docs assertion and verify RED**
 
 Run:
 
@@ -1315,7 +1315,7 @@ python -m unittest tests.test_radar_front -v
 
 Expected: documentation assertion fails on the old R8 instructions.
 
-- [ ] **Step 3: Replace R8 instructions with the calibrated R9 workflow**
+- [x] **Step 3: Replace R8 instructions with the calibrated R9 workflow**
 
 Document these commands exactly:
 
@@ -1341,7 +1341,7 @@ Explain:
 - heatmap near bins and missing returns never mean safe;
 - encoder/IMU motion compensation is the next phase.
 
-- [ ] **Step 4: Run full automated verification**
+- [x] **Step 4: Run full automated verification**
 
 Run:
 
@@ -1353,7 +1353,7 @@ git diff --check
 
 Expected: all Python and Node tests pass; whitespace check returns exit `0`.
 
-- [ ] **Step 5: Generate a temporary real-fixture calibration**
+- [x] **Step 5: Generate a temporary real-fixture calibration**
 
 Run:
 
@@ -1404,7 +1404,7 @@ At `1440 x 900` and `390 x 844`, verify:
 
 Capture one full-page screenshot for the implementation report.
 
-- [ ] **Step 8: Commit docs and checked plan**
+- [x] **Step 8: Commit docs and checked plan**
 
 Mark completed checkboxes in this plan, then run:
 

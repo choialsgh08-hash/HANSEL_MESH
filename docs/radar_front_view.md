@@ -1,82 +1,109 @@
-# IWRL6432 전방 레이더 조종 화면
+# IWRL6432BOOST R9 레이더 LiDAR형 조종 화면
 
-이 화면은 점 몇 개만 그리는 산점도 대신, 기본값으로 로봇 중심 3D 반구형 좌표 맵을 사용해
-다음 정보를 한 화면에 합성한다.
+R9 화면은 카메라 영상을 합성하지 않는다. IWRL6432BOOST가 실제로 측정한 포인트와
+range-azimuth heatmap의 반사 증거를 로봇 기준 LiDAR형 탑뷰로 표시한다.
 
-1. TI range-azimuth heatmap(TLV 304/305)의 반사 강도
-2. 방위각별 최근접 강한 반사를 연결한 거리-방위 추정 윤곽(높이 없음)
-3. 최신 프레임의 선명한 실측 `x/y/z` 점, 바닥 접점, 높이선과 거리/높이 라벨
-4. 근접 실측점끼리만 잇는 점선 보조 윤곽
-5. 전방을 다섯 구역으로 나눈 근접 반사 경고
+- 주 화면: 전방 `0~3m`, 좌우 `-1.5~+1.5m`
+- 충돌 확대창: 전방 `0~50cm`
+- 격자 해상도: 5cm
+- 포인트와 점유 증거 유지 시간: 최대 300ms
+- 거리 기반 빨강 경고: 고정 클러터가 아닌 확인된 포인트가 `10cm` 이하일 때만 표시
 
-IWRL6432BOOST는 3Rx와 2Tx로 6개 가상 안테나 쌍을 만들며, 보드 문서가 명시하는
-명목 각도 분해능은 방위각 약 29°, 고도각 약 58°다. 따라서 point-cloud TLV의
-`x/y/z`는 실측 3D 좌표로 표시할 수 있지만 높이는 매우 거칠다. 반면 TLV 304/305는
-range-azimuth 2D 강도 격자이므로 높이 정보를 갖지 않는다. 3D 화면은 이 격자를
-높이 0인 기준면에 투영하고, 그 위에 최신 프레임의 실측 `x/y/z` 점만 선명한 마름모와
-높이선으로 겹친다. 점에는 시간 누적을 적용하지 않는다. 강도면을 벽이나 바닥의 실제 높이라고
-해석하면 안 된다.
+주 화면은 현재 로봇을 원점으로 한 순간적인 반사 증거다. 세계 좌표에 누적된 지도나
+SLAM 결과가 아니다. 로봇이 움직여도 과거 구조를 지도에 남기지 않으므로, 화면에
+없는 영역과 반사가 없는 영역은 `UNKNOWN`이다. `UNKNOWN`은 빈 공간, 안전 통로,
+`FREE`를 뜻하지 않는다.
 
-프레임 사이의 깜빡임만 줄일 정도로 0.2초를 짧게 누적하며 긴 잔상은 만들지 않는다. 광학 영상은 아니다. 물체의 색, 문자,
-모양, 표면 질감은 볼 수 없다. 반사가 없는 곳도 빈 통로가 아니라 **미확인**이다.
+## 1. 화면만 먼저 확인
 
-## 화면만 먼저 확인
-
-저장소 루트에서 실행한다.
+저장소 루트에서 다음 명령을 실행한다.
 
 ```powershell
-python monitor/radar_front.py --demo
+python monitor\radar_front.py --demo --bind 127.0.0.1 `
+  --http-port 8081 --max-range-m 3 --history-window 0.3
 ```
 
-브라우저에서 `http://127.0.0.1:8081`을 연다. 데모는 실제 heatmap과 같은
-`log-u8` 격자를 합성하므로 다음 기능을 하드웨어 없이 확인할 수 있다.
+브라우저에서 `http://127.0.0.1:8081/`을 연다. 상단의 `UI R9`,
+`0~3m FORWARD MAP`, `ROBOT RELATIVE`와 우측의 `0~50cm 충돌 확대`가 보여야 한다.
+데모 데이터는 합성 데이터이므로 실제 보드 감지 성능을 증명하지 않는다.
 
-- 3 m 기본 근거리 확대 / 5 m 전환
-- 3D 포인트 맵 / 3D 깊이 카메라 / 2D 위보기 전환
-- 0.2초 / 0.4초 / 0.8초 단기 누적
-- 다섯 전방 구역의 `미확인`, `반사`, `근접 반사` 표시
-- 원시 포인트 겹쳐 보기
-- 프레임이 오래되거나 끊겼을 때 정지 오버레이
+## 2. 보드 프로필 적용
 
-## 실제 보드 데이터 연결
+화면 프로세스는 UART를 열지 않는다. `radar-live` 한 프로세스만 Application/User
+UART를 소유하고 mission JSONL을 기록하며, 화면은 그 파일을 따라간다.
 
-화면 프로세스는 UART를 열지 않는다. `radar-live` 한 프로세스만 보드 UART를 소유하고
-mission JSONL을 기록하며, 화면은 그 파일을 따라간다.
-
-### 1. TI 프로필에서 heatmap 출력 활성화
-
-사용하는 IWRL6432 애플리케이션과 cfg가 range-azimuth heatmap TLV 304 또는 305를
-실제로 출력해야 한다. 현재 준비한 기본 프로필은 10 Hz, azimuth 16 bins, range
-128 bins, range step `0.09765625 m`다. 처리 여유가 부족할 때만 5 Hz, azimuth
-32 bins 프로필로 바꾼다. 캡처 옵션은 실제로 보드에 전송한 프로필과 반드시 일치해야
-한다.
-
-### 2. 보드 리셋 후 cfg 적용
-
-보드의 RESET 버튼을 눌러 CLI를 115200 baud 초기 상태로 되돌린 뒤 10 Hz 기본 cfg를
-적용한다.
+보드의 RESET 버튼을 한 번 누른 뒤, 실제 Application/User UART 번호에 맞게
+`COM3`을 바꾸어 실행한다.
 
 ```powershell
-python scripts/configure_ti_radar.py `
+python scripts\configure_ti_radar.py `
   --port COM3 `
-  --cfg configs/radar/iwrl6432_heatmap_10hz.cfg
+  --cfg configs\radar\iwrl6432_3d_operator_near_10hz.cfg `
+  --command-timeout 1.5
 ```
 
-5 Hz fallback을 시험할 때는 RESET을 다시 누르고 cfg 파일만
-`configs/radar/iwrl6432_heatmap_5hz.cfg`로 바꾼다. 결과 JSON에서
-`new_baud_prompt_observed`가 `true`인지 확인한다. cfg 적용 뒤에는 보드를 다시
-리셋하지 않는다.
+결과에서 `commands_completed=25`, `new_baud_verified_by_version=true`,
+`first_magic_observed=true`를 확인한다. 프로필 적용 후에는 다시 RESET하지 않는다.
+이 프로필은 10Hz, 128 range bins, 16 azimuth bins, range step
+`0.09765625m`를 사용한다.
 
-실측 높이 점을 더 많이 얻는 실험에는
-`configs/radar/iwrl6432_3d_operator_10hz.cfg`를 사용할 수 있다. 이 프로필은
-elevation FFT를 4에서 8로 늘리고 검증된 CFAR threshold 15 dB는 유지한다.
-높이 샘플 격자는 촘촘해질 수 있지만 물리 고도각 분해능은 약 58° 그대로다.
-반드시 정지 상태의 거리/높이 표적 시험을 통과한 뒤 사용한다. elevation FFT 16은
-현재 10 Hz 프로필에서 시작 직후 스트림이 멈춰 사용하지 않는다.
+## 3. 빈 장면 캘리브레이션
 
-### 3. 캡처 시작
+고정 안테나 누설, 보드·케이블·장착물의 반복 반사를 실제 장애물에서 분리하려면
+프로필별 빈 장면 캘리브레이션이 필요하다.
 
-10 Hz 기본 프로필은 다음처럼 캡처한다. `COM3`은 실제 포트로 바꾼다.
+1. 보드와 케이블을 실제 로봇 장착 상태로 완전히 고정한다.
+2. 레이더 전방 3m 안에 사람, 반사판, 상자 등 움직이거나 임시로 놓인 물체가 없는
+   넓은 빈 공간을 준비한다.
+3. 보드가 정지한 상태에서 최소 50개의 완전한 heatmap 프레임을 기록한다.
+
+```powershell
+python -m sensors radar-live `
+  --port COM3 `
+  --baud 1250000 `
+  --allow-elided-empty-point-tlv `
+  --allow-nonzero-padding `
+  --heatmap-azimuth-bins 16 `
+  --heatmap-range-bins 128 `
+  --heatmap-range-step-m 0.09765625 `
+  --output missions\radar-empty-scene.jsonl `
+  --raw-output captures\radar-empty-scene.bin `
+  --mission-id radar-empty-scene `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1 `
+  --calibration-id uncalibrated `
+  --duration 10
+```
+
+이미 같은 출력 파일이 있으면 먼저 별도 이름으로 보관하거나 새 파일명을 사용한다.
+캡처가 끝난 뒤 다음 명령으로 클러터 모델을 만든다.
+
+```powershell
+python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
+  --output configs\radar\calibrations\head-near.json `
+  --min-frames 50
+```
+
+캘리브레이션은 다음 항목에 묶인다.
+
+- 캡처의 `profile_id`
+- heatmap shape인 range/azimuth bin 수
+- heatmap range step
+- motion mode
+- 전방·좌우 축과 부호
+
+프로필, heatmap shape/range step 또는 axes가 달라지면 모델을 자동 적용하지 않고
+`PROFILE MISMATCH`로 차단한다. 보드 방향, 프로필, 케이블 또는 레이더 주변 고정
+장착물이 바뀌면 빈 장면을 다시 기록해 캘리브레이션한다. 이 클러터 모델의
+`calibration_id`는 `SensorHeader.calibration_id`와 별도다.
+
+기본 축은 TI 좌표의 `+Y` 전방, `+X` 우측이다. 축을 바꾸어 장착했다면
+`radar-calibrate`와 `radar_front.py` 양쪽에 동일한 `--forward-axis`,
+`--forward-sign`, `--lateral-axis`, `--lateral-sign` 값을 사용해야 한다.
+
+## 4. 실제 운용 데이터 캡처
+
+캘리브레이션 때와 같은 프로필·heatmap 설정으로 실제 장면을 기록한다. 목표 출력
+파일이 이미 있으면 보관한 뒤 실행한다.
 
 ```powershell
 python -m sensors radar-live `
@@ -90,118 +117,112 @@ python -m sensors radar-live `
   --output missions\radar-board-live.jsonl `
   --raw-output captures\radar-board-live.bin `
   --mission-id radar-board-live `
-  --profile-id iwrl6432-heatmap-profile `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1 `
   --calibration-id uncalibrated
 ```
 
-5 Hz fallback 프로필을 보드에 적용했다면 위 명령의
-`--heatmap-azimuth-bins 16`만 `--heatmap-azimuth-bins 32`로 바꾼다. 세 heatmap
-옵션은 반드시 함께 지정한다. 출력 요약에서 다음을 확인한다.
+이 PowerShell은 캡처가 끝날 때까지 닫지 않는다. 출력 요약의
+`heatmap_frames`와 `heatmap_cells_decoded`가 증가하고
+`missing_heatmap_frames`가 계속 증가하지 않는지 확인한다.
 
-- `heatmap_frames`가 계속 증가한다.
-- `missing_heatmap_frames`가 0이다.
-- `heatmap_cells_decoded`가 증가한다.
-- `major_heatmap_frames` 또는 `minor_heatmap_frames`가 증가한다.
+## 5. R9 조종 화면 실행
 
-heatmap TLV가 없으면 화면은 최근 포인트를 부드럽게 누적한 `POINT EVIDENCE` 모드로
-동작한다. 이 모드는 산점도보다 읽기 쉽지만, 실제 `RAW HEATMAP`보다 정보량이 많아지는
-것은 아니다.
-
-실제 heatmap의 azimuth bin은 선형 각도가 아니다. FFT-shift된 bin `i`를
-`asin(2 × (i - N/2) / N)`으로 각도에 투영하고 ±70°만 표시한다. 0.25 m 안쪽은
-블라인드존, 7.5 m 바깥은 이 조종 화면의 유효 범위 밖으로 취급한다.
-
-### 4. 화면 시작
-
-별도 PowerShell에서 실행한다.
+별도 PowerShell에서 다음 명령을 그대로 실행한다.
 
 ```powershell
-python monitor/radar_front.py `
+python monitor\radar_front.py `
   --follow missions\radar-board-live.jsonl `
-  --history-window 0.2
+  --clutter-calibration configs\radar\calibrations\head-near.json `
+  --max-range-m 3 `
+  --history-window 0.3
 ```
 
-상단 입력 모드는 다음 중 하나로 표시된다.
+브라우저에서 `http://127.0.0.1:8081/`을 열고, 이전 화면이 캐시에 남으면
+`Ctrl+F5`로 새로 고친다.
 
-- `RAW HEATMAP + 3D`: 보드의 range-azimuth 강도면과 실측 `x/y/z` 점군 사용
-- `POINT EVIDENCE`: 포인트만 시간 누적
-- `HEATMAP 대기`: 아직 표시할 반사 데이터 없음
-
-저장된 기록은 다음처럼 재생한다.
+저장된 기록은 같은 캘리브레이션을 지정해 재생한다.
 
 ```powershell
-python monitor/radar_front.py `
+python monitor\radar_front.py `
   --replay missions\radar-board-live.jsonl `
-  --speed 1 `
-  --loop
+  --clutter-calibration configs\radar\calibrations\head-near.json `
+  --max-range-m 3 `
+  --history-window 0.3 `
+  --speed 1
 ```
 
-## 조종 화면 읽는 법
+## 6. 화면 읽는 법
 
-- 3D 포인트 맵의 바닥 격자와 거리 링: 레이더 기준 실제 전방 거리와 좌우 위치
-- 작은 마름모: 최신 프레임에서 측정된 실측 `x/y/z` 반사점(점 잔상 없음)
-- 마름모의 세로 연결선: 기준면에서 실측 높이까지의 높이
-- 마름모 아래 작은 원: 해당 포인트의 바닥 기준 위치
-- 겹치지 않게 표시되는 최대 5개 `거리 · z높이` 라벨
-- 굵은 실선: heatmap에서 방위각별 최근접 강한 반사를 이은 추정 윤곽(높이 미측정)
-- 바닥의 청록 실선: 거리가 비슷한 최신 실측점의 바닥 접점을 방위각 순서로 연결
-- 가는 점선: 서로 가까운 최신 실측 3D 점의 보조 연결이며 실제 물체 경계로 확정할 수 없음
-- 점의 화면 크기: 같은 반사 강도에서는 가까운 점이 크게, 먼 점이 작게 보이는 원근 표현
-- 세로광: range-azimuth heatmap의 반사 방향이며 높이는 측정되지 않음
-- 3D 공간 원근 보기의 색 면: 거리-좌우 반사 강도이며 높이는 측정되지 않음
-- 3D 깊이 카메라의 좌우/위아래: point-cloud TLV의 실측 방위각/고도각
-- 청록: 약하거나 중간 정도의 반사 증거
-- 노랑: 강한 반사 증거
-- 빨강: 0.15 m 이하의 최신 실측 포인트 또는 즉시 정지 상태
-- 주황: 0.15 m 초과 0.30 m 이하의 최신 실측 포인트
-- 다섯 구역의 `미확인`: 안전하거나 비어 있다는 뜻이 아님
-- 다섯 구역의 거리: 그 구역에서 최근 누적된 가장 가까운 반사
+### 0~3m 주 지도
 
-다섯 구역은 경로 계획기가 아니라 사람이 화면을 빠르게 읽기 위한 보조 표시다.
-구역을 녹색 또는 `FREE`로 표시하지 않는다.
+- 화면 아래 중앙이 로봇과 레이더의 현재 원점이다.
+- 0.5m 간격 반원은 로봇으로부터의 전방 거리다.
+- 청록·흰색 셀은 점유 또는 반사 증거다. 어두운 배경은 `UNKNOWN`이다.
+- 테두리가 선명한 마커는 point-cloud의 실제 `x/y/z` 포인트다.
+- 짧은 호는 heatmap의 거리·각도 불확실성을 포함한 반사 증거이며 높이는 없다.
+- `z` 라벨은 point cloud가 실제 높이를 제공한 경우에만 표시한다.
+- 최대 5개의 가까운 track에 거리 라벨을 표시한다.
+- track은 마지막 관측 후 정확히 300ms가 되면 제거된다.
 
-근거리 프로필은 SDK의 근거리 예시와 동일하게 `rangeSelCfg` 최소값을 0.07 m로 설정한다.
-현재 range bin 간격은 약 0.098 m이므로 첫 유효 셀은 약 0.10 m다. 0.15 m 이하의 최신
-point-cloud 실측점만 빨강으로 분류하고, heatmap 단독 반사는 가까워도 빨강 판정에 사용하지
-않아 직접 누설로 인한 상시 경고를 줄인다. 7 cm 미만과 안테나 직접 누설 구간은 신뢰할 수
-없으므로 최종 충돌 정지는 범퍼 또는 별도 근접센서로 보완해야 한다.
+이 화면은 포인트 사이를 임의의 벽이나 표면으로 연결하지 않는다. 희소 포인트 때문에
+광학 카메라나 2D LiDAR처럼 연속 윤곽이 보이지 않을 수 있지만, 측정하지 않은 구조를
+만들어 통로로 오인하는 것보다 안전한 표현이다.
 
-## 안전 상태
+### 0~50cm 충돌 확대
 
-- `WAITING`: 첫 프레임이 오기 전이므로 주행 금지
-- `STALE`: 마지막 정상 프레임이 0.75초보다 오래됨
-- `FAULT`: 마지막 정상 프레임이 2초보다 오래됐거나 HTTP 연결 끊김
-- `DEGRADED`: 프레임 누락, 불완전 데이터 또는 파싱 이상
-- `REPLAY END`: 마지막 기록 화면이 고정됨
+50cm는 주 화면의 최대 표시 거리가 아니라 같은 장면의 근거리 확대창이다. 주 화면은
+계속 3m까지 표시한다. 확대창의 10/20/30/40/50cm 반원은 정확한 거리 기준이다.
 
-`WAITING`, `STALE`, `FAULT`, `REPLAY END`에서는 이전 강도 영상을 회색으로 낮추고
-정지 오버레이로 화면을 가린다. 동결된 장애물 흔적을 현재 정보로 오인하지 않게 하기
-위해서다.
+빨강은 다음 조건을 모두 만족할 때만 나타난다.
 
-## 좌표와 장착 검증
+1. 고정 클러터로 제거되지 않은 point-cloud 포인트다.
+2. 최근 3개 프레임 중 최소 2개 프레임에서 같은 위치로 확인됐다.
+3. 확인된 track의 수평거리가 `10cm` 이하다.
 
-IWRL6432 demo의 기본 좌표는 `+Y` 전방, `+X` 우측이다. 보드를 뒤집거나 회전해
-장착했다면 실행 옵션으로 축과 부호를 바꾼다.
+위험 track이 13cm 이상으로 멀어지거나 300ms 동안 다시 관측되지 않으면 빨강을
+해제한다. 70cm나 1m의 반사는 점유 증거로 보이지만 충돌 빨강이 아니다.
+heatmap의 가까운 bin만으로도 빨강을 만들지 않는다.
 
-```powershell
-python monitor/radar_front.py --demo `
-  --forward-axis y --forward-sign -1 `
-  --lateral-axis x --lateral-sign -1
-```
+`NORMAL`은 “10cm 이내 확인 포인트가 없음”만 뜻한다. 장애물이 없거나 경로가
+안전하다는 뜻이 아니다. 반사가 없거나 센서가 놓친 공간도 `UNKNOWN`으로 남는다.
 
-장착 후에는 0.5 m, 1 m, 2 m 거리와 좌/중/우 위치에 큰 반사판을 놓고 거리와 방향을
-검증한다. 보드 기준점, 자의 시작 위치, 레이더 range bin 양자화가 다르므로 자로 잰
-외곽 거리와 화면의 최근점은 몇 cm 차이 날 수 있다. 보정 전에는
-`calibration_id=uncalibrated`를 유지한다.
+## 7. 차단 상태와 안전 한계
 
-## 실제 운용 전에 확인할 항목
+- `CALIBRATION REQUIRED`: 클러터 모델이 없어 두 지도를 신뢰할 수 없음
+- `PROFILE MISMATCH`: 프로필, heatmap 형상/range step 또는 axes가 모델과 다름
+- `WAITING`: 첫 완전 프레임을 기다리는 중
+- `STALE`: 마지막 정상 프레임 후 0.75초 이상 지남
+- `FAULT`: 마지막 정상 프레임 후 2초 이상 지났거나 소스 오류
+- `REPLAY END`: 기록 재생이 끝남
 
-1. 정면 0.5/1/2/3 m 반사판 거리가 일관되게 증가하는지 확인한다.
-2. 좌·중·우 반사판이 올바른 구역에 표시되는지 확인한다.
-3. 벽과 큰 장애물이 포인트보다 heatmap 면으로 안정적으로 보이는지 확인한다.
-4. 케이블 분리 시 0.75초 안에 `STALE`, 2초 안에 `FAULT`가 표시되는지 확인한다.
-5. 반사가 사라져도 구역이 녹색이 아닌 `미확인`으로 남는지 확인한다.
-6. 10분 이상 실행해 프레임률, 누락 수, 메모리 사용량을 확인한다.
+이 상태에서는 이전 점유를 현재 정보처럼 남기지 않고 두 지도를 차단 오버레이로
+가린다. missing return, heatmap의 빈 셀, 가까운 bin 미검출은 절대로 안전 판정이
+아니다. 화면은 모터 정지 명령을 보내지 않는다.
 
-이 화면만으로 충돌 가능 여부를 확정하면 안 된다. 실제 주행에는 카메라, 운전자 판단,
-저속 제한, 비상 정지 절차를 함께 사용한다.
+현재 heatmap range step은 약 9.8cm이고 10cm 안쪽은 안테나 직접 누설과 겹친다.
+따라서 신뢰 가능한 1cm 거리 분리는 보장할 수 없다. 최종 로봇에는 범퍼 또는 별도
+근접센서, 저속 제한, 비상 정지 절차가 필요하다.
+
+## 8. 실측 검증
+
+빈 장면 캘리브레이션 후 큰 금속 반사판을 사용해 다음 순서로 기록한다.
+
+1. 정면 0.2/0.3/0.5/1/2/3m에서 거리 라벨이 일관되게 변하는지 확인한다.
+2. 좌·중·우 위치가 지도에서 올바른 방향에 나타나는지 확인한다.
+3. 0.70m 반사판이 빨강이 되지 않는지 확인한다.
+4. 20cm부터 5cm까지 2cm 간격으로 접근해, 확인 포인트가 10cm 이하일 때만
+   빨강이 되고 13cm 이상에서 해제되는지 확인한다.
+5. 케이블을 분리해 `STALE`, `FAULT` 차단 오버레이가 나타나는지 확인한다.
+6. 반사가 사라져도 녹색이나 `FREE`가 아닌 `UNKNOWN`으로 남는지 확인한다.
+7. 레이더와 화면을 함께 녹화하고 mission JSONL과 raw capture를 보존한다.
+
+광학 자의 물체 외곽이 아니라 레이더 안테나 기준점에서 거리를 잰다. point-cloud와
+heatmap 거리 양자화 때문에 몇 cm 차이가 날 수 있다.
+
+## 9. 다음 단계
+
+현재 R9는 IMU 없이 동작하는 로봇 기준 즉시뷰다. 다음 단계에서 엔코더와 IMU의
+timestamp·좌표계를 맞추고 radar-to-base 외부 보정을 적용해 이동량을 보상한다.
+그 다음에만 여러 프레임을 세계 좌표에 누적하는 rolling occupancy map,
+Doppler odometry, radar scan-to-submap 정합과 SLAM을 추가할 수 있다. 유닛 분리
+위치는 그때의 pose와 불확실성을 함께 저장해야 한다.
