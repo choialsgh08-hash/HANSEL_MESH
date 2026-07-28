@@ -128,6 +128,32 @@ class SensorCliTests(unittest.TestCase):
             self.assertNotEqual(result, 0)
             self.assertIn("at least 7", stderr)
 
+    def test_radar_calibrate_rejects_minimum_below_five(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "model.json"
+            result, _, stderr = self.invoke_calibrate(
+                REAL_FIXTURE,
+                output,
+                "--min-frames",
+                "4",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertFalse(output.exists())
+            self.assertIn("--min-frames", stderr)
+
+    def test_radar_calibrate_accepts_minimum_of_five(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "model.json"
+            result, stdout, stderr = self.invoke_calibrate(
+                REAL_FIXTURE,
+                output,
+                "--min-frames",
+                "5",
+            )
+            self.assertEqual(result, 0, stderr)
+            self.assertTrue(output.exists())
+            self.assertEqual(json.loads(stdout)["frames_used"], 6)
+
     def test_heatmap_cli_requires_range_bins_with_other_settings(self):
         stderr = io.StringIO()
         with mock.patch(

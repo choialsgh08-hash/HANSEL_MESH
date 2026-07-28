@@ -441,26 +441,38 @@ def _load_clusters(value: object) -> Tuple[ClutterPointCluster, ...]:
             payload["observation_fraction"],
             f"point_clusters[{index}].observation_fraction",
         )
-        if radius <= 0:
-            raise ValueError("point cluster radius_m must be positive")
-        if not 0.0 <= fraction <= 1.0:
+        if not (
+            POINT_CLUSTER_MIN_RADIUS_M
+            <= radius
+            <= POINT_CLUSTER_MAX_RADIUS_M
+        ):
+            raise ValueError("point cluster radius_m is out of range")
+        if not POINT_CLUSTER_MIN_FRACTION <= fraction <= 1.0:
             raise ValueError(
                 "point cluster observation_fraction is out of range"
             )
+        forward_m = _require_float_value(
+            payload["forward_m"],
+            f"point_clusters[{index}].forward_m",
+        )
+        lateral_m = _require_float_value(
+            payload["lateral_m"],
+            f"point_clusters[{index}].lateral_m",
+        )
+        height_m = _require_float_value(
+            payload["height_m"],
+            f"point_clusters[{index}].height_m",
+        )
+        if math.dist(
+            (0.0, 0.0, 0.0),
+            (forward_m, lateral_m, height_m),
+        ) > POINT_CALIBRATION_MAX_RANGE_M:
+            raise ValueError("point cluster center is outside near range")
         result.append(
             ClutterPointCluster(
-                forward_m=_require_float_value(
-                    payload["forward_m"],
-                    f"point_clusters[{index}].forward_m",
-                ),
-                lateral_m=_require_float_value(
-                    payload["lateral_m"],
-                    f"point_clusters[{index}].lateral_m",
-                ),
-                height_m=_require_float_value(
-                    payload["height_m"],
-                    f"point_clusters[{index}].height_m",
-                ),
+                forward_m=forward_m,
+                lateral_m=lateral_m,
+                height_m=height_m,
                 radius_m=radius,
                 observation_fraction=fraction,
             )

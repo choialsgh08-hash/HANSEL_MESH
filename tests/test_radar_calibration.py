@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -186,7 +187,41 @@ def load_real_fixture() -> tuple[RadarFrame, ...]:
     )
 
 
+def with_recomputed_calibration_id(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    without_id = dict(payload)
+    del without_id["calibration_id"]
+    canonical = json.dumps(
+        without_id,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload["calibration_id"] = (
+        "radar-clutter-" + hashlib.sha256(canonical).hexdigest()[:16]
+    )
+    return payload
+
+
 class RadarClutterModelTests(unittest.TestCase):
+    def assert_cluster_override_is_rejected(
+        self,
+        **override: float,
+    ) -> None:
+        model = build_clutter_model(
+            synthetic_calibration_frames(),
+            RadarAxes(),
+        )
+        payload = model.to_dict()
+        payload["point_clusters"][0].update(override)
+        with_recomputed_calibration_id(payload)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "model.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_clutter_model(path)
+
     def test_build_is_deterministic_and_finds_persistent_near_clusters(self):
         frames = synthetic_calibration_frames(count=50)
         first = build_clutter_model(frames, RadarAxes(), min_frames=50)
@@ -320,6 +355,24 @@ class RadarClutterModelTests(unittest.TestCase):
             path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "calibration_id"):
                 load_clutter_model(path)
+
+    def test_load_rejects_cluster_radius_below_builder_minimum(self):
+        self.assert_cluster_override_is_rejected(radius_m=0.024999)
+
+    def test_load_rejects_cluster_radius_above_builder_maximum(self):
+        self.assert_cluster_override_is_rejected(radius_m=0.080001)
+
+    def test_load_rejects_cluster_below_persistence_minimum(self):
+        self.assert_cluster_override_is_rejected(
+            observation_fraction=0.599999
+        )
+
+    def test_load_rejects_cluster_center_outside_near_range(self):
+        self.assert_cluster_override_is_rejected(
+            forward_m=0.150001,
+            lateral_m=0.0,
+            height_m=0.0,
+        )
 
 
 if __name__ == "__main__":

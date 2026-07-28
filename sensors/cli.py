@@ -545,6 +545,13 @@ def command_radar_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _calibration_min_frames(value: str) -> int:
+    result = int(value)
+    if result < 5:
+        raise argparse.ArgumentTypeError("must be at least 5")
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -676,7 +683,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calibrate.add_argument("path")
     calibrate.add_argument("--output", required=True)
-    calibrate.add_argument("--min-frames", type=int, default=50)
+    calibrate.add_argument(
+        "--min-frames",
+        type=_calibration_min_frames,
+        default=50,
+    )
     calibrate.add_argument(
         "--forward-axis",
         choices=("x", "y"),
