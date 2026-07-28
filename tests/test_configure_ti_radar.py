@@ -74,6 +74,8 @@ class ConfigureTiRadarTest(unittest.TestCase):
         profile = MODULE.partition_at_baud(MODULE.load_commands(cfg))
         self.assertEqual(profile.target_baud, 1_250_000)
         self.assertIn("rangeSelCfg 0.07 7.5", profile.before_baud)
+        self.assertIn("lowPowerCfg 0", profile.before_baud)
+        self.assertNotIn("lowPowerCfg 1", profile.before_baud)
         self.assertIn(
             "sigProcChainCfg 16 8 1 2 8 4 0 0.3 0",
             profile.before_baud,
