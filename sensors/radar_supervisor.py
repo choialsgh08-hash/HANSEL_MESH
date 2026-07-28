@@ -87,6 +87,7 @@ class RadarSupervisorConfig:
     explicit_port: str | None = None
     xds_serial: str | None = None
     reset_executable: Path | None = None
+    reset_unavailable_reason: str | None = None
     initial_baud: int = 115_200
     data_baud: int = 1_250_000
     heatmap_azimuth_bins: int = 16
@@ -114,6 +115,18 @@ class RadarSupervisorConfig:
             _require_path(getattr(self, name), name)
         if self.reset_executable is not None:
             _require_path(self.reset_executable, "reset_executable")
+        if (
+            self.reset_unavailable_reason is not None
+            and not isinstance(self.reset_unavailable_reason, str)
+        ):
+            raise ValueError("reset_unavailable_reason must be a string or None")
+        if (
+            self.reset_executable is not None
+            and self.reset_unavailable_reason is not None
+        ):
+            raise ValueError(
+                "reset_unavailable_reason requires reset_executable to be None"
+            )
         for name in ("run_id", "mission_id", "profile_id"):
             validate_sensor_id(getattr(self, name), name)
         for name in (
@@ -825,6 +838,14 @@ class RadarSupervisor:
                 if self._port is not None
                 else self._config.xds_serial
             ),
+            "reset_capability": {
+                "available": self._config.reset_executable is not None,
+                "reason": (
+                    None
+                    if self._config.reset_executable is not None
+                    else self._config.reset_unavailable_reason
+                ),
+            },
             "mission_path": (
                 str(self._paths.mission) if self._paths is not None else None
             ),

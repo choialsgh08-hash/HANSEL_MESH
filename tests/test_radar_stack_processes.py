@@ -1,12 +1,16 @@
+from datetime import datetime, timezone
+import importlib.util
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from sensors.radar_watchdog import ExpectedRadarEvidence, RadarEpochWatchdog
 from sensors.radar_stack_processes import (
     ManagedChild,
     RadarStackProcesses,
@@ -15,6 +19,22 @@ from sensors.radar_stack_processes import (
 )
 from sensors.radar_supervisor import EpochPaths, RadarSupervisorConfig
 from sensors.ti_radar_control import RadarPortIdentity
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+LAUNCHER_PATH = REPOSITORY_ROOT / "scripts" / "run_radar_stack.py"
+
+
+def load_launcher():
+    spec = importlib.util.spec_from_file_location(
+        "run_radar_stack_under_test",
+        LAUNCHER_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not create launcher module spec")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class FakeProcess:
@@ -312,6 +332,285 @@ class RadarStackProcessesTests(unittest.TestCase):
         first = manager.stop_child(child)
         self.assertEqual(first.pid, 98)
         self.assertEqual(manager.stop_owned_children(), ())
+
+
+class RadarStackLauncherTests(unittest.TestCase):
+    def test_parser_defaults_and_help_work_outside_repository(self):
+        launcher = load_launcher()
+        args = launcher.build_parser().parse_args([])
+        self.assertEqual(args.port, None)
+        self.assertEqual(args.xds_serial, None)
+        self.assertEqual(args.run_id, None)
+        self.assertEqual(args.output_root, REPOSITORY_ROOT)
+        self.assertEqual(args.frame_timeout, 2.5)
+        self.assertEqual(args.first_frame_timeout, 3.0)
+        self.assertEqual(args.verify_frames, 5)
+        self.assertEqual(args.http_port, 8081)
+        self.assertEqual(
+            args.cfg.name,
+            "iwrl6432_3d_operator_near_10hz.cfg",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, str(LAUNCHER_PATH), "--help"],
+                cwd=directory,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--clutter-calibration", result.stdout)
+        self.assertIn("--xds-serial", result.stdout)
+
+    def test_parser_and_main_reject_unsafe_values_before_external_effects(self):
+        launcher = load_launcher()
+        parser = launcher.build_parser()
+        invalid_parser_args = (
+            ("--frame-timeout", "0"),
+            ("--first-frame-timeout", "-1"),
+            ("--verification-timeout", "0"),
+            ("--verify-frames", "0"),
+            ("--retry-initial", "-0.5"),
+            ("--retry-max", "0"),
+            ("--http-port", "0"),
+            ("--http-port", "65536"),
+        )
+        for option, value in invalid_parser_args:
+            with self.subTest(option=option, value=value):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([option, value])
+
+        with self.assertRaisesRegex(SystemExit, "retry"):
+            launcher.main(
+                [
+                    "--clutter-calibration",
+                    str(__file__),
+                    "--retry-initial",
+                    "2",
+                    "--retry-max",
+                    "1",
+                ]
+            )
+        missing = Path(tempfile.gettempdir()) / "missing-radar-calibration.json"
+        with self.assertRaisesRegex(SystemExit, "calibration"):
+            launcher.main(["--clutter-calibration", str(missing)])
+
+    def test_main_generates_one_utc_run_id_and_composes_real_dependencies(self):
+        launcher = load_launcher()
+        port = SimpleNamespace(
+            device="COM9",
+            vid=0x0451,
+            pid=0xBEF3,
+            serial_number="RI32",
+            description="XDS110 Application/User UART",
+            location="usb-1",
+        )
+        selected = RadarPortIdentity(
+            device="COM9",
+            vid=0x0451,
+            pid=0xBEF3,
+            serial_number="RI32",
+            description="XDS110 Application/User UART",
+            location="usb-1",
+        )
+        generated_at = datetime(2026, 7, 29, 1, 2, 3, tzinfo=timezone.utc)
+        reset_executable = Path("C:/ti/xds110reset.exe")
+        captured: dict[str, object] = {}
+        installed_handlers: dict[int, object] = {}
+
+        class FakeSupervisor:
+            def __init__(self, config, dependencies):
+                captured["config"] = config
+                captured["dependencies"] = dependencies
+
+            def run(self, stop_requested):
+                captured["stop_before_signal"] = stop_requested()
+                handler = installed_handlers[signal.SIGTERM]
+                handler(signal.SIGTERM, None)
+                captured["stop_after_signal"] = stop_requested()
+
+        def install_signal(signum, handler):
+            if callable(handler):
+                installed_handlers[signum] = handler
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calibration = root / "clutter.json"
+            calibration.write_text("{}", encoding="utf-8")
+            output = root / "radar-output"
+            with (
+                mock.patch.object(
+                    launcher,
+                    "_utc_now",
+                    mock.Mock(return_value=generated_at),
+                ) as utc_now,
+                mock.patch.object(
+                    launcher,
+                    "comports",
+                    mock.Mock(return_value=[port]),
+                ) as comports,
+                mock.patch.object(
+                    launcher,
+                    "find_xds110_reset",
+                    mock.Mock(return_value=reset_executable),
+                ) as find_reset,
+                mock.patch.object(launcher, "RadarSupervisor", FakeSupervisor),
+                mock.patch.object(
+                    launcher.signal,
+                    "signal",
+                    side_effect=install_signal,
+                ),
+                mock.patch.object(
+                    launcher.signal,
+                    "getsignal",
+                    return_value=signal.SIG_DFL,
+                ),
+            ):
+                result = launcher.main(
+                    [
+                        "--xds-serial",
+                        "RI32",
+                        "--clutter-calibration",
+                        str(calibration),
+                        "--output-root",
+                        str(output),
+                    ]
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(utc_now.call_count, 1)
+        config = captured["config"]
+        dependencies = captured["dependencies"]
+        self.assertEqual(config.run_id, "20260729-010203")
+        self.assertEqual(config.output_root, output)
+        self.assertEqual(config.calibration_path, calibration)
+        self.assertEqual(config.reset_executable, reset_executable)
+        self.assertIsNone(config.reset_unavailable_reason)
+        self.assertEqual(config.data_baud, 1_250_000)
+        self.assertEqual(config.http_bind, "127.0.0.1")
+        self.assertIs(dependencies.port_provider, comports)
+        self.assertIsInstance(dependencies.processes, RadarStackProcesses)
+        self.assertIs(dependencies.monotonic, launcher.time.monotonic)
+        self.assertIs(dependencies.sleep, launcher.time.sleep)
+        self.assertFalse(captured["stop_before_signal"])
+        self.assertTrue(captured["stop_after_signal"])
+        self.assertIn(signal.SIGINT, installed_handlers)
+        self.assertIn(signal.SIGTERM, installed_handlers)
+        find_reset.assert_called_once_with(None, (Path("C:/ti"),))
+
+        with (
+            mock.patch.object(
+                launcher,
+                "reset_xds110_target",
+            ) as reset_target,
+            mock.patch.object(
+                launcher,
+                "apply_profile",
+                return_value={
+                    "commands_completed": 25,
+                    "new_baud_prompt_observed": True,
+                    "first_magic_observed": True,
+                },
+            ) as apply_profile,
+        ):
+            self.assertTrue(dependencies.reset_target(selected, config))
+            profile_result = dependencies.configure(selected, config)
+
+        reset_target.assert_called_once_with(
+            reset_executable,
+            "RI32",
+            launcher.subprocess.run,
+        )
+        profile = apply_profile.call_args.kwargs["profile"]
+        self.assertEqual(profile.target_baud, config.data_baud)
+        self.assertEqual(apply_profile.call_args.kwargs["port"], "COM9")
+        self.assertEqual(profile_result["commands_completed"], 25)
+        paths = EpochPaths(
+            mission=output / "missions" / "e.jsonl",
+            raw=output / "captures" / "e.bin",
+            raw_index=output / "captures" / "e.index.jsonl",
+            runtime_dir=output / "runtime" / "run",
+            capture_stdout=output / "runtime" / "capture.out",
+            capture_stderr=output / "runtime" / "capture.err",
+            viewer_stdout=output / "runtime" / "viewer.out",
+            viewer_stderr=output / "runtime" / "viewer.err",
+        )
+        watchdog = dependencies.watchdog_factory(paths, config, 4.5)
+        self.assertIsInstance(watchdog, RadarEpochWatchdog)
+        self.assertEqual(
+            watchdog._expected,
+            ExpectedRadarEvidence(
+                profile_id=config.profile_id,
+                heatmap_azimuth_bins=16,
+                heatmap_range_bins=128,
+                heatmap_range_step_m=0.09765625,
+            ),
+        )
+
+    def test_reset_discovery_failure_is_preserved_as_recoverable_capability(self):
+        launcher = load_launcher()
+        captured: dict[str, object] = {}
+        reason = (
+            "xds110reset executable was not found; install TI UniFlash "
+            "or provide its path"
+        )
+
+        class FakeSupervisor:
+            def __init__(self, config, dependencies):
+                captured["config"] = config
+                captured["dependencies"] = dependencies
+
+            def run(self, stop_requested):
+                del stop_requested
+
+        with tempfile.TemporaryDirectory() as directory:
+            calibration = Path(directory) / "clutter.json"
+            calibration.write_text("{}", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    launcher,
+                    "find_xds110_reset",
+                    side_effect=RuntimeError(reason),
+                ),
+                mock.patch.object(launcher, "RadarSupervisor", FakeSupervisor),
+                mock.patch.object(launcher.signal, "signal"),
+                mock.patch.object(
+                    launcher.signal,
+                    "getsignal",
+                    return_value=signal.SIG_DFL,
+                ),
+            ):
+                self.assertEqual(
+                    launcher.main(
+                        [
+                            "--run-id",
+                            "known-run",
+                            "--clutter-calibration",
+                            str(calibration),
+                        ]
+                    ),
+                    0,
+                )
+
+        config = captured["config"]
+        dependencies = captured["dependencies"]
+        self.assertIsNone(config.reset_executable)
+        self.assertEqual(config.reset_unavailable_reason, reason)
+        self.assertFalse(
+            dependencies.reset_target(
+                RadarPortIdentity(
+                    "COM3",
+                    0x0451,
+                    0xBEF3,
+                    "RI32",
+                    "XDS110 Application/User UART",
+                    "usb-1",
+                ),
+                config,
+            )
+        )
 
 
 if __name__ == "__main__":

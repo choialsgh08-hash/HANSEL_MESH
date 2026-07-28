@@ -81,6 +81,7 @@ class RadarSupervisorContractTests(unittest.TestCase):
         self.assertIsNone(config.explicit_port)
         self.assertIsNone(config.xds_serial)
         self.assertIsNone(config.reset_executable)
+        self.assertIsNone(config.reset_unavailable_reason)
         self.assertEqual(config.initial_baud, 115_200)
         self.assertEqual(config.data_baud, 1_250_000)
         self.assertEqual(config.heatmap_azimuth_bins, 16)
@@ -148,6 +149,15 @@ class RadarSupervisorContractTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.make_config(retry_initial_s=2.0, retry_max_s=1.0)
+        for value in (False, 1, Path("reason")):
+            with self.subTest(reset_unavailable_reason=value):
+                with self.assertRaises(ValueError):
+                    self.make_config(reset_unavailable_reason=value)
+        with self.assertRaises(ValueError):
+            self.make_config(
+                reset_executable=Path("xds110reset.exe"),
+                reset_unavailable_reason="not available",
+            )
         with self.assertRaises(ValueError):
             self.make_config(http_bind="")
 
@@ -795,6 +805,10 @@ class RadarSupervisorStartupTests(unittest.TestCase):
     def test_healthy_startup_has_exact_order_and_stops_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = SupervisorFixture(directory)
+            fixture.config = replace(
+                fixture.config,
+                reset_executable=Path("xds110reset.exe"),
+            )
             RadarSupervisor(fixture.config, fixture.dependencies).run(
                 fixture.stop_when_running
             )
@@ -810,6 +824,12 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                     "viewer:e001",
                     "running:e001",
                 ],
+            )
+            self.assertEqual(
+                json.loads(fixture.manifest.read_text(encoding="utf-8"))[
+                    "reset_capability"
+                ],
+                {"available": True, "reason": None},
             )
 
     def test_second_discovery_reenumeration_uses_com9_and_same_serial(self) -> None:
@@ -1654,6 +1674,10 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                         self.assertEqual(path.read_bytes(), content)
 
     def test_no_reset_tool_waits_for_real_usb_cycle_after_silent_fault(self) -> None:
+        reset_unavailable_reason = (
+            "xds110reset executable was not found; install TI UniFlash "
+            "or provide its path"
+        )
         ambiguous = [
             application_port("COM3"),
             application_port("COM4"),
@@ -1683,6 +1707,10 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                     [snapshot()],
                 ],
             )
+            fixture.config = replace(
+                fixture.config,
+                reset_unavailable_reason=reset_unavailable_reason,
+            )
             reasons: list[str] = []
             original_write = write_manifest_atomic
 
@@ -1710,6 +1738,13 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
             self.assertLess(absent_poll, reappeared_poll)
             self.assertLess(reappeared_poll, second_configure)
             self.assertEqual(fixture.processes.capture_ports, ["COM3", "COM9"])
+            self.assertEqual(
+                fixture.payload()["reset_capability"],
+                {
+                    "available": False,
+                    "reason": reset_unavailable_reason,
+                },
+            )
 
     def test_no_reset_tool_uses_already_observed_port_loss(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
