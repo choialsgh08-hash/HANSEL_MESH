@@ -1368,7 +1368,7 @@ python -m sensors radar-calibrate `
 Expected: exit `0`, deterministic calibration summary, and no repository file
 outside `tmp` changes.
 
-- [ ] **Step 6: Start demo and real replay servers for browser verification**
+- [x] **Step 6: Start demo and real replay servers for browser verification**
 
 Demo:
 
@@ -1388,6 +1388,12 @@ python monitor\radar_front.py `
 ```
 
 - [ ] **Step 7: Verify desktop and mobile browser layouts**
+
+> 2026-07-28: both localhost servers and their API/static assets were
+> verified, but the Codex in-app browser policy rejected localhost
+> navigation. Responsive visual inspection and the screenshot remain
+> intentionally unclaimed; the live 8081 page is left available for manual
+> refresh.
 
 At `1440 x 900` and `390 x 844`, verify:
 
