@@ -17,8 +17,11 @@ python scripts\configure_ti_radar.py `
   --command-timeout 1.5
 ```
 
-결과에서 `commands_completed=25`, `new_baud_verified_by_version=true`,
-`first_magic_observed=true`를 확인한다. 프로필 적용 후에는 다시 RESET하지 않는다.
+결과에서 `commands_completed=25`, `new_baud_prompt_observed=true`,
+`first_magic_observed=true`를 확인한다. `new_baud_verified_by_version`은 새 baud의
+프롬프트를 직접 확인하지 못해 fallback `version` probe를 사용한 경우에만
+`true`다. 프롬프트를 직접 확인한 정상 경로에서는 이 값이 `false`여도 정상이다.
+프로필 적용 후에는 다시 RESET하지 않는다.
 
 ## 2. 캘리브레이션 파일 확인
 
@@ -59,6 +62,8 @@ python -m sensors radar-live `
 기존 출력 파일이 있으면 보관하거나 다른 이름을 사용한다. 캡처 후 실행한다.
 
 ```powershell
+New-Item -ItemType Directory -Force -Path configs\radar\calibrations
+
 python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
   --output configs\radar\calibrations\head-near.json `
   --min-frames 50

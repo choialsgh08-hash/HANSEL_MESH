@@ -762,18 +762,66 @@ class MissionLogFollowerTests(unittest.TestCase):
 
 
 class RadarFrontDocumentationTests(unittest.TestCase):
-    def test_operator_guide_documents_the_calibrated_r9_contract(self):
-        docs = (
-            REPO_ROOT / "docs" / "radar_front_view.md"
-        ).read_text(encoding="utf-8")
+    CALIBRATE_COMMAND = (
+        "python -m sensors radar-calibrate "
+        "missions\\radar-empty-scene.jsonl `\n"
+        "  --output configs\\radar\\calibrations\\head-near.json `\n"
+        "  --min-frames 50"
+    )
+    VIEWER_COMMAND = (
+        "python monitor\\radar_front.py `\n"
+        "  --follow missions\\radar-board-live.jsonl `\n"
+        "  --clutter-calibration "
+        "configs\\radar\\calibrations\\head-near.json `\n"
+        "  --max-range-m 3 `\n"
+        "  --history-window 0.3"
+    )
+    CALIBRATION_DIRECTORY_COMMAND = (
+        "New-Item -ItemType Directory -Force "
+        "-Path configs\\radar\\calibrations"
+    )
 
-        self.assertIn("radar-calibrate", docs)
-        self.assertIn("--clutter-calibration", docs)
-        self.assertIn("0~3m", docs)
-        self.assertIn("0~50cm", docs)
-        self.assertIn("10cm", docs)
-        self.assertIn("UNKNOWN", docs)
-        self.assertNotIn("흑백 벽면", docs)
+    def read_guides(self):
+        return {
+            name: (REPO_ROOT / "docs" / name).read_text(
+                encoding="utf-8"
+            )
+            for name in (
+                "radar_front_view.md",
+                "radar_reconnect_windows.md",
+            )
+        }
+
+    def test_both_guides_document_the_calibrated_r9_contract(self):
+        for name, docs in self.read_guides().items():
+            with self.subTest(name=name):
+                self.assertIn(self.CALIBRATE_COMMAND, docs)
+                self.assertIn(self.VIEWER_COMMAND, docs)
+                self.assertIn("0~3m", docs)
+                self.assertIn("0~50cm", docs)
+                self.assertIn("10cm", docs)
+                self.assertIn("UNKNOWN", docs)
+                self.assertNotIn("흑백 벽면", docs)
+
+    def test_both_guides_create_calibration_directory_before_calibrate(
+        self,
+    ):
+        for name, docs in self.read_guides().items():
+            with self.subTest(name=name):
+                self.assertIn(self.CALIBRATION_DIRECTORY_COMMAND, docs)
+                self.assertLess(
+                    docs.index(self.CALIBRATION_DIRECTORY_COMMAND),
+                    docs.index(self.CALIBRATE_COMMAND),
+                )
+
+    def test_both_guides_use_prompt_observed_as_baud_success_signal(self):
+        for name, docs in self.read_guides().items():
+            with self.subTest(name=name):
+                self.assertIn("`new_baud_prompt_observed=true`", docs)
+                self.assertNotIn(
+                    "`new_baud_verified_by_version=true`",
+                    docs,
+                )
 
 
 class RadarFrontHttpTests(unittest.TestCase):
