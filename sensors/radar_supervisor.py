@@ -378,8 +378,9 @@ class RadarSupervisor:
         recovering: bool,
         usb_absence_seen: bool,
     ) -> bool:
-        usb_cycle_satisfied = usb_absence_seen
         while True:
+            attempt_usb_absence_seen = usb_absence_seen
+            usb_absence_seen = False
             self._transition(SupervisorState.WAIT_PORT, "waiting_for_port")
             port = self._wait_for_port(stop_requested)
             if port is None:
@@ -405,12 +406,11 @@ class RadarSupervisor:
                 if port is None:
                     return False
                 self._port = port
-            elif not usb_cycle_satisfied:
+            elif not attempt_usb_absence_seen:
                 port = self._wait_for_usb_cycle(stop_requested)
                 if port is None:
                     return False
                 self._port = port
-                usb_cycle_satisfied = True
 
             self._transition(SupervisorState.CONFIGURE, "configuring")
             try:
@@ -466,6 +466,10 @@ class RadarSupervisor:
             except Exception:
                 self._finalize_epoch(reason="capture_start_failed")
                 self._restore_verified_paths()
+                self._transition(
+                    SupervisorState.RECOVERING,
+                    "capture_start_failed",
+                )
                 if not self._backoff(stop_requested):
                     return False
                 continue
@@ -725,6 +729,8 @@ class RadarSupervisor:
             raise RuntimeError(
                 "stop_child result does not match registered active child"
             )
+        if self._active_capture is child:
+            self._set_capture_exit_code(result.exit_code)
         self._record_stop_result(result)
         if self._active_capture is child:
             self._active_capture = None
