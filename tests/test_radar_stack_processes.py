@@ -612,6 +612,276 @@ class RadarStackLauncherTests(unittest.TestCase):
             )
         )
 
+    def test_relative_paths_are_resolved_once_from_the_callers_working_directory(self):
+        launcher = load_launcher()
+        captured: dict[str, object] = {}
+
+        class FakeSupervisor:
+            def __init__(self, config, dependencies):
+                del dependencies
+                captured["config"] = config
+
+            def run(self, stop_requested):
+                del stop_requested
+
+        with tempfile.TemporaryDirectory() as directory:
+            caller_root = Path(directory)
+            profile = caller_root / "profile.cfg"
+            profile.write_text(
+                "sensorStop\nbaudRate 1250000\nsensorStart\n",
+                encoding="utf-8",
+            )
+            calibration = caller_root / "calibration.json"
+            calibration.write_text("{}", encoding="utf-8")
+            reset_executable = caller_root / "xds110reset.exe"
+            reset_executable.touch()
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(caller_root)
+                with (
+                    mock.patch.object(
+                        launcher,
+                        "find_xds110_reset",
+                        side_effect=lambda explicit, roots: explicit,
+                    ),
+                    mock.patch.object(
+                        launcher,
+                        "RadarSupervisor",
+                        FakeSupervisor,
+                    ),
+                    mock.patch.object(launcher.signal, "signal"),
+                    mock.patch.object(
+                        launcher.signal,
+                        "getsignal",
+                        return_value=signal.SIG_DFL,
+                    ),
+                ):
+                    self.assertEqual(
+                        launcher.main(
+                            [
+                                "--run-id",
+                                "relative-path-run",
+                                "--output-root",
+                                "relative-out",
+                                "--cfg",
+                                "profile.cfg",
+                                "--clutter-calibration",
+                                "calibration.json",
+                                "--reset-executable",
+                                "xds110reset.exe",
+                            ]
+                        ),
+                        0,
+                    )
+            finally:
+                os.chdir(previous_cwd)
+
+        config = captured["config"]
+        self.assertEqual(
+            config.output_root,
+            caller_root / "relative-out",
+        )
+        self.assertEqual(config.profile_path, profile)
+        self.assertEqual(config.calibration_path, calibration)
+        self.assertEqual(config.reset_executable, reset_executable)
+        for path in (
+            config.output_root,
+            config.profile_path,
+            config.calibration_path,
+            config.reset_executable,
+        ):
+            self.assertTrue(path.is_absolute())
+
+        paths = EpochPaths(
+            mission=config.output_root / "missions" / "epoch.jsonl",
+            raw=config.output_root / "captures" / "epoch.bin",
+            raw_index=config.output_root / "captures" / "epoch.index.jsonl",
+            runtime_dir=config.output_root / "runtime" / "run",
+            capture_stdout=config.output_root / "runtime" / "capture.out",
+            capture_stderr=config.output_root / "runtime" / "capture.err",
+            viewer_stdout=config.output_root / "runtime" / "viewer.out",
+            viewer_stderr=config.output_root / "runtime" / "viewer.err",
+        )
+        capture_command = build_capture_command(
+            RadarPortIdentity(
+                "COM3",
+                0x0451,
+                0xBEF3,
+                "RI32",
+                "XDS110 Application/User UART",
+                "usb-1",
+            ),
+            paths,
+            config,
+        )
+        viewer_command = build_viewer_command(paths, config)
+        self.assertEqual(
+            Path(capture_command[capture_command.index("--output") + 1]),
+            paths.mission,
+        )
+        self.assertEqual(
+            Path(capture_command[capture_command.index("--raw-output") + 1]),
+            paths.raw,
+        )
+        self.assertEqual(
+            Path(
+                viewer_command[
+                    viewer_command.index("--clutter-calibration") + 1
+                ]
+            ),
+            calibration,
+        )
+
+    def test_missing_profile_is_rejected_before_reset_or_hardware_dependencies(self):
+        launcher = load_launcher()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calibration = root / "calibration.json"
+            calibration.write_text("{}", encoding="utf-8")
+            missing_profile = root / "missing.cfg"
+            with (
+                mock.patch.object(
+                    launcher,
+                    "find_xds110_reset",
+                    return_value=root / "xds110reset.exe",
+                ) as find_reset,
+                mock.patch.object(launcher, "RadarSupervisor") as supervisor,
+                mock.patch.object(launcher, "comports") as comports,
+                mock.patch.object(
+                    launcher,
+                    "reset_xds110_target",
+                ) as reset_target,
+            ):
+                with self.assertRaisesRegex(SystemExit, "cfg|profile"):
+                    launcher.main(
+                        [
+                            "--cfg",
+                            str(missing_profile),
+                            "--clutter-calibration",
+                            str(calibration),
+                        ]
+                    )
+
+        find_reset.assert_not_called()
+        supervisor.assert_not_called()
+        comports.assert_not_called()
+        reset_target.assert_not_called()
+
+    def test_signal_handlers_restore_in_reverse_after_supervisor_return_or_error(self):
+        launcher = load_launcher()
+        for supervisor_error in (None, RuntimeError("supervisor failed")):
+            with self.subTest(supervisor_error=supervisor_error):
+                originals = {
+                    signal.SIGINT: object(),
+                    signal.SIGTERM: object(),
+                }
+                signal_calls: list[tuple[int, object]] = []
+
+                def set_signal(signum, handler):
+                    signal_calls.append((signum, handler))
+
+                class FakeSupervisor:
+                    def __init__(self, config, dependencies):
+                        del config, dependencies
+
+                    def run(self, stop_requested):
+                        del stop_requested
+                        if supervisor_error is not None:
+                            raise supervisor_error
+
+                with tempfile.TemporaryDirectory() as directory:
+                    calibration = Path(directory) / "calibration.json"
+                    calibration.write_text("{}", encoding="utf-8")
+                    with (
+                        mock.patch.object(
+                            launcher,
+                            "find_xds110_reset",
+                            side_effect=RuntimeError("unavailable"),
+                        ),
+                        mock.patch.object(
+                            launcher,
+                            "RadarSupervisor",
+                            FakeSupervisor,
+                        ),
+                        mock.patch.object(
+                            launcher.signal,
+                            "getsignal",
+                            side_effect=lambda signum: originals[signum],
+                        ),
+                        mock.patch.object(
+                            launcher.signal,
+                            "signal",
+                            side_effect=set_signal,
+                        ),
+                    ):
+                        if supervisor_error is None:
+                            self.assertEqual(
+                                launcher.main(
+                                    [
+                                        "--run-id",
+                                        "signal-restore",
+                                        "--clutter-calibration",
+                                        str(calibration),
+                                    ]
+                                ),
+                                0,
+                            )
+                        else:
+                            with self.assertRaises(RuntimeError) as raised:
+                                launcher.main(
+                                    [
+                                        "--run-id",
+                                        "signal-restore",
+                                        "--clutter-calibration",
+                                        str(calibration),
+                                    ]
+                                )
+                            self.assertIs(raised.exception, supervisor_error)
+
+                self.assertEqual(
+                    signal_calls[-2:],
+                    [
+                        (signal.SIGTERM, originals[signal.SIGTERM]),
+                        (signal.SIGINT, originals[signal.SIGINT]),
+                    ],
+                )
+
+    def test_partial_signal_installation_restores_first_and_preserves_error(self):
+        launcher = load_launcher()
+        original_sigint = object()
+        installation_error = RuntimeError("SIGTERM installation failed")
+        signal_calls: list[tuple[int, object]] = []
+
+        def set_signal(signum, handler):
+            signal_calls.append((signum, handler))
+            if signum == signal.SIGTERM and callable(handler):
+                raise installation_error
+
+        with (
+            mock.patch.object(
+                launcher.signal,
+                "getsignal",
+                side_effect=lambda signum: {
+                    signal.SIGINT: original_sigint,
+                    signal.SIGTERM: object(),
+                }[signum],
+            ),
+            mock.patch.object(
+                launcher.signal,
+                "signal",
+                side_effect=set_signal,
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                with launcher._shutdown_requested():
+                    self.fail("context body must not run")
+
+        self.assertIs(raised.exception, installation_error)
+        self.assertEqual(
+            signal_calls[-1],
+            (signal.SIGINT, original_sigint),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -194,22 +194,23 @@ def _watchdog(
 @contextmanager
 def _shutdown_requested() -> Iterator[object]:
     requested = False
-    previous: dict[int, object] = {}
+    installed: list[tuple[int, object]] = []
 
     def request_shutdown(signum: int, frame: object) -> None:
         del signum, frame
         nonlocal requested
         requested = True
 
-    for name in ("SIGINT", "SIGTERM"):
-        signum = getattr(signal, name, None)
-        if signum is not None:
-            previous[signum] = signal.getsignal(signum)
-            signal.signal(signum, request_shutdown)
     try:
+        for name in ("SIGINT", "SIGTERM"):
+            signum = getattr(signal, name, None)
+            if signum is not None:
+                previous = signal.getsignal(signum)
+                signal.signal(signum, request_shutdown)
+                installed.append((signum, previous))
         yield lambda: requested
     finally:
-        for signum, handler in previous.items():
+        for signum, handler in reversed(installed):
             signal.signal(signum, handler)
 
 
@@ -217,7 +218,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.retry_initial > args.retry_max:
         raise SystemExit("--retry-initial must not exceed --retry-max")
-    if args.calibration is None or not args.calibration.is_file():
+    output_root = args.output_root.resolve()
+    profile_path = args.cfg.resolve()
+    calibration_path = (
+        args.calibration.resolve() if args.calibration is not None else None
+    )
+    reset_path = (
+        args.reset_executable.resolve()
+        if args.reset_executable is not None
+        else None
+    )
+    if not profile_path.is_file():
+        raise SystemExit("--cfg must name an existing radar profile file")
+    if calibration_path is None or not calibration_path.is_file():
         raise SystemExit(
             "--clutter-calibration must name an existing calibration file"
         )
@@ -226,7 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     reset_unavailable_reason: str | None
     try:
         reset_executable = find_xds110_reset(
-            args.reset_executable,
+            reset_path,
             RESET_SEARCH_ROOTS,
         )
     except RuntimeError as exc:
@@ -241,9 +254,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     config = RadarSupervisorConfig(
         repository_root=REPOSITORY_ROOT,
-        output_root=args.output_root,
-        profile_path=args.cfg,
-        calibration_path=args.calibration,
+        output_root=output_root,
+        profile_path=profile_path,
+        calibration_path=calibration_path,
         run_id=run_id,
         explicit_port=args.port,
         xds_serial=args.xds_serial,
