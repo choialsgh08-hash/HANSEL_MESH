@@ -1113,7 +1113,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260728-lidar-operator-r9",
+                "20260729-lidar-operator-r10",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1127,6 +1127,43 @@ class RadarFrontHttpTests(unittest.TestCase):
                 javascript = response.read().decode("utf-8")
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
+            self.assertIn(
+                "/radar_scene.js?v=20260729-lidar-operator-r10",
+                html,
+            )
+            self.assertIn(
+                "/radar_panel.js?v=20260729-lidar-operator-r10",
+                html,
+            )
+            self.assertIn(
+                '#radar-status[data-status="sensor_fault"]',
+                html,
+            )
+            self.assertIn(
+                '#radar-status[data-status="http_lost"]',
+                html,
+            )
+            self.assertIn(
+                'const UI_BUILD_ID = "20260729-lidar-operator-r10";',
+                javascript,
+            )
+            self.assertIn(
+                '"RADAR STARTING · DRIVE STOP"',
+                javascript,
+            )
+            self.assertIn(
+                '"레이더 준비 중 · 주행을 정지하세요"',
+                javascript,
+            )
+            self.assertIn(
+                '"RADAR RECONNECTING · DRIVE STOP"',
+                javascript,
+            )
+            self.assertIn(
+                '"레이더 재연결 중 · 주행을 정지하세요"',
+                javascript,
+            )
+            self.assertIn("sensor_fault: [", javascript)
             self.assertIn('id="radar-main-canvas"', html)
             self.assertIn('id="collision-canvas"', html)
             self.assertIn("0~3m LiDAR형 전방 점유 지도", html)

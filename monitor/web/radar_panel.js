@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260728-lidar-operator-r9";
+  const UI_BUILD_ID = "20260729-lidar-operator-r10";
   const MAIN_MAX_RANGE_M = 3.0;
   const MAIN_HALF_WIDTH_M = 1.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -16,6 +16,8 @@
     fault: "FAULT",
     waiting: "WAITING",
     replay_end: "REPLAY END",
+    sensor_fault: "SENSOR FAULT",
+    http_lost: "HTTP LOST",
   };
   const SECTOR_NAMES = ["좌측 끝", "좌측", "정면", "우측", "우측 끝"];
 
@@ -799,9 +801,22 @@
     drawBlockingOverlay(ctx, width, height, presentation) {
       const reason = presentation && presentation.reason;
       const messages = {
-        waiting: ["SCENE WAITING", "첫 유효 레이더 프레임을 기다립니다"],
-        stale: ["SENSOR STALE", "오래된 장면 · 주행하지 마세요"],
-        fault: ["SENSOR FAULT", "레이더 입력을 확인하고 정지하세요"],
+        waiting: [
+          "RADAR STARTING · DRIVE STOP",
+          "레이더 준비 중 · 주행을 정지하세요",
+        ],
+        stale: [
+          "RADAR RECONNECTING · DRIVE STOP",
+          "레이더 재연결 중 · 주행을 정지하세요",
+        ],
+        fault: [
+          "RADAR RECONNECTING · DRIVE STOP",
+          "레이더 재연결 중 · 주행을 정지하세요",
+        ],
+        sensor_fault: [
+          "RADAR RECONNECTING · DRIVE STOP",
+          "레이더 재연결 중 · 주행을 정지하세요",
+        ],
         replay_end: ["REPLAY END", "마지막 프레임을 지도처럼 사용하지 마세요"],
         calibration_required: [
           "CALIBRATION REQUIRED",
@@ -815,7 +830,10 @@
           "PROFILE MISMATCH",
           "보정 파일과 현재 레이더 프로필이 다릅니다",
         ],
-        http_lost: ["DATA LINK LOST", "화면 데이터 연결을 확인하세요"],
+        http_lost: [
+          "RADAR RECONNECTING · DRIVE STOP",
+          "레이더 재연결 중 · 주행을 정지하세요",
+        ],
         invalid_scene: [
           "SCENE CONTRACT ERROR",
           "검증되지 않은 장면은 표시하지 않습니다",
@@ -847,16 +865,27 @@
 
     updateText(presentation) {
       const state = this.snapshot;
-      const status = this.fetchFailed
+      const presentationStatus =
+        presentation &&
+        presentation.blocked &&
+        [
+          "waiting",
+          "stale",
+          "fault",
+          "sensor_fault",
+          "http_lost",
+        ].includes(presentation.reason)
+          ? presentation.reason
+          : null;
+      const status = presentationStatus || (this.fetchFailed
         ? "fault"
         : state
           ? state.status
-          : "waiting";
+          : "waiting");
       const badge = document.querySelector("#radar-status");
       badge.dataset.status = status;
-      badge.textContent = this.fetchFailed
-        ? "HTTP LOST"
-        : STATUS_LABELS[status] || String(status).toUpperCase();
+      badge.textContent =
+        STATUS_LABELS[status] || String(status).toUpperCase();
       const warning = document.querySelector("#warning-text");
       if (presentation && presentation.blocked) {
         const detail = presentation.error
@@ -883,13 +912,15 @@
       const danger = hazard && hazard.level === "DANGER" &&
         presentation.tracks.some((track) =>
           this.isDangerTrack(track, presentation));
-      const hazardLevel = danger
-        ? "DANGER"
-        : hazard && hazard.level === "DANGER"
-          ? "UNKNOWN"
-          : hazard
-            ? hazard.level
-            : "UNKNOWN";
+      const hazardLevel = presentation && presentation.blocked
+        ? "SENSOR_FAULT"
+        : danger
+          ? "DANGER"
+          : hazard && hazard.level === "DANGER"
+            ? "UNKNOWN"
+            : hazard
+              ? hazard.level
+              : "UNKNOWN";
       const hazardMetric = document.querySelector("#metric-hazard");
       hazardMetric.dataset.hazard = danger ? "DANGER" : hazardLevel;
       this.setMetric(
@@ -923,7 +954,7 @@
 
       const collisionInset = document.querySelector("#collision-inset");
       collisionInset.dataset.hazard = presentation && presentation.blocked
-        ? "BLOCKED"
+        ? "SENSOR_FAULT"
         : danger
           ? "DANGER"
           : hazardLevel;
@@ -997,7 +1028,7 @@
       document.querySelector("#scene-hazard-value").textContent =
         presentation && !presentation.blocked && presentation.hazard
           ? presentation.hazard.level
-          : "UNKNOWN";
+          : "SENSOR_FAULT";
       document.querySelector("#axis-warning").hidden =
         Boolean(
           scene &&

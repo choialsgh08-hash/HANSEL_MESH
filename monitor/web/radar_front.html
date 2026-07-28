@@ -125,6 +125,8 @@
 
       #radar-status[data-status="waiting"],
       #radar-status[data-status="stale"],
+      #radar-status[data-status="sensor_fault"],
+      #radar-status[data-status="http_lost"],
       #radar-status[data-status="fault"] {
         color: var(--red);
         border-color: rgba(255, 81, 81, 0.72);
@@ -240,7 +242,8 @@
           0 8px 28px rgba(0, 0, 0, 0.6);
       }
 
-      #collision-inset[data-hazard="BLOCKED"] {
+      #collision-inset[data-hazard="BLOCKED"],
+      #collision-inset[data-hazard="SENSOR_FAULT"] {
         border-color: rgba(255, 193, 91, 0.72);
       }
 
@@ -776,8 +779,8 @@
       </footer>
     </main>
 
-    <script src="/radar_scene.js?v=20260728-lidar-operator-r9"></script>
-    <script src="/radar_panel.js?v=20260728-lidar-operator-r9"></script>
+    <script src="/radar_scene.js?v=20260729-lidar-operator-r10"></script>
+    <script src="/radar_panel.js?v=20260729-lidar-operator-r10"></script>
     <script>
       const panel = new window.HanselRadarPanel(
         document.querySelector("#radar-panel"),

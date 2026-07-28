@@ -48,7 +48,7 @@ from sensors.radar_calibration import load_clutter_model  # noqa: E402
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
-UI_BUILD_ID = "20260728-lidar-operator-r9"
+UI_BUILD_ID = "20260729-lidar-operator-r10"
 RADAR_VALID_MIN_RANGE_M = 0.07
 
 
