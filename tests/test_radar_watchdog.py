@@ -206,6 +206,22 @@ class RadarEpochWatchdogTests(unittest.TestCase):
                 "mission_evidence_invalid",
             )
 
+    def test_mission_truncate_and_regrow_past_offset_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mission = root / "mission.jsonl"
+            watchdog = make_watchdog(mission, root / "capture.bin")
+            append_radar_frame(mission, log_seq=1, frame_number=1)
+            consumed_size = mission.stat().st_size
+            watchdog.poll(0.1)
+
+            mission.write_bytes(b"x" * consumed_size)
+
+            self.assertEqual(
+                watchdog.poll(0.2).fault_reason,
+                "mission_evidence_invalid",
+            )
+
     def test_replaced_mission_epoch_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -356,6 +372,28 @@ class RadarEpochWatchdogTests(unittest.TestCase):
             self.assertEqual(
                 watchdog.poll(0.2).fault_reason,
                 "firmware_low_power_timing_assert",
+            )
+
+    def test_raw_truncate_and_regrow_past_offset_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "capture.bin"
+            watchdog = make_watchdog(root / "mission.jsonl", raw)
+            initial_size = 96
+            raw.write_bytes(b"x" * initial_size)
+            self.assertIsNone(watchdog.poll(0.1).fault_reason)
+            marker = (
+                b"Error: No Sufficient Time for getting into "
+                b"Low Power Modes."
+            )
+
+            raw.write_bytes(
+                marker + b"y" * (initial_size - len(marker))
+            )
+
+            self.assertEqual(
+                watchdog.poll(0.2).fault_reason,
+                "raw_evidence_invalid",
             )
 
     def test_arbitrary_binary_and_other_error_strings_do_not_fault(self):

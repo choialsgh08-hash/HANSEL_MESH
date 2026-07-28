@@ -14,6 +14,7 @@ from sensors.mission_log import DEFAULT_MAX_LINE_BYTES, decode_log_entry
 _FIRMWARE_LOW_POWER_TIMING_ASSERT = (
     b"Error: No Sufficient Time for getting into Low Power Modes."
 )
+_CONTINUITY_BYTES = 4 * 1024
 _RAW_READ_BYTES = 64 * 1024
 _MISSION_READ_BYTES = DEFAULT_MAX_LINE_BYTES + 1
 
@@ -61,10 +62,12 @@ class RadarEpochWatchdog:
 
         self._mission_identity: tuple[int, int] | None = None
         self._mission_offset = 0
+        self._mission_continuity_tail = b""
         self._mission_partial = b""
         self._mission_line_number = 0
         self._raw_identity: tuple[int, int] | None = None
         self._raw_offset = 0
+        self._raw_continuity_tail = b""
         self._raw_overlap = b""
 
         self._verified = False
@@ -101,9 +104,20 @@ class RadarEpochWatchdog:
             if stat.st_size < self._mission_offset:
                 self._fault_reason = "mission_evidence_invalid"
                 return
+            if not self._continuity_matches(
+                handle,
+                self._mission_offset,
+                self._mission_continuity_tail,
+            ):
+                self._fault_reason = "mission_evidence_invalid"
+                return
             handle.seek(self._mission_offset)
             chunk = handle.read(_MISSION_READ_BYTES)
             self._mission_offset += len(chunk)
+            self._mission_continuity_tail = self._updated_continuity_tail(
+                self._mission_continuity_tail,
+                chunk,
+            )
 
         buffered = self._mission_partial + chunk
         lines = buffered.split(b"\n")
@@ -147,9 +161,20 @@ class RadarEpochWatchdog:
             if stat.st_size < self._raw_offset:
                 self._fault_reason = "raw_evidence_invalid"
                 return
+            if not self._continuity_matches(
+                handle,
+                self._raw_offset,
+                self._raw_continuity_tail,
+            ):
+                self._fault_reason = "raw_evidence_invalid"
+                return
             handle.seek(self._raw_offset)
             chunk = handle.read(_RAW_READ_BYTES)
             self._raw_offset += len(chunk)
+            self._raw_continuity_tail = self._updated_continuity_tail(
+                self._raw_continuity_tail,
+                chunk,
+            )
 
         candidate = self._raw_overlap + chunk
         if _FIRMWARE_LOW_POWER_TIMING_ASSERT in candidate:
@@ -174,6 +199,24 @@ class RadarEpochWatchdog:
     @staticmethod
     def _file_identity(stat: os.stat_result) -> tuple[int, int]:
         return stat.st_dev, stat.st_ino
+
+    @staticmethod
+    def _continuity_matches(
+        handle: BinaryIO,
+        offset: int,
+        continuity_tail: bytes,
+    ) -> bool:
+        if not continuity_tail:
+            return True
+        handle.seek(offset - len(continuity_tail))
+        return handle.read(len(continuity_tail)) == continuity_tail
+
+    @staticmethod
+    def _updated_continuity_tail(
+        continuity_tail: bytes,
+        chunk: bytes,
+    ) -> bytes:
+        return (continuity_tail + chunk)[-_CONTINUITY_BYTES:]
 
     def _observe_frame(self, frame: RadarFrame, now_s: float) -> None:
         self._last_frame_observed_s = now_s
