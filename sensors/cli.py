@@ -6,12 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 import uuid
 from typing import Iterator
 
+from common.radar_geometry import RadarAxes
 from common.sensor_contract import (
     ImuSample,
     RadarFrame,
@@ -32,6 +35,7 @@ from sensors.radar_capture import (
     classify_frame_transition,
 )
 from sensors.raw_capture_index import inspect_uart_chunk_index
+from sensors.radar_calibration import build_clutter_model
 from sensors.ti_mmwave import TiMmwavePacketParser, TiMmwaveStreamDecoder
 
 
@@ -471,6 +475,76 @@ def command_radar_index(args: argparse.Namespace) -> int:
     return 0 if report["healthy"] else 2
 
 
+def command_radar_calibrate(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    if output.exists() and not args.overwrite:
+        raise ValueError(
+            f"output already exists; pass --overwrite to replace {output.name}"
+        )
+
+    frames = tuple(
+        entry.record
+        for entry in iter_replay(Path(args.path))
+        if (
+            isinstance(entry.record, RadarFrame)
+            and entry.record.complete
+            and entry.record.heatmap is not None
+        )
+    )
+    axes = RadarAxes(
+        forward_axis=args.forward_axis,
+        forward_sign=args.forward_sign,
+        lateral_axis=args.lateral_axis,
+        lateral_sign=args.lateral_sign,
+    )
+    model = build_clutter_model(
+        frames,
+        axes,
+        min_frames=args.min_frames,
+    )
+
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            dir=output.parent,
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(model.canonical_bytes() + b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, output)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    print(
+        json.dumps(
+            {
+                "azimuth_bins": model.azimuth_bins,
+                "calibration_id": model.calibration_id,
+                "frames_used": len(frames),
+                "motion_mode": model.motion_mode,
+                "point_clusters": len(model.point_clusters),
+                "profile_id": model.profile_id,
+                "range_bins": model.range_bins,
+                "range_step_m": model.range_step_m,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -595,6 +669,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="timing JSONL path (default: PATH.chunks.jsonl)",
     )
     radar_index.set_defaults(func=command_radar_index)
+
+    calibrate = subparsers.add_parser(
+        "radar-calibrate",
+        help="build a deterministic profile-bound radar self-clutter model",
+    )
+    calibrate.add_argument("path")
+    calibrate.add_argument("--output", required=True)
+    calibrate.add_argument("--min-frames", type=int, default=50)
+    calibrate.add_argument(
+        "--forward-axis",
+        choices=("x", "y"),
+        default="y",
+    )
+    calibrate.add_argument(
+        "--forward-sign",
+        type=int,
+        choices=(-1, 1),
+        default=1,
+    )
+    calibrate.add_argument(
+        "--lateral-axis",
+        choices=("x", "y"),
+        default="x",
+    )
+    calibrate.add_argument(
+        "--lateral-sign",
+        type=int,
+        choices=(-1, 1),
+        default=1,
+    )
+    calibrate.add_argument("--overwrite", action="store_true")
+    calibrate.set_defaults(func=command_radar_calibrate)
 
     live = subparsers.add_parser(
         "radar-live",

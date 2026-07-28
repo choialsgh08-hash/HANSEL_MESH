@@ -24,7 +24,110 @@ from tests.test_radar_capture import (
 )
 
 
+REAL_PROFILE = (
+    "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1"
+)
+REAL_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "radar_clutter_20260728_f2286_f2291.jsonl"
+)
+
+
 class SensorCliTests(unittest.TestCase):
+    def invoke_calibrate(self, input_path, output_path, *extra):
+        argv = [
+            "sensors",
+            "radar-calibrate",
+            str(input_path),
+            "--output",
+            str(output_path),
+            *extra,
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("sys.argv", argv), contextlib.redirect_stdout(
+            stdout
+        ), contextlib.redirect_stderr(stderr):
+            try:
+                result = main()
+            except SystemExit as error:
+                result = error.code
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_radar_calibrate_writes_deterministic_profile_bound_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "model.json"
+            result, stdout, _ = self.invoke_calibrate(
+                REAL_FIXTURE,
+                output,
+                "--min-frames",
+                "6",
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                json.loads(output.read_text("utf-8"))["profile_id"],
+                REAL_PROFILE,
+            )
+            self.assertEqual(json.loads(stdout)["frames_used"], 6)
+
+    def test_radar_calibrate_refuses_existing_output_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "model.json"
+            output.write_text("owned", encoding="utf-8")
+            result, _, stderr = self.invoke_calibrate(
+                REAL_FIXTURE,
+                output,
+                "--min-frames",
+                "6",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertEqual(output.read_text("utf-8"), "owned")
+            self.assertIn("--overwrite", stderr)
+
+    def test_radar_calibrate_rejects_mixed_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            mixed = Path(directory) / "mixed.jsonl"
+            entries = [
+                json.loads(line)
+                for line in REAL_FIXTURE.read_text("utf-8").splitlines()
+            ]
+            entries[-1]["record"]["payload"]["profile_id"] = "other-profile"
+            mixed.write_text(
+                "".join(
+                    json.dumps(
+                        entry,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                    for entry in entries
+                ),
+                encoding="utf-8",
+            )
+            output = Path(directory) / "model.json"
+            result, _, stderr = self.invoke_calibrate(
+                mixed,
+                output,
+                "--min-frames",
+                "6",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("mixed profile", stderr)
+
+    def test_radar_calibrate_rejects_insufficient_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "model.json"
+            result, _, stderr = self.invoke_calibrate(
+                REAL_FIXTURE,
+                output,
+                "--min-frames",
+                "7",
+            )
+            self.assertNotEqual(result, 0)
+            self.assertIn("at least 7", stderr)
+
     def test_heatmap_cli_requires_range_bins_with_other_settings(self):
         stderr = io.StringIO()
         with mock.patch(
