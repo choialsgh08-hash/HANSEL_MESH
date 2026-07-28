@@ -209,6 +209,29 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(expired["level"], "UNKNOWN")
         self.assertIsNone(expired["nearest_confirmed_m"])
 
+    def test_hazard_evaluator_rejects_confirmed_heatmap_track(self):
+        evaluator = RadarHazardEvaluator()
+        heatmap_track = {
+            "track_id": 8,
+            "forward_m": 0.09,
+            "lateral_m": 0.0,
+            "height_m": None,
+            "distance_m": 0.09,
+            "range_uncertainty_m": RANGE_STEP_M,
+            "confidence": 1.0,
+            "source": "heatmap",
+            "point_confirmed": True,
+            "age_ms": 0,
+        }
+        hazard = evaluator.update(
+            [heatmap_track],
+            "ok",
+            "live",
+            now=91.0,
+        )
+        self.assertEqual(hazard["level"], "UNKNOWN")
+        self.assertIsNone(hazard["nearest_confirmed_m"])
+
     def test_three_metre_grid_retains_049_and_299_but_rejects_301(self):
         estimator = calibrated_estimator()
         estimator.ingest(frame_with_forward_ranges(0.49, 2.99, 3.01))
@@ -294,11 +317,11 @@ class RadarSceneEstimatorTests(unittest.TestCase):
 
     def test_track_is_present_before_but_not_at_300ms(self):
         estimator = calibrated_estimator()
-        estimator.ingest(point_frame(0.40), received_at=20.0)
-        tracks = estimator.snapshot(now=20.299999999)["tracks"]
+        estimator.ingest(point_frame(0.40), received_at=2.0)
+        tracks = estimator.snapshot(now=2.299999999)["tracks"]
         self.assertTrue(tracks)
         self.assertEqual(tracks[0]["age_ms"], 299)
-        self.assertFalse(estimator.snapshot(now=20.300000000)["tracks"])
+        self.assertFalse(estimator.snapshot(now=2.300000000)["tracks"])
 
     def test_two_point_hits_with_one_missed_frame_enter_danger(self):
         estimator = calibrated_estimator()
@@ -471,12 +494,30 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         )
         estimator.ingest(heatmap_only_frame(4, 8))
         scene = estimator.snapshot()
-        self.assertEqual(scene["calibration_status"], "ok")
+        self.assertEqual(
+            scene["calibration_status"],
+            "calibration_unavailable",
+        )
         self.assertFalse(scene["tracks"])
         self.assertEqual(
             scene["diagnostics"]["heatmap_cells_accepted"],
             0,
         )
+
+    def test_optional_missing_calibration_never_authorizes_point_hazard(self):
+        estimator = RadarSceneEstimator(
+            RadarAxes(),
+            require_calibration=False,
+        )
+        estimator.ingest(point_frame(0.09, frame_number=1), received_at=65.0)
+        estimator.ingest(point_frame(0.09, frame_number=2), received_at=65.1)
+        scene = estimator.snapshot(now=65.1)
+        self.assertEqual(
+            scene["calibration_status"],
+            "calibration_unavailable",
+        )
+        self.assertTrue(scene["tracks"][0]["point_confirmed"])
+        self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
 
     def test_reset_and_producer_change_clear_confirmation_and_latch(self):
         estimator = calibrated_estimator()

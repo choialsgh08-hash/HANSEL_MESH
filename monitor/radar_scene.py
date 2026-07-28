@@ -22,6 +22,7 @@ SCENE_MAX_FORWARD_M = 3.0
 SCENE_HALF_WIDTH_M = 1.5
 TRACK_ASSOCIATION_M = 0.18
 TRACK_TTL_S = 0.300
+TRACK_TTL_NS = 300_000_000
 HEATMAP_MIN_RESIDUAL_DB = 6.0
 HEATMAP_MAD_MULTIPLIER = 4.0
 DANGER_ENTER_M = 0.10
@@ -72,9 +73,14 @@ class RadarHazardEvaluator:
             for track in tracks
             if int(track.get("age_ms", 0)) < TRACK_TTL_S * 1000
         ]
+        point_source_tracks = [
+            track
+            for track in fresh_tracks
+            if track.get("source") == "point"
+        ]
         by_id = {
             int(track["track_id"]): track
-            for track in fresh_tracks
+            for track in point_source_tracks
         }
         if self._danger_track_id is not None:
             latched = by_id.get(self._danger_track_id)
@@ -91,7 +97,7 @@ class RadarHazardEvaluator:
 
         confirmed = [
             track
-            for track in fresh_tracks
+            for track in point_source_tracks
             if bool(track["point_confirmed"])
         ]
         entering = [
@@ -156,11 +162,14 @@ class RadarSceneEstimator:
         self._clock = clock
         self._tracks: List[Dict[str, object]] = []
         self._next_track_id = 1
-        self._calibration_status = (
-            "calibration_required"
-            if require_calibration and clutter_model is None
-            else "ok"
-        )
+        if clutter_model is None:
+            self._calibration_status = (
+                "calibration_required"
+                if require_calibration
+                else "calibration_unavailable"
+            )
+        else:
+            self._calibration_status = "ok"
         self._scene_point_count = 0
         self._clutter_points_rejected = 0
         self._heatmap_cells_accepted = 0
@@ -312,6 +321,7 @@ class RadarSceneEstimator:
         now: Optional[float] = None,
     ) -> Dict[str, object]:
         observed_at = self._clock() if now is None else now
+        observed_at_ns = self._seconds_to_ns(observed_at)
         if source_status in FAULT_SOURCE_STATUSES:
             self.reset(source_status)
         self._expire_tracks(observed_at)
@@ -324,10 +334,11 @@ class RadarSceneEstimator:
             | {
                 "age_ms": max(
                     0,
-                    int(
-                        (observed_at - float(track["_received_at"]))
-                        * 1000.0
-                    ),
+                    (
+                        observed_at_ns
+                        - int(track["_received_at_ns"])
+                    )
+                    // 1_000_000,
                 )
             }
             for track in self._tracks
@@ -395,7 +406,7 @@ class RadarSceneEstimator:
             return (
                 "calibration_required"
                 if self.require_calibration
-                else "ok"
+                else "calibration_unavailable"
             )
         if (
             frame.profile_id != self.clutter_model.profile_id
@@ -480,7 +491,7 @@ class RadarSceneEstimator:
                 nearest["source"] = source
                 if height_m is not None:
                     nearest["height_m"] = height_m
-            nearest["_received_at"] = received_at
+            nearest["_received_at_ns"] = self._seconds_to_ns(received_at)
             if source == "point":
                 hits = nearest["_point_hits"]
                 assert isinstance(hits, list)
@@ -502,7 +513,7 @@ class RadarSceneEstimator:
                 "source": source,
                 "point_confirmed": False,
                 "age_ms": 0,
-                "_received_at": received_at,
+                "_received_at_ns": self._seconds_to_ns(received_at),
                 "_point_hits": [point_hit],
                 "_updated_by_point": point_hit,
             }
@@ -510,8 +521,16 @@ class RadarSceneEstimator:
         self._next_track_id += 1
 
     def _expire_tracks(self, now: float) -> None:
+        now_ns = self._seconds_to_ns(now)
         self._tracks = [
             track
             for track in self._tracks
-            if now - float(track["_received_at"]) < TRACK_TTL_S
+            if (
+                now_ns - int(track["_received_at_ns"])
+                < TRACK_TTL_NS
+            )
         ]
+
+    @staticmethod
+    def _seconds_to_ns(value: float) -> int:
+        return int(round(value * 1_000_000_000))
