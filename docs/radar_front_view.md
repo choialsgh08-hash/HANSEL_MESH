@@ -1,6 +1,11 @@
-# IWRL6432BOOST R9 레이더 LiDAR형 조종 화면
+# IWRL6432BOOST R10 레이더 LiDAR형 조종 화면
 
-R9 화면은 카메라 영상을 합성하지 않는다. IWRL6432BOOST가 실제로 측정한 포인트와
+> **중요:** 정상 Windows 보드 운용은
+> [자동 복구 운용 절차](radar_auto_recovery.md)의 one-command supervisor를
+> 사용한다. 아래의 수동 configure/capture/viewer 명령은 진단 fallback과 통제된
+> 빈 장면 캘리브레이션을 위해 그대로 유지한다.
+
+R10 화면은 카메라 영상을 합성하지 않는다. IWRL6432BOOST가 실제로 측정한 포인트와
 range-azimuth heatmap의 반사 증거를 로봇 기준 LiDAR형 탑뷰로 표시한다.
 
 - 주 화면: 전방 `0~3m`, 좌우 `-1.5~+1.5m`
@@ -23,7 +28,7 @@ python monitor\radar_front.py --demo --bind 127.0.0.1 `
   --http-port 8081 --max-range-m 3 --history-window 0.3
 ```
 
-브라우저에서 `http://127.0.0.1:8081/`을 연다. 상단의 `UI R9`,
+브라우저에서 `http://127.0.0.1:8081/`을 연다. r10 build의
 `0~3m FORWARD MAP`, `ROBOT RELATIVE`와 우측의 `0~50cm 충돌 확대`가 보여야 한다.
 데모 데이터는 합성 데이터이므로 실제 보드 감지 성능을 증명하지 않는다.
 
@@ -129,7 +134,7 @@ python -m sensors radar-live `
 `heatmap_frames`와 `heatmap_cells_decoded`가 증가하고
 `missing_heatmap_frames`가 계속 증가하지 않는지 확인한다.
 
-## 5. R9 조종 화면 실행
+## 5. R10 조종 화면 실행
 
 별도 PowerShell에서 다음 명령을 그대로 실행한다.
 
@@ -225,7 +230,7 @@ heatmap 거리 양자화 때문에 몇 cm 차이가 날 수 있다.
 
 ## 9. 다음 단계
 
-현재 R9는 IMU 없이 동작하는 로봇 기준 즉시뷰다. 다음 단계에서 엔코더와 IMU의
+현재 R10은 IMU 없이 동작하는 로봇 기준 즉시뷰다. 다음 단계에서 엔코더와 IMU의
 timestamp·좌표계를 맞추고 radar-to-base 외부 보정을 적용해 이동량을 보상한다.
 그 다음에만 여러 프레임을 세계 좌표에 누적하는 rolling occupancy map,
 Doppler odometry, radar scan-to-submap 정합과 SLAM을 추가할 수 있다. 유닛 분리
