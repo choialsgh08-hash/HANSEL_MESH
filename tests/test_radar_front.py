@@ -717,6 +717,7 @@ class RadarFrontStateTests(unittest.TestCase):
             radar_frame(
                 [RadarPoint(0.0, 2.0, 0.0, 0.0)],
                 frame_number=1,
+                dropped=1,
             )
         )
         state.ingest(
@@ -735,6 +736,7 @@ class RadarFrontStateTests(unittest.TestCase):
             snapshot["counters"]["sensor_sequence_gaps_total"],
             1,
         )
+        self.assertEqual(snapshot["counters"]["frame_gaps_total"], 1)
         state.ingest(
             radar_frame(
                 [RadarPoint(0.0, 2.2, 0.0, 0.0)],
@@ -742,6 +744,68 @@ class RadarFrontStateTests(unittest.TestCase):
             )
         )
         self.assertEqual(state.snapshot()["status"], "degraded")
+        state.ingest(
+            SensorHealth(
+                header=SensorHeader(
+                    mission_id="test-mission",
+                    unit_id="head",
+                    boot_id="test-boot",
+                    producer_id="health-producer",
+                    stream_id="health/radar",
+                    seq=1,
+                    monotonic_ns=2_000_000_000,
+                ),
+                subject_stream_id="radar/front",
+                status="ok",
+                seq_gaps_total=1,
+                detail="quiet interval after one gap",
+            )
+        )
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["status"], "live")
+        self.assertEqual(snapshot["counters"]["frame_gaps_total"], 1)
+
+    def test_ok_health_does_not_clear_viewer_integrity_failures(self):
+        for error_method, detail, counter, reason in (
+            (
+                "note_parse_error",
+                "invalid JSON log line",
+                "parse_errors_total",
+                "invalid_log_record",
+            ),
+            (
+                "note_log_sequence_error",
+                "non-contiguous mission log sequence",
+                "log_sequence_errors_total",
+                "log_sequence_discontinuity",
+            ),
+        ):
+            with self.subTest(error_method=error_method):
+                state = RadarFrontState("follow", clock=FakeClock())
+                state.ingest(
+                    radar_frame([RadarPoint(0.0, 2.0, 0.0, 0.0)])
+                )
+                getattr(state, error_method)(detail)
+                state.ingest(
+                    SensorHealth(
+                        header=SensorHeader(
+                            mission_id="test-mission",
+                            unit_id="head",
+                            boot_id="test-boot",
+                            producer_id="health-producer",
+                            stream_id="health/radar",
+                            seq=1,
+                            monotonic_ns=2_000_000_000,
+                        ),
+                        subject_stream_id="radar/front",
+                        status="ok",
+                    )
+                )
+
+                snapshot = state.snapshot()
+                self.assertEqual(snapshot["status"], "degraded")
+                self.assertEqual(snapshot["health"]["degraded_reason"], reason)
+                self.assertEqual(snapshot["counters"][counter], 1)
 
     def test_new_producer_starts_a_fresh_sensor_sequence(self):
         clock = FakeClock()

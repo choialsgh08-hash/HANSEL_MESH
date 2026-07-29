@@ -135,7 +135,8 @@ class RadarFrontState:
         self._scene_producer_id: Optional[str] = None
         self._source_error: Optional[str] = None
         self._source_note = "waiting for first radar frame"
-        self._degraded_reason: Optional[str] = None
+        self._capture_degraded_reason: Optional[str] = None
+        self._integrity_degraded_reason: Optional[str] = None
         self._health_status: Optional[str] = None
         self._health_detail: Optional[str] = None
         self._replay_ended = False
@@ -178,8 +179,12 @@ class RadarFrontState:
                     self._device_discontinuities_total,
                     record.device_discontinuities_total,
                 )
-                if record.status not in {"ok", "starting"}:
-                    self._degraded_reason = f"sensor_health_{record.status}"
+                if record.status == "ok":
+                    self._capture_degraded_reason = None
+                elif record.status != "starting":
+                    self._capture_degraded_reason = (
+                        f"sensor_health_{record.status}"
+                    )
             return True
 
         if not isinstance(record, RadarFrame):
@@ -221,13 +226,13 @@ class RadarFrontState:
                 "reset_or_out_of_order",
             }:
                 self._device_discontinuities_total += 1
-                self._degraded_reason = "device_frame_discontinuity"
+                self._capture_degraded_reason = "device_frame_discontinuity"
                 if not record.complete:
                     self.scene_estimator.reset(record.frame_transition)
 
             if not record.complete:
                 self._incomplete_frames += 1
-                self._degraded_reason = "incomplete_point_cloud"
+                self._capture_degraded_reason = "incomplete_point_cloud"
                 return False
 
             self.scene_estimator.ingest(record, received_at=now)
@@ -333,9 +338,9 @@ class RadarFrontState:
             self._trim_history(now)
             self._valid_frames += 1
             if record.dropped_frames_since_previous:
-                self._degraded_reason = "frame_gap"
+                self._capture_degraded_reason = "frame_gap"
             elif sensor_sequence_issue is not None:
-                self._degraded_reason = sensor_sequence_issue
+                self._capture_degraded_reason = sensor_sequence_issue
         return True
 
     def _heatmap_payload(self, heatmap: object) -> Optional[Dict[str, object]]:
@@ -505,8 +510,8 @@ class RadarFrontState:
     def reset_sensor_sequence_tracking(self) -> None:
         """Forget replay-only sequence baselines without clearing diagnostics.
 
-        Degraded diagnostics remain latched for the lifetime of this viewer
-        process so a short gap cannot disappear between browser polls.
+        Cumulative diagnostics and integrity failures remain latched. Capture
+        degradation clears only through explicit ``ok`` sensor health.
         """
 
         with self._lock:
@@ -518,13 +523,19 @@ class RadarFrontState:
         with self._lock:
             self._parse_errors_total += 1
             self._source_error = detail[:240]
-            self._degraded_reason = "invalid_log_record"
+            self._integrity_degraded_reason = "invalid_log_record"
 
     def note_log_sequence_error(self, detail: str) -> None:
         with self._lock:
             self._log_sequence_errors_total += 1
             self._source_error = detail[:240]
-            self._degraded_reason = "log_sequence_discontinuity"
+            self._integrity_degraded_reason = "log_sequence_discontinuity"
+
+    def _degraded_reason_locked(self) -> Optional[str]:
+        return (
+            self._integrity_degraded_reason
+            or self._capture_degraded_reason
+        )
 
     def set_source_note(self, note: str) -> None:
         with self._lock:
@@ -573,6 +584,7 @@ class RadarFrontState:
                 elapsed = self._arrival_times[-1] - self._arrival_times[0]
                 if elapsed > 0:
                     fps = (len(self._arrival_times) - 1) / elapsed
+            degraded_reason = self._degraded_reason_locked()
 
             if frame is None:
                 status = "fault" if self._source_error else "waiting"
@@ -586,7 +598,7 @@ class RadarFrontState:
                 frame.get("source_format") == "ti-mmwave-none"
             ):
                 status = "degraded"
-            elif self._degraded_reason is not None:
+            elif degraded_reason is not None:
                 status = "degraded"
             else:
                 status = "live"
@@ -666,7 +678,7 @@ class RadarFrontState:
                 "health": {
                     "status": self._health_status,
                     "detail": self._health_detail,
-                    "degraded_reason": self._degraded_reason,
+                    "degraded_reason": degraded_reason,
                 },
             }
 
