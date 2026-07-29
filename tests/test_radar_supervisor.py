@@ -1986,6 +1986,75 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
             self.assertEqual(fixture.payload()["epoch"], 1)
             self.assertEqual(fixture.payload()["recovery_count"], 0)
 
+    def test_same_epoch_viewer_restart_preserves_elevated_fault_backoff(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fault = snapshot(
+                verified=False,
+                frames=0,
+                fault="radar_frame_timeout",
+            )
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[
+                    [snapshot(), snapshot(), fault],
+                    [
+                        snapshot(),
+                        snapshot(),
+                        snapshot(),
+                        snapshot(),
+                        fault,
+                    ],
+                    [snapshot()],
+                ],
+            )
+            viewer_restart_armed = False
+
+            def stop_after_next_running_epoch() -> bool:
+                nonlocal viewer_restart_armed
+                if not fixture.manifest.exists():
+                    return False
+                payload = fixture.payload()
+                if (
+                    payload["state"] == "RUNNING"
+                    and payload["epoch"] == 2
+                    and not viewer_restart_armed
+                ):
+                    viewer = next(
+                        child
+                        for child in reversed(fixture.processes.children)
+                        if child.role == "viewer"
+                    )
+                    viewer.exit_code = 9
+                    viewer_restart_armed = True
+                    return False
+                return (
+                    payload["state"] == "RUNNING"
+                    and payload["epoch"] == 3
+                )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_next_running_epoch
+            )
+
+            recovery_sleeps = [
+                delay
+                for delay in fixture.sleeps
+                if delay != fixture.config.poll_interval_s
+            ]
+            self.assertEqual(recovery_sleeps, [0.5, 1.0])
+            self.assertTrue(viewer_restart_armed)
+            self.assertEqual(
+                [
+                    action
+                    for action in fixture.actions
+                    if action.startswith("viewer:e002:")
+                ],
+                ["viewer:e002:none", "viewer:e002:none"],
+            )
+            self.assertEqual(fixture.payload()["recovery_count"], 2)
+
     def test_same_epoch_viewer_retry_propagates_watchdog_fault(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = RecoveryFixture(
@@ -2184,6 +2253,101 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 if delay != fixture.config.poll_interval_s
             ]
             self.assertEqual(recovery_sleeps, [0.5, 0.5])
+            self.assertEqual(fixture.payload()["recovery_count"], 2)
+
+    def test_fault_at_stable_reset_boundary_preserves_elevated_backoff(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fault = snapshot(
+                verified=False,
+                frames=0,
+                fault="radar_frame_timeout",
+            )
+            fixture = RecoveryFixture(directory)
+            healthy_polls = int(
+                fixture.config.stable_running_reset_s
+                / fixture.config.poll_interval_s
+            )
+            fixture.watchdogs = [
+                [snapshot(), snapshot(), fault],
+                [snapshot(), snapshot()]
+                + [snapshot() for _ in range(healthy_polls)]
+                + [fault],
+                [snapshot()],
+            ]
+
+            nanoseconds = 100_000_000_000
+            reset_calls = 0
+            boundary_fault_times: list[float] = []
+            watchdog_calls = 0
+            original_reset = fixture.reset_target
+            original_watchdog_factory = fixture.watchdog_factory
+
+            def exact_monotonic() -> float:
+                return nanoseconds / 1_000_000_000
+
+            def exact_sleep(delay_s: float) -> None:
+                nonlocal nanoseconds
+                fixture.sleeps.append(delay_s)
+                nanoseconds += round(delay_s * 1_000_000_000)
+
+            def reset_with_exact_epoch_start(
+                port: object,
+                config: RadarSupervisorConfig,
+            ) -> bool:
+                nonlocal nanoseconds, reset_calls
+                result = original_reset(port, config)
+                reset_calls += 1
+                if reset_calls == 2:
+                    nanoseconds = 1_000_000_000_000
+                return result
+
+            def recording_watchdog_factory(
+                paths: EpochPaths,
+                config: RadarSupervisorConfig,
+                started_at_s: float,
+            ) -> FakeWatchdog:
+                nonlocal watchdog_calls
+                watchdog_calls += 1
+                watchdog = original_watchdog_factory(
+                    paths,
+                    config,
+                    started_at_s,
+                )
+                if watchdog_calls != 2:
+                    return watchdog
+                original_poll = watchdog.poll
+
+                def record_boundary_fault(
+                    now_s: float,
+                ) -> RadarWatchdogSnapshot:
+                    result = original_poll(now_s)
+                    if result.fault_reason is not None:
+                        boundary_fault_times.append(now_s)
+                    return result
+
+                watchdog.poll = record_boundary_fault  # type: ignore[method-assign]
+                return watchdog
+
+            dependencies = replace(
+                fixture.dependencies,
+                reset_target=reset_with_exact_epoch_start,
+                watchdog_factory=recording_watchdog_factory,
+                monotonic=exact_monotonic,
+                sleep=exact_sleep,
+            )
+            RadarSupervisor(fixture.config, dependencies).run(
+                lambda: self._stop_after_running_epoch(fixture, 3)
+            )
+
+            recovery_sleeps = [
+                delay
+                for delay in fixture.sleeps
+                if delay != fixture.config.poll_interval_s
+            ]
+            self.assertEqual(boundary_fault_times, [1030.0])
+            self.assertEqual(recovery_sleeps, [0.5, 1.0])
             self.assertEqual(fixture.payload()["recovery_count"], 2)
 
     def test_short_running_epochs_increase_fault_backoff_to_cap(self) -> None:
