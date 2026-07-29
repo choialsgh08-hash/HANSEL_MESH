@@ -51,7 +51,7 @@ python scripts\run_radar_stack.py --help
 
 ```powershell
 Test-Path -LiteralPath `
-  configs\radar\calibrations\head-near.json `
+  configs\radar\calibrations\head-near-8hz.json `
   -PathType Leaf
 ```
 
@@ -67,10 +67,12 @@ Test-Path -LiteralPath `
 
 ```powershell
 python scripts\run_radar_stack.py `
-  --xds-serial RI32 `
-  --cfg configs\radar\iwrl6432_3d_operator_near_10hz.cfg `
+  --xds-serial RI32RI32 `
+  --cfg configs\radar\iwrl6432_3d_operator_near_8hz.cfg `
+  --profile-id `
+    lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
   --clutter-calibration `
-    configs\radar\calibrations\head-near.json
+    configs\radar\calibrations\head-near-8hz.json
 ```
 
 supervisor가 `RUNNING`이 되면 브라우저에서
@@ -80,20 +82,53 @@ supervisor가 `RUNNING`이 되면 브라우저에서
 
 | 항목 | 기본값 |
 | --- | --- |
-| active profile | `configs\radar\iwrl6432_3d_operator_near_10hz.cfg` |
-| profile ID | `lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1` |
+| active profile | `configs\radar\iwrl6432_3d_operator_near_8hz.cfg` |
+| profile ID | `lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1` |
+| frame rate/period | 8Hz / 125ms |
 | 첫 프레임 제한 | `--first-frame-timeout 3.0`초 |
 | RUNNING 프레임 제한 | `--frame-timeout 2.5`초 |
-| 검증 제한 | `--verification-timeout 3.0`초 |
-| 연속 검증 프레임 | `--verify-frames 5` |
+| 검증 제한 | `--verification-timeout 5.0`초 |
+| 연속 검증 프레임 | `--verify-frames 30` |
 | 재시도 backoff | `--retry-initial 0.5`초, 최대 `--retry-max 5.0`초 |
+| backoff 초기화 gate | fault 없이 연속 `RUNNING` 30초 |
 | HTTP | `--http-port 8081`, bind `127.0.0.1` |
 | 출력 root | `--output-root` 생략 시 저장소 루트 |
 | run ID | `--run-id` 생략 시 UTC `YYYYMMDD-HHMMSS` |
 
-backoff는 실패할 때마다 두 배로 늘어나 최대 5초가 되고, 다시 `RUNNING`에
-도달하면 0.5초로 초기화된다. `--clutter-calibration`은 기본 파일을 암묵적으로
-선택하지 않으며, 존재하는 JSON 경로를 반드시 명시해야 한다.
+backoff는 실패할 때마다 `0.5 → 1 → 2 → 4 → 5`초로 늘어나고 5초에서
+제한된다. 새 epoch가 `RUNNING`에 도달하거나 같은 epoch에서 viewer만 다시
+시작하는 것으로는 초기화되지 않는다. 오직 fault 없이 `RUNNING` 상태를 연속
+30초 유지한 뒤에만 0.5초로 초기화된다. `--clutter-calibration`은 기본 파일을
+암묵적으로 선택하지 않으며, 존재하는 JSON 경로를 반드시 명시해야 한다.
+
+### 8Hz를 production 기본값으로 쓰는 이유
+
+10Hz 실측에서 포인트 15개인 완전 프레임도 chirp 9.6ms, inter-frame 처리
+15.489ms, UART 전송 74.247ms로 합계 약 99.34ms를 사용했다. 100ms frame period에
+약 0.66ms만 남았고, 다음 16/17포인트 프레임은 8,480바이트 중 마지막
+45/55바이트를 전송하지 못한 채 멈췄다. 8Hz 프로필은 heatmap `16×128`,
+elevation FFT 8, CFAR 15dB, 1.25Mbps UART, `lowPowerCfg 0`을 그대로 유지하고
+frame period만 125ms로 늘려 약 25.66ms의 여유를 만든다. 화면 갱신은 10Hz보다
+25ms 느리지만, 저속 로봇에서는 불완전 전송으로 2.5초 복구가 반복되는 것보다
+안정적인 8Hz가 우선이다.
+
+### 10Hz 실험 프로필로 명시적으로 되돌리기
+
+10Hz는 production 기본값이 아니라 벤치 비교용이다. 반드시 10Hz로 새로 만든
+profile-bound 캘리브레이션을 사용하고 다음처럼 cfg와 profile ID를 함께 지정한다.
+
+```powershell
+python scripts\run_radar_stack.py `
+  --xds-serial RI32RI32 `
+  --cfg configs\radar\iwrl6432_3d_operator_near_10hz.cfg `
+  --profile-id `
+    lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1 `
+  --clutter-calibration `
+    configs\radar\calibrations\head-near-10hz.json
+```
+
+launcher는 bundled 8Hz/10Hz cfg와 profile ID의 짝이 다르면 보드 reset 전에
+거부한다. 8Hz 캘리브레이션을 10Hz에 재사용하거나 그 반대 조합도 금지한다.
 
 ## 4. 보드와 COM 식별
 
@@ -101,13 +136,15 @@ supervisor는 다음 조건을 모두 만족하는 포트 하나만 선택한다
 
 - TI XDS110 VID:PID `0451:BEF3`
 - description에 `Application/User UART` 포함
-- XDS serial `RI32`
+- XDS serial `RI32RI32`
 - description에 `Auxiliary`가 없음
 
 `Auxiliary Data Port`는 레이더 CLI/data 포트가 아니므로 절대 선택하지 않는다.
-정상 명령에는 `--port`가 없기 때문에 reset 또는 USB 재연결 뒤 `COM3`이 다른
-번호로 바뀌어도 같은 XDS serial의 Application/User UART를 자동으로 다시 찾는다.
-`--port COM3`처럼 번호를 명시하면 해당 번호로 고정되므로 진단할 때만 사용한다.
+현재 확인된 포트는 Application/User UART `COM8`, Auxiliary Data Port `COM7`이지만
+COM 번호는 USB 재열거 때 바뀔 수 있는 관측값일 뿐이다. 정상 명령에는 `--port`가
+없기 때문에 reset 또는 USB 재연결 뒤 번호가 바뀌어도 같은 XDS serial의
+Application/User UART를 자동으로 다시 찾는다. `--port COM8`처럼 번호를
+명시하면 해당 번호로 고정되므로 진단할 때만 사용한다.
 조건을 만족하는 포트가 없거나 둘 이상이라 하나를 확정할 수 없으면
 `WAIT_PORT`에서 주행을 차단한 채 기다린다.
 
@@ -119,7 +156,7 @@ supervisor는 다음 조건을 모두 만족하는 포트 하나만 선택한다
 | `RESET_TARGET` | 발견한 reset 도구로 XDS serial이 일치하는 보드만 reset한다. 실패하면 backoff 후 다시 시도한다. |
 | `CONFIGURE` | 115200 baud에서 profile을 적용하고 1250000 baud 전환 결과를 검증한다. |
 | `START_CAPTURE` | 새 epoch의 mission, raw, raw index 경로를 할당하고 `radar-live`를 시작한다. |
-| `VERIFY_FRAMES` | watchdog가 요구하는 연속 5개 정상 프레임을 기다린다. 검증 전 데이터는 주행 가능 상태가 아니다. |
+| `VERIFY_FRAMES` | 5초 안에 watchdog가 요구하는 연속 30개 정상 프레임을 기다린다. 검증 전 데이터는 주행 가능 상태가 아니다. |
 | `SWITCH_VIEWER` | 검증된 새 epoch를 따라가도록 viewer를 교체한다. |
 | `RUNNING` | 캡처와 viewer가 살아 있고 프레임 watchdog가 정상인 유일한 운용 상태다. viewer만 종료되면 같은 epoch에서 다시 시작한다. |
 | `RECOVERING` | UART 손실, 캡처 종료, stale/assert 등 fault 뒤 캡처를 닫고 다음 복구 시도를 준비한다. 주행은 차단한다. |
@@ -147,10 +184,24 @@ supervisor는 다음 조건을 모두 만족하는 포트 하나만 선택한다
 3. 같은 XDS serial의 Application/User UART를 다시 찾는다.
 4. 가능하면 선택한 보드만 reset하고 profile을 다시 적용한다.
 5. 기존 파일을 재사용하지 않고 다음 epoch를 만든다.
-6. 연속 5개 정상 프레임을 검증한 뒤 viewer를 바꾸고 `RUNNING`으로 복귀한다.
+6. 5초 안에 연속 30개 정상 프레임을 검증한 뒤 viewer를 바꾸고 `RUNNING`으로 복귀한다.
 
 `recovery_count`는 `RUNNING`에서 감지한 runtime fault 횟수다. 시작 단계의 profile,
 capture 시작 또는 초기 프레임 검증 재시도 횟수와 동일하지 않다.
+
+viewer 시작만 실패하면 검증된 capture는 유지한다. 재시도 backoff 동안 0.05초
+이하의 짧은 구간마다 종료 요청, capture 종료, Application/User UART 존재 여부,
+watchdog 상태를 다시 확인한다. 따라서 긴 backoff 중 초기에 큐에 들어온 마지막
+프레임 하나가 이후의 실제 UART 정지를 가려서 오래된 viewer를 시작하지 않는다.
+
+2026-07-30 근접 물체 실측에서 발생한 두 번의 `radar_frame_timeout`은 화면 상태
+오탐이 아니었다. 두 epoch 모두 길이 8,480바이트인 유효한 다음 패킷을 전송하다가
+각각 8,435바이트와 8,425바이트에서 멈춰 마지막 45바이트와 55바이트가 오지
+않았다. 직전 프레임은 완전했고 parser, incomplete, frame-gap, writer-drop,
+device-discontinuity 카운터도 0이었다. 원시 UART 자체가 약 2.5초 멈춘 것이므로
+2.5초 watchdog 제한을 늘리면 복구만 늦어진다. 같은 현상이 반복되면 timeout을
+완화하기 전에 USB 케이블·전원·허브와 보드 firmware/profile의 전송 정지를
+점검한다.
 
 reset 실행 파일을 찾지 못해도 최초 시작에서 사용 가능한 포트의 profile 적용은
 시도한다. 그러나 이미 연결된 채 발생한 fault를 복구할 때 reset 도구가 없고
@@ -180,9 +231,11 @@ runtime\radar-supervisor-<run-id>.json
 reset 가능 여부, 각 epoch의 시작·종료·종료 이유·capture exit code, owned child
 시작/종료와 escalation을 담는 manifest다.
 
-epoch 파일은 immutable이다. 경로 중 하나라도 이미 존재하면 덮어쓰지 않고
-실패하며, 복구는 기존 mission/raw/index를 이어 쓰지 않고 새 epoch를 할당한다.
-따라서 장애 전후 자료는 각각 보존된다.
+새 epoch를 할당할 때 경로 중 하나라도 이미 존재하면 덮어쓰지 않고 실패하며,
+복구는 기존 mission/raw/index를 이어 쓰지 않고 새 epoch를 할당한다. 같은
+epoch에서 viewer만 다시 시작할 때는 viewer stdout/stderr 로그를 append-only로
+이어 써서 이전 시도의 진단 출력도 보존한다. epoch가 끝난 뒤의 mission/raw/index와
+로그는 변경하지 않는다. 따라서 장애 전후 자료는 각각 보존된다.
 
 ## 8. 정상 종료
 
@@ -208,7 +261,7 @@ C:\Users\minho\AppData\Local\Temp\hansel-r9-fixture-calibration.json
 
 이 파일은 production/default 캘리브레이션이 아니다. 로봇 장착 상태의 정상 운용,
 실측 평가 또는 현장 주행에는
-`configs\radar\calibrations\head-near.json`을 새로 생성해 사용한다.
+`configs\radar\calibrations\head-near-8hz.json`을 새로 생성해 사용한다.
 
 ## 10. Raspberry Pi 배포
 

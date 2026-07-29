@@ -18,8 +18,10 @@ the existing `MissionLogWriter`, and the existing local HTTP radar API.
 
 - Modify only radar-related source, tests, and radar documentation.
 - Preserve the 30-frame supervisor probation, 2.5-second running frame
-  timeout, retry backoff, profile, calibration, port selection, and collision
-  threshold.
+  timeout, retry backoff, port selection, and collision threshold. A later
+  user-authorized live-evidence amendment changes only production cadence
+  from the bundled 10 Hz cfg to a new 8 Hz cfg and requires a newly generated
+  profile-bound calibration.
 - Never reset or hide cumulative health counters.
 - Final capture health and offline mission inspection remain unhealthy when
   any lifetime fault occurred.

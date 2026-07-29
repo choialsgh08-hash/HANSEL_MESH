@@ -13,7 +13,7 @@
 ```powershell
 python scripts\configure_ti_radar.py `
   --port COM3 `
-  --cfg configs\radar\iwrl6432_3d_operator_near_10hz.cfg `
+  --cfg configs\radar\iwrl6432_3d_operator_near_8hz.cfg `
   --command-timeout 1.5
 ```
 
@@ -26,7 +26,7 @@ python scripts\configure_ti_radar.py `
 ## 2. 캘리브레이션 파일 확인
 
 ```powershell
-Test-Path configs\radar\calibrations\head-near.json
+Test-Path configs\radar\calibrations\head-near-8hz.json
 ```
 
 `True`이고 프로필, 보드 방향, heatmap shape/range step, axes, 케이블과 고정 장착물이
@@ -54,7 +54,7 @@ python -m sensors radar-live `
   --output missions\radar-empty-scene.jsonl `
   --raw-output captures\radar-empty-scene.bin `
   --mission-id radar-empty-scene `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1 `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
   --calibration-id uncalibrated `
   --duration 10
 ```
@@ -65,7 +65,7 @@ python -m sensors radar-live `
 New-Item -ItemType Directory -Force -Path configs\radar\calibrations
 
 python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
-  --output configs\radar\calibrations\head-near.json `
+  --output configs\radar\calibrations\head-near-8hz.json `
   --min-frames 50
 ```
 
@@ -88,7 +88,7 @@ python -m sensors radar-live `
   --output missions\radar-board-live.jsonl `
   --raw-output captures\radar-board-live.bin `
   --mission-id radar-board-live `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1 `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
   --calibration-id uncalibrated
 ```
 
@@ -101,7 +101,7 @@ python -m sensors radar-live `
 ```powershell
 python monitor\radar_front.py `
   --follow missions\radar-board-live.jsonl `
-  --clutter-calibration configs\radar\calibrations\head-near.json `
+  --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
   --max-range-m 3 `
   --history-window 0.3
 ```

@@ -111,6 +111,37 @@ class ConfigureTiRadarTest(unittest.TestCase):
         )
         self.assertEqual(profile.after_baud, ("sensorStart 0 0 0 0",))
 
+    def test_stable_near_3d_profile_is_8hz_and_only_changes_frame_period(self):
+        root = Path(__file__).resolve().parent.parent / "configs" / "radar"
+        stable = MODULE.partition_at_baud(
+            MODULE.load_commands(
+                root / "iwrl6432_3d_operator_near_8hz.cfg"
+            )
+        )
+        experimental = MODULE.partition_at_baud(
+            MODULE.load_commands(
+                root / "iwrl6432_3d_operator_near_10hz.cfg"
+            )
+        )
+
+        expected_stable_commands = tuple(
+            (
+                "frameCfg 2 8 600 16 125 0"
+                if command == "frameCfg 2 8 600 16 100 0"
+                else command
+            )
+            for command in experimental.before_baud
+        )
+
+        self.assertEqual(stable.target_baud, 1_250_000)
+        self.assertEqual(stable.before_baud, expected_stable_commands)
+        self.assertEqual(stable.after_baud, experimental.after_baud)
+        self.assertIn("lowPowerCfg 0", stable.before_baud)
+        self.assertIn(
+            "sigProcChainCfg 16 8 1 2 8 4 0 0.3 0",
+            stable.before_baud,
+        )
+
     def test_load_and_partition_heatmap_profile(self):
         cfg = (
             Path(__file__).resolve().parent.parent

@@ -117,7 +117,7 @@ class RadarStackProcessesTests(unittest.TestCase):
                 "--raw-output", str(self.paths.raw), "--raw-index",
                 str(self.paths.raw_index), "--mission-id",
                 "radar-board-live", "--profile-id",
-                "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1",
+                "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1",
                 "--calibration-id", "uncalibrated",
             ],
         )
@@ -203,6 +203,60 @@ class RadarStackProcessesTests(unittest.TestCase):
         killpg.assert_not_called()
         self.assertEqual(replacement.pid, 11)
         manager.stop_owned_children()
+
+    def test_same_epoch_viewer_restart_preserves_prior_attempt_logs(self):
+        processes = [
+            FakeProcess(pid=10, waits=(0,)),
+            FakeProcess(pid=11, poll_result=0),
+        ]
+        attempts = 0
+
+        def start(command, **kwargs):
+            nonlocal attempts
+            del command
+            attempts += 1
+            kwargs["stdout"].write(f"stdout-attempt-{attempts}\n")
+            kwargs["stdout"].flush()
+            kwargs["stderr"].write(f"stderr-attempt-{attempts}\n")
+            kwargs["stderr"].flush()
+            return processes[attempts - 1]
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "runtime"
+            paths = EpochPaths(
+                self.paths.mission,
+                self.paths.raw,
+                self.paths.raw_index,
+                runtime,
+                runtime / "capture.out",
+                runtime / "capture.err",
+                runtime / "viewer.out",
+                runtime / "viewer.err",
+            )
+            manager = RadarStackProcesses(popen_factory=start)
+            with mock.patch(
+                "sensors.radar_stack_processes.os.name",
+                "posix",
+            ), mock.patch(
+                "sensors.radar_stack_processes.os.killpg",
+                create=True,
+            ), mock.patch(
+                "sensors.radar_stack_processes.os.getpgid",
+                return_value=77,
+                create=True,
+            ):
+                current = manager.switch_viewer(None, paths, self.config)
+                manager.switch_viewer(current, paths, self.config)
+
+            self.assertEqual(
+                paths.viewer_stdout.read_text(encoding="utf-8"),
+                "stdout-attempt-1\nstdout-attempt-2\n",
+            )
+            self.assertEqual(
+                paths.viewer_stderr.read_text(encoding="utf-8"),
+                "stderr-attempt-1\nstderr-attempt-2\n",
+            )
+            manager.stop_owned_children()
 
     def test_start_capture_owns_child_and_creates_runtime_log_parents(self):
         child_process = FakeProcess(poll_result=0)
@@ -853,9 +907,10 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(args.verification_timeout, 5.0)
         self.assertEqual(args.verify_frames, 30)
         self.assertEqual(args.http_port, 8081)
+        self.assertIsNone(args.profile_id)
         self.assertEqual(
             args.cfg.name,
-            "iwrl6432_3d_operator_near_10hz.cfg",
+            "iwrl6432_3d_operator_near_8hz.cfg",
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -869,7 +924,56 @@ class RadarStackLauncherTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--clutter-calibration", result.stdout)
+        self.assertIn("--profile-id", result.stdout)
         self.assertIn("--xds-serial", result.stdout)
+
+    def test_profile_id_resolution_keeps_known_cfg_pairs_consistent(self):
+        launcher = load_launcher()
+        stable_id = (
+            "lsdk-05.05.04.02-presence-near-"
+            "heatmap16-elev8-cfar15-8hz-v1"
+        )
+        experimental_id = (
+            "lsdk-05.05.04.02-presence-near-"
+            "heatmap16-elev8-cfar15-10hz-v1"
+        )
+        experimental_cfg = (
+            REPOSITORY_ROOT
+            / "configs"
+            / "radar"
+            / "iwrl6432_3d_operator_near_10hz.cfg"
+        )
+
+        self.assertEqual(
+            launcher._resolve_profile_id(
+                launcher.DEFAULT_PROFILE.resolve(),
+                None,
+            ),
+            stable_id,
+        )
+        self.assertEqual(
+            launcher._resolve_profile_id(
+                experimental_cfg.resolve(),
+                experimental_id,
+            ),
+            experimental_id,
+        )
+        with self.assertRaisesRegex(
+            SystemExit,
+            "does not match the selected known --cfg",
+        ):
+            launcher._resolve_profile_id(
+                experimental_cfg.resolve(),
+                stable_id,
+            )
+        with self.assertRaisesRegex(
+            SystemExit,
+            "--profile-id is required for an unknown --cfg",
+        ):
+            launcher._resolve_profile_id(
+                Path("custom-profile.cfg").resolve(),
+                None,
+            )
 
     def test_parser_and_main_reject_unsafe_values_before_external_effects(self):
         launcher = load_launcher()
@@ -995,6 +1099,11 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(config.calibration_path, calibration)
         self.assertEqual(config.reset_executable, reset_executable)
         self.assertIsNone(config.reset_unavailable_reason)
+        self.assertEqual(
+            config.profile_id,
+            "lsdk-05.05.04.02-presence-near-"
+            "heatmap16-elev8-cfar15-8hz-v1",
+        )
         self.assertEqual(config.data_baud, 1_250_000)
         self.assertEqual(config.http_bind, "127.0.0.1")
         self.assertIs(dependencies.port_provider, comports)
@@ -1172,6 +1281,8 @@ class RadarStackLauncherTests(unittest.TestCase):
                                 "relative-out",
                                 "--cfg",
                                 "profile.cfg",
+                                "--profile-id",
+                                "relative-profile",
                                 "--clutter-calibration",
                                 "calibration.json",
                                 "--reset-executable",
@@ -1189,6 +1300,7 @@ class RadarStackLauncherTests(unittest.TestCase):
             caller_root / "relative-out",
         )
         self.assertEqual(config.profile_path, profile)
+        self.assertEqual(config.profile_id, "relative-profile")
         self.assertEqual(config.calibration_path, calibration)
         self.assertEqual(config.reset_executable, reset_executable)
         for path in (

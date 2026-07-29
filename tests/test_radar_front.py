@@ -807,6 +807,33 @@ class RadarFrontStateTests(unittest.TestCase):
                 self.assertEqual(snapshot["health"]["degraded_reason"], reason)
                 self.assertEqual(snapshot["counters"][counter], 1)
 
+    def test_integrity_reason_precedes_simultaneous_capture_degradation(self):
+        state = RadarFrontState("follow", clock=FakeClock())
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 2.0, 0.0, 0.0)],
+                frame_number=1,
+            )
+        )
+        state.note_parse_error("invalid JSON log line")
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 2.1, 0.0, 0.0)],
+                frame_number=3,
+                dropped=1,
+            )
+        )
+
+        snapshot = state.snapshot()
+
+        self.assertEqual(snapshot["status"], "degraded")
+        self.assertEqual(
+            snapshot["health"]["degraded_reason"],
+            "invalid_log_record",
+        )
+        self.assertEqual(snapshot["counters"]["parse_errors_total"], 1)
+        self.assertEqual(snapshot["counters"]["frame_gaps_total"], 1)
+
     def test_new_producer_starts_a_fresh_sensor_sequence(self):
         clock = FakeClock()
         state = RadarFrontState("follow", clock=clock)
@@ -1101,14 +1128,14 @@ class RadarFrontDocumentationTests(unittest.TestCase):
     CALIBRATE_COMMAND = (
         "python -m sensors radar-calibrate "
         "missions\\radar-empty-scene.jsonl `\n"
-        "  --output configs\\radar\\calibrations\\head-near.json `\n"
+        "  --output configs\\radar\\calibrations\\head-near-8hz.json `\n"
         "  --min-frames 50"
     )
     VIEWER_COMMAND = (
         "python monitor\\radar_front.py `\n"
         "  --follow missions\\radar-board-live.jsonl `\n"
         "  --clutter-calibration "
-        "configs\\radar\\calibrations\\head-near.json `\n"
+        "configs\\radar\\calibrations\\head-near-8hz.json `\n"
         "  --max-range-m 3 `\n"
         "  --history-window 0.3"
     )

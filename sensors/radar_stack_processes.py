@@ -243,6 +243,8 @@ class RadarStackProcesses:
         stderr_path: Path,
         config: RadarSupervisorConfig,
         parent_lease: ParentDeathLease,
+        *,
+        log_mode: Literal["w", "a"] = "w",
     ) -> ManagedChild:
         try:
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,10 +263,10 @@ class RadarStackProcesses:
             else:
                 popen_kwargs["start_new_session"] = True
             with stdout_path.open(
-                "w",
+                log_mode,
                 encoding="utf-8",
             ) as stdout, stderr_path.open(
-                "w",
+                log_mode,
                 encoding="utf-8",
             ) as stderr:
                 process = self._popen_factory(
@@ -347,6 +349,7 @@ class RadarStackProcesses:
                 paths.viewer_stderr,
                 config,
                 parent_lease,
+                log_mode="a",
             )
         except BaseException:
             parent_lease.release()

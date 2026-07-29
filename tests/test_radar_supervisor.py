@@ -81,7 +81,7 @@ class RadarSupervisorContractTests(unittest.TestCase):
         self.assertEqual(
             config.profile_id,
             "lsdk-05.05.04.02-presence-near-"
-            "heatmap16-elev8-cfar15-10hz-v1",
+            "heatmap16-elev8-cfar15-8hz-v1",
         )
         self.assertIsNone(config.explicit_port)
         self.assertIsNone(config.xds_serial)
@@ -1810,27 +1810,39 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 ],
                 ["viewer:e001:none", "viewer:e001:none"],
             )
-            self.assertIn(0.5, fixture.sleeps)
+            self.assertTrue(fixture.sleeps)
+            self.assertTrue(
+                all(
+                    delay <= fixture.config.poll_interval_s
+                    for delay in fixture.sleeps
+                )
+            )
+            self.assertAlmostEqual(
+                sum(fixture.sleeps),
+                fixture.config.retry_initial_s,
+            )
             self.assertEqual(fixture.payload()["epoch"], 1)
 
     def test_initial_viewer_retry_revalidates_capture_before_running(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = RecoveryFixture(directory)
             fixture.processes.viewer_failures_remaining = 1
-            retry_sleeps = 0
+            viewer_wait_elapsed_s = 0.0
 
             def capture_exits_during_viewer_backoff(delay_s: float) -> None:
-                nonlocal retry_sleeps
+                nonlocal viewer_wait_elapsed_s
                 fixture.sleep(delay_s)
-                if delay_s >= fixture.config.retry_initial_s:
-                    retry_sleeps += 1
-                    if retry_sleeps == 1:
-                        capture = next(
-                            child
-                            for child in fixture.processes.children
-                            if child.role == "capture"
-                        )
-                        capture.exit_code = 23
+                viewer_wait_elapsed_s += delay_s
+                if (
+                    viewer_wait_elapsed_s
+                    >= fixture.config.poll_interval_s
+                ):
+                    capture = next(
+                        child
+                        for child in fixture.processes.children
+                        if child.role == "capture"
+                    )
+                    capture.exit_code = 23
 
             dependencies = replace(
                 fixture.dependencies,
@@ -1843,7 +1855,8 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                 payload = fixture.payload()
                 return (
                     payload["state"] == "RUNNING"
-                    or retry_sleeps >= 2
+                    or viewer_wait_elapsed_s
+                    >= 2 * fixture.config.retry_initial_s
                 )
 
             RadarSupervisor(fixture.config, dependencies).run(
@@ -1871,6 +1884,118 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                     and event["action"] == "started"
                     for event in payload["process_events"]
                 )
+            )
+
+    def test_elevated_viewer_retry_detects_queued_frame_then_stall_before_relaunch(
+        self,
+    ) -> None:
+        class QueuedThenStalledWatchdog:
+            def __init__(
+                self,
+                actions: list[str],
+                *,
+                queued_at_s: float,
+                frame_timeout_s: float,
+            ) -> None:
+                self.actions = actions
+                self.queued_at_s = queued_at_s
+                self.frame_timeout_s = frame_timeout_s
+                self.last_frame_observed_s = queued_at_s - 0.05
+                self.queued_frame_observed = False
+                self.poll_count = 0
+
+            def poll(self, now_s: float) -> RadarWatchdogSnapshot:
+                self.poll_count += 1
+                if self.poll_count == 1:
+                    return RadarWatchdogSnapshot(
+                        True,
+                        5,
+                        self.last_frame_observed_s,
+                        5,
+                        None,
+                    )
+                if (
+                    not self.queued_frame_observed
+                    and now_s >= self.queued_at_s
+                ):
+                    self.queued_frame_observed = True
+                    self.last_frame_observed_s = now_s
+                    self.actions.append("watchdog:queued-frame")
+                fault = (
+                    "radar_frame_timeout"
+                    if now_s - self.last_frame_observed_s
+                    > self.frame_timeout_s
+                    else None
+                )
+                return RadarWatchdogSnapshot(
+                    True,
+                    5,
+                    self.last_frame_observed_s,
+                    6,
+                    fault,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(directory)
+            fixture.config = replace(
+                fixture.config,
+                retry_initial_s=5.0,
+                retry_max_s=5.0,
+            )
+            fixture.processes.viewer_failures_remaining = 1
+            watchdog = QueuedThenStalledWatchdog(
+                fixture.actions,
+                queued_at_s=fixture.now_s + fixture.config.poll_interval_s,
+                frame_timeout_s=fixture.config.frame_timeout_s,
+            )
+            fixture.dependencies = replace(
+                fixture.dependencies,
+                watchdog_factory=lambda paths, config, started_at_s: watchdog,
+            )
+
+            def stop_after_fault_or_stale_relaunch() -> bool:
+                viewer_attempts = [
+                    action
+                    for action in fixture.actions
+                    if action.startswith("viewer:e001")
+                ]
+                if len(viewer_attempts) > 1:
+                    return True
+                if not fixture.manifest.exists():
+                    return False
+                payload = fixture.payload()
+                return (
+                    payload["state"] == "RECOVERING"
+                    and payload["last_reason"] == "radar_frame_timeout"
+                )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                stop_after_fault_or_stale_relaunch
+            )
+
+            viewer_attempts = [
+                action
+                for action in fixture.actions
+                if action.startswith("viewer:e001")
+            ]
+            self.assertEqual(viewer_attempts, ["viewer:e001:none"])
+            self.assertTrue(watchdog.queued_frame_observed)
+            self.assertEqual(
+                fixture.payload()["epochs"][0]["end_reason"],
+                "radar_frame_timeout",
+            )
+            self.assertTrue(fixture.sleeps)
+            self.assertLessEqual(
+                max(fixture.sleeps),
+                fixture.config.poll_interval_s,
+            )
+            self.assertGreaterEqual(
+                sum(fixture.sleeps),
+                fixture.config.frame_timeout_s,
+            )
+            self.assertLess(
+                sum(fixture.sleeps),
+                fixture.config.retry_max_s,
             )
 
     def test_viewer_retry_revalidates_port_after_successful_launch(self) -> None:
@@ -1924,8 +2049,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
             def sleep_and_request_stop(delay_s: float) -> None:
                 nonlocal stopped
                 fixture.sleep(delay_s)
-                if delay_s >= fixture.config.retry_initial_s:
-                    stopped = True
+                stopped = True
 
             dependencies = replace(
                 fixture.dependencies,
@@ -1940,6 +2064,10 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
             self.assertEqual(payload["epochs"][0]["end_reason"], "shutdown")
             self.assertEqual(fixture.actions.count("reset:COM3"), 1)
             self.assertEqual(fixture.actions.count("configure:COM3"), 1)
+            self.assertEqual(
+                fixture.sleeps,
+                [fixture.config.poll_interval_s],
+            )
 
     def test_same_epoch_viewer_restart_retries_and_allows_pid_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

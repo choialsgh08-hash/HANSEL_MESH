@@ -89,7 +89,7 @@ class RadarSupervisorConfig:
     mission_id: str = "radar-board-live"
     profile_id: str = (
         "lsdk-05.05.04.02-presence-near-"
-        "heatmap16-elev8-cfar15-10hz-v1"
+        "heatmap16-elev8-cfar15-8hz-v1"
     )
     explicit_port: str | None = None
     xds_serial: str | None = None
@@ -763,10 +763,7 @@ class RadarSupervisor:
                 )
             except Exception:
                 self._transition(SupervisorState.SWITCH_VIEWER, reason)
-                fault = self._poll_retained_radar_fault()
-                if fault is not None:
-                    raise _ViewerRetryFault(fault)
-                if not self._backoff(stop_requested):
+                if not self._wait_for_viewer_retry(stop_requested):
                     return None
                 retrying = True
                 continue
@@ -807,6 +804,31 @@ class RadarSupervisor:
         if snapshot.fault_reason is not None:
             return snapshot.fault_reason, None, False
         return None
+
+    def _wait_for_viewer_retry(
+        self,
+        stop_requested: Callable[[], bool],
+    ) -> bool:
+        if stop_requested():
+            return False
+        delay_s = self._retry_delay_s
+        self._retry_delay_s = min(
+            self._config.retry_max_s,
+            delay_s * 2.0,
+        )
+        deadline_s = self._dependencies.monotonic() + delay_s
+        while True:
+            if stop_requested():
+                return False
+            fault = self._poll_retained_radar_fault()
+            if fault is not None:
+                raise _ViewerRetryFault(fault)
+            remaining_s = deadline_s - self._dependencies.monotonic()
+            if remaining_s <= 0:
+                return True
+            self._dependencies.sleep(
+                min(self._config.poll_interval_s, remaining_s)
+            )
 
     def _matching_port_inventory(
         self,

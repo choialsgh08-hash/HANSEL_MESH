@@ -43,7 +43,7 @@ UART를 소유하고 mission JSONL을 기록하며, 화면은 그 파일을 따�
 ```powershell
 python scripts\configure_ti_radar.py `
   --port COM3 `
-  --cfg configs\radar\iwrl6432_3d_operator_near_10hz.cfg `
+  --cfg configs\radar\iwrl6432_3d_operator_near_8hz.cfg `
   --command-timeout 1.5
 ```
 
@@ -51,7 +51,7 @@ python scripts\configure_ti_radar.py `
 `first_magic_observed=true`를 확인한다. `new_baud_verified_by_version`은 새 baud의
 프롬프트를 직접 확인하지 못해 fallback `version` probe를 사용한 경우에만
 `true`다. 프롬프트를 직접 확인한 정상 경로에서는 이 값이 `false`여도 정상이다.
-프로필 적용 후에는 다시 RESET하지 않는다. 이 프로필은 10Hz, 128 range bins,
+프로필 적용 후에는 다시 RESET하지 않는다. 이 프로필은 8Hz, 128 range bins,
 16 azimuth bins, range step `0.09765625m`를 사용한다.
 
 ## 3. 빈 장면 캘리브레이션
@@ -76,7 +76,7 @@ python -m sensors radar-live `
   --output missions\radar-empty-scene.jsonl `
   --raw-output captures\radar-empty-scene.bin `
   --mission-id radar-empty-scene `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1 `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
   --calibration-id uncalibrated `
   --duration 10
 ```
@@ -88,7 +88,7 @@ python -m sensors radar-live `
 New-Item -ItemType Directory -Force -Path configs\radar\calibrations
 
 python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
-  --output configs\radar\calibrations\head-near.json `
+  --output configs\radar\calibrations\head-near-8hz.json `
   --min-frames 50
 ```
 
@@ -126,7 +126,7 @@ python -m sensors radar-live `
   --output missions\radar-board-live.jsonl `
   --raw-output captures\radar-board-live.bin `
   --mission-id radar-board-live `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-10hz-v1 `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
   --calibration-id uncalibrated
 ```
 
@@ -141,7 +141,7 @@ python -m sensors radar-live `
 ```powershell
 python monitor\radar_front.py `
   --follow missions\radar-board-live.jsonl `
-  --clutter-calibration configs\radar\calibrations\head-near.json `
+  --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
   --max-range-m 3 `
   --history-window 0.3
 ```
@@ -154,7 +154,7 @@ python monitor\radar_front.py `
 ```powershell
 python monitor\radar_front.py `
   --replay missions\radar-board-live.jsonl `
-  --clutter-calibration configs\radar\calibrations\head-near.json `
+  --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
   --max-range-m 3 `
   --history-window 0.3 `
   --speed 1

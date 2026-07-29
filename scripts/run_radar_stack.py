@@ -43,8 +43,26 @@ DEFAULT_PROFILE = (
     REPOSITORY_ROOT
     / "configs"
     / "radar"
+    / "iwrl6432_3d_operator_near_8hz.cfg"
+)
+DEFAULT_PROFILE_ID = (
+    "lsdk-05.05.04.02-presence-near-"
+    "heatmap16-elev8-cfar15-8hz-v1"
+)
+EXPERIMENTAL_10HZ_PROFILE = (
+    REPOSITORY_ROOT
+    / "configs"
+    / "radar"
     / "iwrl6432_3d_operator_near_10hz.cfg"
 )
+EXPERIMENTAL_10HZ_PROFILE_ID = (
+    "lsdk-05.05.04.02-presence-near-"
+    "heatmap16-elev8-cfar15-10hz-v1"
+)
+KNOWN_PROFILE_IDS = {
+    DEFAULT_PROFILE.resolve(): DEFAULT_PROFILE_ID,
+    EXPERIMENTAL_10HZ_PROFILE.resolve(): EXPERIMENTAL_10HZ_PROFILE_ID,
+}
 RESET_SEARCH_ROOTS = (Path("C:/ti"),)
 
 
@@ -100,6 +118,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cfg", type=Path, default=DEFAULT_PROFILE)
     parser.add_argument(
+        "--profile-id",
+        help=(
+            "profile identity recorded with frames; inferred for bundled "
+            "8 Hz and 10 Hz profiles, required for an unknown --cfg"
+        ),
+    )
+    parser.add_argument(
         "--clutter-calibration",
         dest="calibration",
         type=Path,
@@ -133,6 +158,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _resolve_profile_id(
+    profile_path: Path,
+    requested_profile_id: str | None,
+) -> str:
+    expected_profile_id = KNOWN_PROFILE_IDS.get(profile_path.resolve())
+    if expected_profile_id is None:
+        if requested_profile_id is None:
+            raise SystemExit(
+                "--profile-id is required for an unknown --cfg"
+            )
+        return requested_profile_id
+    if (
+        requested_profile_id is not None
+        and requested_profile_id != expected_profile_id
+    ):
+        raise SystemExit(
+            "--profile-id does not match the selected known --cfg"
+        )
+    return expected_profile_id
 
 
 def _configure_profile(
@@ -256,6 +302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if not profile_path.is_file():
         raise SystemExit("--cfg must name an existing radar profile file")
+    profile_id = _resolve_profile_id(profile_path, args.profile_id)
     if calibration_path is None or not calibration_path.is_file():
         raise SystemExit(
             "--clutter-calibration must name an existing calibration file"
@@ -284,6 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile_path=profile_path,
         calibration_path=calibration_path,
         run_id=run_id,
+        profile_id=profile_id,
         explicit_port=args.port,
         xds_serial=args.xds_serial,
         reset_executable=reset_executable,

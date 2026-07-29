@@ -75,11 +75,40 @@ check.
 
 ## Supervisor and operator safety
 
-The supervisor remains unchanged:
+The supervisor's radar recovery gates remain unchanged:
 
 - 30 consecutive qualifying frames are required before a new epoch is shown;
 - a running epoch faults after 2.5 seconds without a radar frame;
 - retry backoff resets only after 30 healthy running seconds.
+
+Viewer launch retry is retained-radar-aware. Its shared retry delay still
+advances once per failed launch, but the wait is divided into intervals no
+longer than the supervisor poll interval. Every interval rechecks shutdown,
+capture exit, the selected Application/User UART, and watchdog health. A
+queued frame therefore cannot be timestamped only after an uninterrupted
+five-second viewer backoff and hide a stream that stalled meanwhile.
+
+Same-epoch viewer restarts append to the epoch viewer logs. They never
+truncate the diagnostic output from an earlier viewer attempt.
+
+## Stable production cadence
+
+Later live evidence showed that the 10 Hz near profile had effectively no
+frame budget left. A completed 15-point frame reported 9.6 ms chirp time,
+15.489 ms inter-frame processing, and 74.247 ms UART time: approximately
+99.34 ms of its 100 ms period. The following 8,480-byte packets with 16 and
+17 points stopped after 8,435 and 8,425 bytes respectively. Their prior
+frames were complete and parser, incomplete, gap, writer, and device
+discontinuity counters remained zero.
+
+Production therefore uses the bundled 8 Hz near profile and profile ID. It
+changes only `frameCfg` from a 100 ms period to 125 ms, retaining the
+16-by-128 heatmap, elevation FFT 8, CFAR 15 dB, 1.25 Mbps UART, near-range
+selection, and `lowPowerCfg 0`. The bundled 10 Hz profile remains an explicit
+experimental option. The launcher deterministically binds each bundled cfg
+to its profile ID and rejects a conflicting explicit pair before hardware
+effects. Changing cadence requires a newly generated profile-bound clutter
+calibration; an 8 Hz and 10 Hz calibration are not interchangeable.
 
 The browser continues to block `waiting`, `stale`, `fault`, and supervisor
 non-running states. `degraded` remains renderable. After a quiet capture
@@ -97,7 +126,15 @@ Automated tests must prove:
 4. viewer status changes from degraded to live on explicit recovery health
    without clearing counters;
 5. recovery health cannot clear invalid-log or log-sequence degradation;
-6. existing supervisor, capture, viewer, and browser regressions remain green.
+6. integrity degradation remains the displayed reason while capture
+   degradation is active at the same time;
+7. an elevated viewer retry detects a queued frame followed by a stalled
+   stream before launching a replacement viewer;
+8. shutdown interrupts viewer retry within one supervisor poll interval and
+   same-epoch viewer logs preserve all attempts;
+9. the stable cfg differs from the experimental 10 Hz cfg only in its 125 ms
+   `frameCfg`, and launcher defaults/mappings cannot mislabel either profile;
+10. existing supervisor, capture, viewer, and browser regressions remain green.
 
 Live verification will deliberately restart only the manifest-owned capture
 child so the existing supervisor exercises one automatic recovery epoch. The
