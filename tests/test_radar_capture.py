@@ -198,6 +198,27 @@ class PeriodicDiagnosticFakeSerial(FakeSerial):
         raise KeyboardInterrupt
 
 
+class GapThenQuietFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.read_count = 0
+
+    def read(self, size):
+        del size
+        self.read_count += 1
+        if self.read_count == 1:
+            return one_point_packet(1) + one_point_packet(3)
+        if self.read_count == 2:
+            time.sleep(0.02)
+            return b""
+        if self.read_count == 3:
+            return one_point_packet(4)
+        if self.read_count == 4:
+            time.sleep(0.02)
+            return b""
+        raise KeyboardInterrupt
+
+
 class RadarCaptureTests(unittest.TestCase):
     def test_parent_stop_request_flushes_capture_without_reading_uart(self):
         class NoReadSerial(FakeSerial):
@@ -495,6 +516,44 @@ class RadarCaptureTests(unittest.TestCase):
             for record in records:
                 state.ingest(record)
             self.assertEqual(state.snapshot()["status"], "live")
+
+    def test_periodic_health_recovers_after_quiet_interval_without_erasing_gap(
+        self,
+    ):
+        fake_serial_module = SimpleNamespace(Serial=GapThenQuietFakeSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="lsdk-05.05.04.02-test",
+                boot_id="boot-1",
+                health_interval_s=0.01,
+            )
+
+            health_records = [
+                entry.record
+                for entry in iter_mission_log(mission)
+                if type(entry.record).__name__ == "SensorHealth"
+            ]
+            periodic = [
+                record
+                for record in health_records
+                if record.detail.startswith("health_kind=periodic")
+            ]
+            final = health_records[-1]
+            self.assertEqual(periodic[0].status, "degraded")
+            self.assertEqual(periodic[-1].status, "ok")
+            self.assertTrue(
+                all(item.seq_gaps_total == 1 for item in periodic)
+            )
+            self.assertEqual(final.status, "degraded")
+            self.assertEqual(final.seq_gaps_total, 1)
 
     def test_post_sync_corruption_degrades_live_health(self):
         fake_serial_module = SimpleNamespace(

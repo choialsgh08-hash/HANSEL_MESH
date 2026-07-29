@@ -64,6 +64,29 @@ class RadarCaptureStats:
     heatmap_range_step_m: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class _HealthFaultSnapshot:
+    post_sync_parse_errors: int = 0
+    post_sync_discarded_bytes: int = 0
+    incomplete_frames: int = 0
+    missing_point_tlv_frames: int = 0
+    missing_heatmap_frames: int = 0
+    writer_drops: int = 0
+    radar_frame_gaps: int = 0
+    device_discontinuities: int = 0
+
+    def increased_since(self, previous: _HealthFaultSnapshot) -> bool:
+        return any(
+            getattr(self, field) > getattr(previous, field)
+            for field in self.__dataclass_fields__
+        )
+
+    def any_faults(self) -> bool:
+        return any(
+            getattr(self, field) for field in self.__dataclass_fields__
+        )
+
+
 def frame_gap(previous: Optional[int], current: int) -> int:
     """Return a plausible uint32 frame gap, tolerating counter wrap/reset."""
 
@@ -456,11 +479,31 @@ def capture_radar_uart(
             ) as writer:
                 start = time.monotonic()
                 next_health_at = start + health_interval_s
+                last_accepted_periodic_faults = _HealthFaultSnapshot()
                 stop_reason = "duration_elapsed"
+
+                def health_fault_snapshot() -> _HealthFaultSnapshot:
+                    return _HealthFaultSnapshot(
+                        post_sync_parse_errors=(
+                            decoder.post_sync_parse_errors
+                        ),
+                        post_sync_discarded_bytes=(
+                            decoder.post_sync_discarded_bytes
+                        ),
+                        incomplete_frames=incomplete_frames,
+                        missing_point_tlv_frames=(
+                            missing_point_tlv_frames
+                        ),
+                        missing_heatmap_frames=missing_heatmap_frames,
+                        writer_drops=writer_drops,
+                        radar_frame_gaps=radar_frame_gaps,
+                        device_discontinuities=device_discontinuities,
+                    )
 
                 def make_health_record(
                     kind: str,
                     include_buffered_tail: bool,
+                    current_faults: _HealthFaultSnapshot,
                 ) -> SensorHealth:
                     unresolved_startup_failure = bool(
                         include_buffered_tail
@@ -471,21 +514,19 @@ def capture_radar_uart(
                             or decoder.buffered_bytes
                         )
                     )
-                    degraded = bool(
-                        decoder.post_sync_parse_errors
-                        or decoder.post_sync_discarded_bytes
-                        or incomplete_frames
-                        or missing_point_tlv_frames
-                        or missing_heatmap_frames
-                        or writer_drops
-                        or radar_frame_gaps
-                        or device_discontinuities
-                        or unresolved_startup_failure
-                        or (
-                            include_buffered_tail
-                            and decoder.buffered_bytes
+                    if kind == "periodic":
+                        degraded = current_faults.increased_since(
+                            last_accepted_periodic_faults
                         )
-                    )
+                    else:
+                        degraded = bool(
+                            current_faults.any_faults()
+                            or unresolved_startup_failure
+                            or (
+                                include_buffered_tail
+                                and decoder.buffered_bytes
+                            )
+                        )
                     if degraded:
                         status = "degraded"
                     elif frames_decoded == 0:
@@ -564,15 +605,20 @@ def capture_radar_uart(
                     )
 
                 def emit_periodic_health_if_due() -> None:
+                    nonlocal last_accepted_periodic_faults
                     nonlocal next_health_at, writer_drops
                     now = time.monotonic()
                     if now < next_health_at:
                         return
+                    current_faults = health_fault_snapshot()
                     health = make_health_record(
                         "periodic",
                         include_buffered_tail=False,
+                        current_faults=current_faults,
                     )
-                    if not writer.submit(health):
+                    if writer.submit(health):
+                        last_accepted_periodic_faults = current_faults
+                    else:
                         writer_drops += 1
                     next_health_at = now + health_interval_s
 
@@ -767,9 +813,11 @@ def capture_radar_uart(
                     os.fsync(raw_handle.fileno())
                     os.fsync(index_handle.fileno())
 
+                current_faults = health_fault_snapshot()
                 health = make_health_record(
                     "final",
                     include_buffered_tail=True,
+                    current_faults=current_faults,
                 )
                 writer.write_critical(health)
         finally:
