@@ -445,6 +445,9 @@ class RadarSupervisor:
                         self._stop_active_child(self._active_capture)
                     self._active_watchdog = None
                     self._finalize_epoch(reason=reason)
+                    if not self._backoff(stop_requested):
+                        self._shutdown()
+                        return
                     if not self._attempt_until_running(
                         stop_requested,
                         recovering=True,
@@ -662,7 +665,6 @@ class RadarSupervisor:
 
             self._fatal_reason = "running_manifest_write_failed"
             self._transition(SupervisorState.RUNNING, "verified_frames")
-            self._retry_delay_s = self._config.retry_initial_s
             return True
 
     def _monitor_until_fault(
@@ -727,7 +729,6 @@ class RadarSupervisor:
                 self._active_viewer = replacement
                 self._persist_manifest()
                 self._transition(SupervisorState.RUNNING, "viewer_restarted")
-                self._retry_delay_s = self._config.retry_initial_s
 
             self._fatal_reason = "running_sleep_failed"
             self._dependencies.sleep(self._config.poll_interval_s)

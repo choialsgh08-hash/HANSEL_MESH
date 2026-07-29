@@ -804,6 +804,7 @@ class RecoveryFixture:
             calibration_path=self.root / "calibration.json",
             run_id="recovery",
             xds_serial="RI32",
+            verification_frames=5,
         )
         self.dependencies = RadarSupervisorDependencies(
             port_provider=self.port_provider,
@@ -2014,13 +2015,6 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                     fixture.processes.viewer_failures_remaining = 1
                     armed = True
                     return False
-                if fixture.manifest.exists():
-                    payload = fixture.payload()
-                    if (
-                        payload["state"] == "RECOVERING"
-                        and payload["last_reason"] == "radar_frame_timeout"
-                    ):
-                        return True
                 return len(viewers) >= 2
 
             RadarSupervisor(fixture.config, fixture.dependencies).run(
@@ -2157,6 +2151,71 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
             and fixture.payload()["state"] == "RUNNING"
             and fixture.payload()["epoch"] == epoch
         )
+
+    def test_short_running_epochs_increase_fault_backoff_to_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            short_epoch = [
+                snapshot(),
+                snapshot(),
+                snapshot(
+                    verified=False,
+                    frames=0,
+                    fault="radar_frame_timeout",
+                ),
+            ]
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[short_epoch for _ in range(5)] + [[snapshot()]],
+            )
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                lambda: self._stop_after_running_epoch(fixture, 6)
+            )
+
+            recovery_sleeps = [
+                delay
+                for delay in fixture.sleeps
+                if delay != fixture.config.poll_interval_s
+            ]
+            self.assertEqual(recovery_sleeps[:5], [0.5, 1.0, 2.0, 4.0, 5.0])
+            self.assertEqual(fixture.payload()["recovery_count"], 5)
+
+    def test_shutdown_during_fault_backoff_does_not_reset_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = RecoveryFixture(
+                directory,
+                watchdogs=[[
+                    snapshot(),
+                    snapshot(),
+                    snapshot(
+                        verified=False,
+                        frames=0,
+                        fault="radar_frame_timeout",
+                    ),
+                ]],
+            )
+            stopped = False
+
+            def stop_in_fault_backoff(delay_s: float) -> None:
+                nonlocal stopped
+                fixture.sleep(delay_s)
+                if delay_s == fixture.config.retry_initial_s:
+                    stopped = True
+
+            dependencies = replace(
+                fixture.dependencies,
+                sleep=stop_in_fault_backoff,
+            )
+            RadarSupervisor(fixture.config, dependencies).run(
+                lambda: (
+                    stopped
+                    or fixture.actions.count("reset:COM3") >= 2
+                )
+            )
+
+            self.assertEqual(fixture.actions.count("reset:COM3"), 1)
+            self.assertEqual(fixture.payload()["recovery_count"], 1)
+            self.assertEqual(fixture.payload()["state"], "STOPPED")
 
     def test_healthy_running_frames_do_not_reset_configure_or_rotate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2459,7 +2518,7 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
                     for delay in fixture.sleeps
                     if delay != fixture.config.poll_interval_s
                 ],
-                [0.5],
+                [0.5, 1.0],
             )
 
     def test_failures_back_off_with_cap_and_preserve_epoch_rules(self) -> None:
@@ -2780,16 +2839,19 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
             stopped = False
             backoff_payload: dict[str, object] | None = None
             old_viewer_active = False
+            non_poll_sleeps = 0
 
             def observe_backoff(delay_s: float) -> None:
-                nonlocal stopped, backoff_payload, old_viewer_active
+                nonlocal stopped, backoff_payload, old_viewer_active, non_poll_sleeps
                 if delay_s != fixture.config.poll_interval_s:
-                    backoff_payload = fixture.payload()
-                    old_viewer_active = not any(
-                        action.startswith("stop:viewer:")
-                        for action in fixture.actions
-                    )
-                    stopped = True
+                    non_poll_sleeps += 1
+                    if non_poll_sleeps == 2:
+                        backoff_payload = fixture.payload()
+                        old_viewer_active = not any(
+                            action.startswith("stop:viewer:")
+                            for action in fixture.actions
+                        )
+                        stopped = True
                 fixture.sleep(delay_s)
 
             dependencies = replace(
