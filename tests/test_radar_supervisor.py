@@ -94,8 +94,8 @@ class RadarSupervisorContractTests(unittest.TestCase):
         self.assertEqual(config.heatmap_range_step_m, 0.09765625)
         self.assertEqual(config.first_frame_timeout_s, 3.0)
         self.assertEqual(config.frame_timeout_s, 2.5)
-        self.assertEqual(config.verification_timeout_s, 3.0)
-        self.assertEqual(config.verification_frames, 5)
+        self.assertEqual(config.verification_timeout_s, 5.0)
+        self.assertEqual(config.verification_frames, 30)
         self.assertEqual(config.retry_initial_s, 0.5)
         self.assertEqual(config.retry_max_s, 5.0)
         self.assertEqual(config.poll_interval_s, 0.05)
@@ -543,6 +543,7 @@ class SupervisorFixture:
         reset_result: bool = True,
         profile_result: dict[str, object] | None = None,
         snapshots: list[RadarWatchdogSnapshot] | None = None,
+        verification_frames: int = 5,
     ) -> None:
         self.root = Path(directory)
         self.actions: list[str] = []
@@ -564,9 +565,17 @@ class SupervisorFixture:
             snapshots
             or [
                 RadarWatchdogSnapshot(False, count, 100.0, count, None)
-                for count in range(1, 5)
+                for count in range(1, verification_frames)
             ]
-            + [RadarWatchdogSnapshot(True, 5, 100.0, 5, None)],
+            + [
+                RadarWatchdogSnapshot(
+                    True,
+                    verification_frames,
+                    100.0,
+                    verification_frames,
+                    None,
+                )
+            ],
             self.actions,
         )
         self.processes.watchdog = self.watchdog
@@ -579,6 +588,7 @@ class SupervisorFixture:
             calibration_path=self.root / "calibration.json",
             run_id="board-live",
             xds_serial="RI32",
+            verification_frames=verification_frames,
         )
         self.dependencies = RadarSupervisorDependencies(
             port_provider=self.port_provider,
@@ -1283,6 +1293,52 @@ class RadarSupervisorStartupTests(unittest.TestCase):
             self.assertEqual(fixture.processes.viewer_watchdog_poll_count, 5)
             self.assertLess(
                 fixture.actions.index("verified:5"),
+                fixture.actions.index("viewer:e001"),
+            )
+
+    def test_five_frame_snapshot_does_not_pass_thirty_frame_probation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SupervisorFixture(
+                directory,
+                verification_frames=30,
+                snapshots=[
+                    snapshot(verified=True, frames=5),
+                    snapshot(
+                        verified=False,
+                        frames=0,
+                        fault="radar_verification_timeout",
+                    ),
+                ],
+            )
+            stopped = False
+
+            def stop_on_retry(delay_s: float) -> None:
+                nonlocal stopped
+                fixture.sleep(delay_s)
+                stopped = True
+
+            dependencies = replace(
+                fixture.dependencies,
+                sleep=stop_on_retry,
+            )
+            RadarSupervisor(fixture.config, dependencies).run(lambda: stopped)
+
+            self.assertIsNone(fixture.processes.started_viewer)
+            self.assertNotIn("viewer:e001", fixture.actions)
+
+    def test_viewer_switch_waits_for_thirty_consecutive_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SupervisorFixture(
+                directory,
+                verification_frames=30,
+            )
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                fixture.stop_when_running
+            )
+
+            self.assertEqual(fixture.processes.viewer_watchdog_poll_count, 30)
+            self.assertLess(
+                fixture.actions.index("verified:30"),
                 fixture.actions.index("viewer:e001"),
             )
 

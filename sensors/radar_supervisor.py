@@ -102,8 +102,8 @@ class RadarSupervisorConfig:
     heatmap_range_step_m: float = 0.09765625
     first_frame_timeout_s: float = 3.0
     frame_timeout_s: float = 2.5
-    verification_timeout_s: float = 3.0
-    verification_frames: int = 5
+    verification_timeout_s: float = 5.0
+    verification_frames: int = 30
     retry_initial_s: float = 0.5
     retry_max_s: float = 5.0
     poll_interval_s: float = 0.05
@@ -922,7 +922,11 @@ class RadarSupervisor:
                     f"{snapshot.fault_reason}",
                     reason=snapshot.fault_reason,
                 )
-            if snapshot.verified is True:
+            if (
+                snapshot.verified is True
+                and snapshot.consecutive_good_frames
+                >= self._config.verification_frames
+            ):
                 return snapshot
             self._dependencies.sleep(self._config.poll_interval_s)
 

@@ -135,8 +135,8 @@ def make_watchdog(mission: Path, raw: Path) -> RadarEpochWatchdog:
         started_at_s=0.0,
         first_frame_timeout_s=3.0,
         frame_timeout_s=2.5,
-        required_consecutive_frames=5,
-        verification_timeout_s=3.0,
+        required_consecutive_frames=30,
+        verification_timeout_s=5.0,
     )
 
 
@@ -258,26 +258,31 @@ class RadarEpochWatchdogTests(unittest.TestCase):
                 "mission_evidence_invalid",
             )
 
-    def test_five_consecutive_qualifying_frames_verify_the_epoch(self):
+    def test_five_frames_do_not_verify_but_thirty_consecutive_frames_do(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             mission = root / "mission.jsonl"
             watchdog = make_watchdog(mission, root / "capture.bin")
-            for log_seq in range(1, 5):
+            for log_seq in range(1, 6):
                 append_radar_frame(
                     mission,
                     log_seq=log_seq,
                     frame_number=100 + log_seq,
                 )
 
-            four_frames = watchdog.poll(0.4)
-            append_radar_frame(mission, log_seq=5, frame_number=105)
             five_frames = watchdog.poll(0.5)
+            for log_seq in range(6, 31):
+                append_radar_frame(
+                    mission,
+                    log_seq=log_seq,
+                    frame_number=100 + log_seq,
+                )
+            thirty_frames = watchdog.poll(3.0)
 
-            self.assertFalse(four_frames.verified)
-            self.assertEqual(four_frames.consecutive_good_frames, 4)
-            self.assertTrue(five_frames.verified)
+            self.assertFalse(five_frames.verified)
             self.assertEqual(five_frames.consecutive_good_frames, 5)
+            self.assertTrue(thirty_frames.verified)
+            self.assertEqual(thirty_frames.consecutive_good_frames, 30)
 
     def test_each_nonqualifying_frame_resets_consecutive_evidence(self):
         cases = {
@@ -324,15 +329,15 @@ class RadarEpochWatchdogTests(unittest.TestCase):
             root = Path(directory)
             mission = root / "mission.jsonl"
             watchdog = make_watchdog(mission, root / "capture.bin")
-            for log_seq in range(1, 5):
+            for log_seq in range(1, 30):
                 append_radar_frame(
                     mission,
                     log_seq=log_seq,
                     frame_number=log_seq,
                 )
 
-            self.assertIsNone(watchdog.poll(2.999).fault_reason)
-            snapshot = watchdog.poll(3.0)
+            self.assertIsNone(watchdog.poll(4.999).fault_reason)
+            snapshot = watchdog.poll(5.0)
 
             self.assertFalse(snapshot.verified)
             self.assertEqual(

@@ -118,9 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verification-timeout",
         type=_positive_float,
-        default=3.0,
+        default=5.0,
     )
-    parser.add_argument("--verify-frames", type=_positive_int, default=5)
+    parser.add_argument("--verify-frames", type=_positive_int, default=30)
     parser.add_argument(
         "--retry-initial",
         type=_positive_float,

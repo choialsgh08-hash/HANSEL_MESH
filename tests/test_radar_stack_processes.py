@@ -850,7 +850,8 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(args.output_root, REPOSITORY_ROOT)
         self.assertEqual(args.frame_timeout, 2.5)
         self.assertEqual(args.first_frame_timeout, 3.0)
-        self.assertEqual(args.verify_frames, 5)
+        self.assertEqual(args.verification_timeout, 5.0)
+        self.assertEqual(args.verify_frames, 30)
         self.assertEqual(args.http_port, 8081)
         self.assertEqual(
             args.cfg.name,
