@@ -99,6 +99,7 @@ class RadarSupervisorContractTests(unittest.TestCase):
         self.assertEqual(config.retry_initial_s, 0.5)
         self.assertEqual(config.retry_max_s, 5.0)
         self.assertEqual(config.poll_interval_s, 0.05)
+        self.assertEqual(config.stable_running_reset_s, 30.0)
         self.assertEqual(config.http_bind, "127.0.0.1")
         self.assertEqual(config.http_port, 8081)
         self.assertEqual(config.viewer_max_range_m, 3.0)
@@ -131,6 +132,7 @@ class RadarSupervisorContractTests(unittest.TestCase):
             "retry_initial_s",
             "retry_max_s",
             "poll_interval_s",
+            "stable_running_reset_s",
             "viewer_max_range_m",
             "viewer_history_s",
         )
@@ -2151,6 +2153,38 @@ class RadarSupervisorRecoveryTests(unittest.TestCase):
             and fixture.payload()["state"] == "RUNNING"
             and fixture.payload()["epoch"] == epoch
         )
+
+    def test_thirty_healthy_seconds_reset_fault_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fault = snapshot(
+                verified=False,
+                frames=0,
+                fault="radar_frame_timeout",
+            )
+            fixture = RecoveryFixture(directory)
+            healthy_polls = (
+                int(30.0 / fixture.config.poll_interval_s)
+                + 2
+            )
+            fixture.watchdogs = [
+                [snapshot(), snapshot(), fault],
+                [snapshot(), snapshot()]
+                + [snapshot() for _ in range(healthy_polls)]
+                + [fault],
+                [snapshot(), snapshot()],
+            ]
+
+            RadarSupervisor(fixture.config, fixture.dependencies).run(
+                lambda: self._stop_after_running_epoch(fixture, 3)
+            )
+
+            recovery_sleeps = [
+                delay
+                for delay in fixture.sleeps
+                if delay != fixture.config.poll_interval_s
+            ]
+            self.assertEqual(recovery_sleeps, [0.5, 0.5])
+            self.assertEqual(fixture.payload()["recovery_count"], 2)
 
     def test_short_running_epochs_increase_fault_backoff_to_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

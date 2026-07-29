@@ -107,6 +107,7 @@ class RadarSupervisorConfig:
     retry_initial_s: float = 0.5
     retry_max_s: float = 5.0
     poll_interval_s: float = 0.05
+    stable_running_reset_s: float = 30.0
     http_bind: str = "127.0.0.1"
     http_port: int = 8081
     viewer_max_range_m: float = 3.0
@@ -153,6 +154,7 @@ class RadarSupervisorConfig:
             "retry_initial_s",
             "retry_max_s",
             "poll_interval_s",
+            "stable_running_reset_s",
             "viewer_max_range_m",
             "viewer_history_s",
         ):
@@ -678,6 +680,7 @@ class RadarSupervisor:
             or self._paths is None
         ):
             raise RuntimeError("RUNNING requires active radar children and watchdog")
+        healthy_since_s = self._dependencies.monotonic()
         while True:
             self._fatal_reason = "running_stop_check_failed"
             if stop_requested():
@@ -691,14 +694,18 @@ class RadarSupervisor:
             if not present:
                 return "application_port_lost", None, True
 
-            snapshot = self._active_watchdog.poll(
-                self._dependencies.monotonic()
-            )
+            now_s = self._dependencies.monotonic()
+            snapshot = self._active_watchdog.poll(now_s)
             self._verified_consecutive_frames = (
                 snapshot.consecutive_good_frames
             )
             if snapshot.fault_reason is not None:
                 return snapshot.fault_reason, None, False
+            if (
+                now_s - healthy_since_s
+                >= self._config.stable_running_reset_s
+            ):
+                self._retry_delay_s = self._config.retry_initial_s
 
             if self._active_viewer.poll() is not None:
                 viewer = self._active_viewer
