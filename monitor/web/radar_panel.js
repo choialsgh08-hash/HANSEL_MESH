@@ -624,6 +624,7 @@
         if (index < options.labelLimit) {
           this.drawTrackLabel(
             ctx,
+            transform,
             point,
             track,
             danger,
@@ -758,6 +759,7 @@
 
     drawTrackLabel(
       ctx,
+      transform,
       point,
       track,
       danger,

@@ -88,6 +88,17 @@ function makeContext() {
     fillTextStyles: [],
     strokeRectStyles: [],
     setTransform() {},
+    save() {},
+    restore() {},
+    beginPath() {},
+    arc() {},
+    fill() {},
+    stroke() {},
+    moveTo() {},
+    lineTo() {},
+    measureText(text) {
+      return { width: String(text).length * 7 };
+    },
     clearRect(...args) {
       this.clearRectCalls.push(args);
     },
@@ -186,6 +197,12 @@ function makeHarness() {
       makeMapTransform() {
         return { scale: 1 };
       },
+      projectMapPoint(transform, forwardM, lateralM) {
+        return {
+          x: transform.originX + lateralM * transform.scale,
+          y: transform.originY - forwardM * transform.scale,
+        };
+      },
     },
     addEventListener() {},
     devicePixelRatio: 1,
@@ -264,6 +281,47 @@ function makeHarness() {
     contexts: [mainContext, collisionContext],
   };
 }
+
+test("live point tracks render their distance label without a rendering error", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[0];
+  const transform = {
+    originX: 320,
+    originY: 340,
+    scale: 100,
+    width: 640,
+    height: 360,
+    forwardMaxM: 3,
+    halfWidthM: 1.5,
+  };
+  const track = {
+    source: "point",
+    point_confirmed: true,
+    age_ms: 0,
+    distance_m: 0.25,
+    forward_m: 0.25,
+    lateral_m: 0,
+    height_m: 0.1,
+  };
+
+  assert.doesNotThrow(() => {
+    panel.drawTracks(context, transform, [track], {
+      scene: {
+        hazard: {
+          level: "NORMAL",
+          threshold_m: 0.1,
+        },
+      },
+      labelLimit: 1,
+      maxRangeM: 3,
+      clipShape: "rectangular",
+    });
+  });
+  assert.equal(
+    context.fillTextCalls.some(([text]) => String(text).includes("0.25m")),
+    true,
+  );
+});
 
 function staleBlockedPresentation(reason) {
   return {
