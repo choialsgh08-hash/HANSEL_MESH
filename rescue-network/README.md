@@ -5,7 +5,7 @@
 자가완결형 서브프로젝트(`rescue-network/`)로 존재합니다.
 
 > **현재 상태: Phase 1–6 전체 구현됨** — 코어(구조 요청 앱·receiver·forwarder·대시보드),
-> systemd 배포, 조난자 AP + B.A.T.M.A.N.-adv 메시망, 그리고 선택 기능(자동 롤백·모니터링·
+> systemd 배포, 조난자 AP, **기존 HANSEL 메시 재사용**, 그리고 선택 기능(자동 롤백·모니터링·
 > HMAC 인증·SSE·captive portal·유선 게이트웨이)까지 완료.
 >
 > 처음이라면 아래 **[동작 원리](#동작-원리-구조와-원리)** → **[실행 순서](#실행-순서-한눈에)** 순서로 읽으세요.
@@ -20,12 +20,16 @@
 
 ## 네트워크 구조 (전체 목표)
 
+rescue-network는 **기존 HANSEL B.A.T.M.A.N.-adv 메시(bat0, 192.168.50.0/24)를 그대로
+재사용**합니다. 별도의 메시를 만들지 않습니다 — 메시 구성은 저장소 루트의
+`scripts/*mesh*.sh` + `configs/*.env`가 담당합니다.
+
 ```text
 [스마트폰] --Wi-Fi AP(192.168.10.0/24)--> [field Pi]
-                                              |  bat0 (10.10.0.0/24)
+                                              |  bat0 (기존 HANSEL 메시, 192.168.50.0/24)
                                           [relay Pi ...]  <-- B.A.T.M.A.N.-adv (Layer 2)
                                               |
-                                          [receiver Pi] 10.10.0.254:8080
+                                          [receiver = base Pi] 192.168.50.1:8080
                                               |
                                           [구조대 대시보드]
 ```
@@ -35,9 +39,9 @@
 | 대역 | 용도 | 예시 |
 |---|---|---|
 | **AP 네트워크** | 스마트폰 ↔ 현장 Pi | `http://192.168.10.1/` (스마트폰 접속 주소) |
-| **bat0 메시 대역** | Pi ↔ Pi (BATMAN-adv) | `10.10.0.254:8080` (내부 전달 주소) |
+| **bat0 메시 대역** | Pi ↔ Pi (기존 HANSEL 메시) | `192.168.50.1:8080` (내부 전달 주소) |
 
-`10.10.0.1` 은 스마트폰 접속 주소가 **아닙니다** — 메시망 내부 주소입니다.
+`192.168.50.1` 은 스마트폰 접속 주소가 **아닙니다** — 메시망 내부(구조대 노드) 주소입니다.
 
 ## 노드 역할 (`NODE_ROLE`)
 
@@ -88,9 +92,10 @@
          └──────────────────────────────────────────────────────────────┘
 ```
 
-`relay` 노드는 이 그림에 **애플리케이션이 없습니다**. Linux 라우팅 +
-B.A.T.M.A.N.-adv가 field↔receiver 사이의 Layer 2 프레임을 옮길 뿐이고, 앱은 그저
-`RECEIVER_URL`(`10.10.0.254:8080`)로 HTTP를 쏘면 커널이 알아서 경로를 정합니다.
+`relay` 노드는 이 그림에 **애플리케이션이 없습니다**. 기존 HANSEL 메시가 올라와
+있으면 Linux 라우팅 + B.A.T.M.A.N.-adv가 field↔receiver 사이의 Layer 2 프레임을 옮기고,
+앱은 그저 `RECEIVER_URL`(`192.168.50.1:8080`)로 HTTP를 쏘면 커널이 경로를 정합니다.
+**rescue-network는 메시를 만들지 않고, 이미 도는 메시 위에 얹힙니다.**
 
 ### 코드 계층 (책임 분리)
 
@@ -204,8 +209,11 @@ SQLite · httpx · Jinja2 · Vanilla JS · pytest · Ruff · systemd · Bash.
 network-online.target
    └▶ (field)    rescue-field-web.service  +  rescue-forwarder.service
    └▶ (receiver) rescue-receiver.service
-   └▶ (relay)    [Phase 5의 네트워크 서비스만]
+   └▶ (relay)    rescue 서비스 없음 — 기존 HANSEL 메시(hansel-mesh@)만 실행
 ```
+
+> 전제: 세 역할 모두 **기존 HANSEL 메시(bat0)가 이미 올라와 있어야** 전달이 됩니다.
+> 메시 자체는 저장소 루트의 `scripts/*mesh*.sh`로 구성합니다(rescue-network 범위 밖).
 
 구체적 명령은 아래 [개발 환경 실행](#개발-환경-실행-방법) /
 [receiver·forwarder 실행](#receiver--forwarder-실행-방법-phase-2) /
@@ -301,7 +309,7 @@ NODE_ROLE=receiver NODE_ID=receiver-01 RESCUE_SHARED_TOKEN=<shared> \
 
 ```bash
 NODE_ROLE=field NODE_ID=node-01 RESCUE_SHARED_TOKEN=<shared> \
-  RECEIVER_URL=http://10.10.0.254:8080 \
+  RECEIVER_URL=http://192.168.50.1:8080 \
   python -m rescue_network.forwarder
 ```
 
@@ -350,7 +358,7 @@ NODE_ROLE=field NODE_ID=node-01 DATA_DIR=./data-field \
 | `field` | `rescue-field-web.service` | 구조 요청 웹/API (`uvicorn field_app`) |
 | `field` | `rescue-forwarder.service` | 전달 프로세스 (`python -m …forwarder`) |
 | `receiver` | `rescue-receiver.service` | 수신 API + 대시보드 (`uvicorn receiver_app`) |
-| `relay` | *(없음)* | 네트워크 전용 — Phase 5의 메시 서비스만 |
+| `relay` | *(없음)* | rescue 서비스 없음 — 기존 `hansel-mesh@`만 실행 |
 
 공통 정책: 전용 시스템 사용자 `rescue`, `WorkingDirectory`/`EnvironmentFile` 명시,
 `Restart=always` + `RestartSec`, 로그는 **journald**, 쓰기 데이터는
@@ -409,7 +417,7 @@ journalctl -u rescue-forwarder.service -f
 
 현장 노드가 스마트폰을 받는 Wi-Fi AP(hostapd + dnsmasq)를 구성합니다. 스마트폰은
 `http://192.168.10.1/` 로 접속해 구조 요청 폼을 엽니다. AP 인터페이스는 보통
-**Pi 내장 Wi-Fi**(brcmfmac)이고, USB 동글은 메시(Phase 5)용으로 남겨둡니다.
+**Pi 내장 Wi-Fi**(brcmfmac)이고, USB 동글은 기존 HANSEL 메시용으로 남겨둡니다.
 
 > **captive portal 없음 / NAT·인터넷 공유 없음 / IP forwarding 켜지 않음.**
 > 초기 단계는 "스마트폰에서 주소를 직접 입력하면 폼이 열린다"만 검증합니다.
@@ -459,7 +467,7 @@ sudo ./scripts/configure-ap.sh --env /etc/rescue-network/ap.env --down
 1. 스마트폰 Wi-Fi에서 `Rescue-Network`(SSID) 에 연결(암호는 `AP_PASSPHRASE`).
 2. DHCP로 `192.168.10.100~200` 범위 주소를 받는지 확인.
 3. 브라우저에서 **`http://192.168.10.1/`** 입력 → 구조 요청 폼이 열리면 성공.
-   (`http://10.10.0.1` 은 메시 내부 주소이지 스마트폰 접속 주소가 아닙니다.)
+   (`192.168.50.x` 는 메시 내부 주소이지 스마트폰 접속 주소가 아닙니다.)
 
 ### AP 환경 변수 (`ap.env`)
 
@@ -468,69 +476,42 @@ sudo ./scripts/configure-ap.sh --env /etc/rescue-network/ap.env --down
 `AP_SECURITY`(wpa2/open) + `AP_PASSPHRASE`, `HOSTAPD_CONF`/`DNSMASQ_CONF`(설치
 경로). 템플릿은 `config/hostapd/` · `config/dnsmasq/` 에 있습니다.
 
-## B.A.T.M.A.N.-adv 메시망 (Phase 5)
+## 메시망: 기존 HANSEL 메시 재사용 (Phase 5)
 
-노드 사이를 잇는 Layer 2 메시입니다. 각 노드의 **bat0** 가상 인터페이스만 IP를
-갖고(예: field `10.10.0.1`, receiver `10.10.0.254`), 앱은 그저
-`RECEIVER_URL=http://10.10.0.254:8080` 로 HTTP를 쏩니다 — 실제 경로는 Linux 라우팅
-+ B.A.T.M.A.N.-adv가 정합니다. **그래서 forwarder/receiver 코드는 그대로이고,
-메시가 올라오면 종단 간 전달이 저절로 동작합니다.**
+**rescue-network는 자체 메시를 구성하지 않습니다.** 이 로봇 Pi들은 이미 카메라·제어용
+B.A.T.M.A.N.-adv 메시(`bat0`, `MESH_ID=HANSEL_MESH`, 192.168.50.0/24)를 형성하므로,
+구조 요청 전달은 **그 메시 위에 얹힌 또 하나의 애플리케이션 트래픽**일 뿐입니다.
 
-- 하위 무선 방식은 환경변수로 선택: `MESH_BACKEND=80211s`(mesh point) 또는 `ibss`.
-- 동글이 그 모드를 지원하는지 `iw`로 확인하고, **지원하지 않으면 명확한 오류로 중단**.
-- **bat0에만 IP를 할당**하고, 메시를 나르는 하위 무선(`MESH_INTERFACE`)에는 일반 IP를
-  주지 않습니다. 안전 규칙(dry-run·백업·rollback·미하드코딩·no flush)은 AP와 동일.
+- 메시 구성/기동은 저장소 루트의 기존 도구가 담당합니다:
+  `scripts/install_mesh.sh`, `scripts/start_role_network.sh`, `configs/*.env`,
+  `services/hansel-mesh@.service`.
+- 앱이 하는 일은 `RECEIVER_URL`을 **구조대 노드의 기존 bat0 IP**(관례상 base 노드
+  `192.168.50.1`)로 두는 것뿐. Linux 라우팅 + B.A.T.M.A.N.-adv가 경로를 정합니다.
+- 그래서 **forwarder/receiver 코드는 메시를 전혀 몰라도** 되고, 메시가 올라와 있으면
+  종단 간 전달이 저절로 동작합니다.
 
-### 실행 순서 (모든 field/relay/receiver 노드에서)
-
-```bash
-# 1) 동글이 mesh point/IBSS 와 batman_adv 를 지원하는지 확인 (변경 없음)
-./scripts/check-capabilities.sh
-./scripts/detect-network.sh                # USB 동글 = MESH_INTERFACE 제안
-
-# 2) 노드별 설정 (bat0 IP는 노드마다 유일! receiver=10.10.0.254)
-sudo cp config/examples/mesh.env.example /etc/rescue-network/mesh.env
-sudo nano /etc/rescue-network/mesh.env     # MESH_INTERFACE / BACKEND / ID / FREQ / BAT_ADDRESS
-
-# 3) dry-run 으로 bring-up 순서 확인 (변경 없음)
-./scripts/configure-batman.sh --env /etc/rescue-network/mesh.env
-
-# 4) batman-adv 모듈 부팅 로드 기록 (백업 후, 라이브 변경 없음)
-sudo ./scripts/configure-batman.sh --env /etc/rescue-network/mesh.env --apply
-
-# 5) 메시 + bat0 올리기 (명시적)
-sudo ./scripts/configure-batman.sh --env /etc/rescue-network/mesh.env --up
-
-# 6) 검증: batman_adv 로드, bat0 UP+주소, batctl if/n/o, 피어 ping
-./scripts/verify-network.sh --env /etc/rescue-network/mesh.env
-
-# 내리기: sudo ./scripts/configure-batman.sh --env … --down
-```
-
-### 두 노드 연결 + 종단 간 전달 검증
+### 종단 간 전달 검증 (기존 메시가 올라온 상태에서)
 
 ```bash
-# 두 노드에서 5)까지 마친 뒤, 서로 bat0로 ping
-ping 10.10.0.254                    # field → receiver bat0
+# 0) (선행) 기존 HANSEL 메시 기동 — rescue 범위 밖, 저장소 루트 도구 사용
+sudo ./scripts/install_mesh.sh
+sudo ./scripts/start_role_network.sh base      # 노드별로 base/head/node1 …
 
-# 수동 메시 점검
-sudo batctl if      # bat0에 붙은 무선 인터페이스
-sudo batctl n       # 이웃(1-hop)
-sudo batctl o       # 오리지네이터(전체 노드)
+# 1) 메시가 살아있는지 확인 (읽기 전용)
+ping 192.168.50.1                              # 상대 노드 bat0
+sudo batctl if ; sudo batctl n ; sudo batctl o # 인터페이스 / 이웃 / 오리지네이터
+./scripts/verify-network.sh                     # AP + bat0 존재 여부 점검
 
-# 앱 종단 간: field에서 receiver 헬스 확인 후 forwarder 가동
-curl http://10.10.0.254:8080/health
-NODE_ROLE=field RESCUE_SHARED_TOKEN=<shared> RECEIVER_URL=http://10.10.0.254:8080 \
+# 2) 앱 종단 간: field에서 receiver 헬스 확인 후 forwarder 가동
+curl http://192.168.50.1:8080/health
+NODE_ROLE=field RESCUE_SHARED_TOKEN=<shared> RECEIVER_URL=http://192.168.50.1:8080 \
   python -m rescue_network.forwarder
-# → field 폼에 넣은 요청이 메시를 건너 receiver 대시보드에 뜨면 성공
+# → field 폼에 넣은 요청이 기존 메시를 건너 receiver 대시보드에 뜨면 성공
 ```
 
-### 메시 환경 변수 (`mesh.env`)
-
-`MESH_INTERFACE`(USB 동글), `MESH_BACKEND`(80211s/ibss), `MESH_ID`,
-`MESH_COUNTRY`, `MESH_FREQ`(MHz), `MESH_BSSID`(IBSS 셀 고정, 선택), `MESH_MTU`
-(기본 1560 — batman 오버헤드 대비), `BAT_ADDRESS`(bat0 CIDR, **노드별 유일**),
-`BAT_PEER`(verify용 피어 IP, 선택), `BATMAN_MODULES_LOAD`.
+> 참고: rescue-network의 네트워크 스크립트는 **조난자 AP(`configure-ap.sh`)** 와
+> **읽기 전용 진단·검증(`check-capabilities.sh`/`detect-network.sh`/`verify-network.sh`)**
+> 만 제공합니다. 메시 bring-up 스크립트는 의도적으로 두지 않았습니다(중복 방지).
 
 ## 선택 기능 (Phase 6)
 
@@ -547,7 +528,7 @@ sudo ./scripts/configure-ap.sh --env /etc/rescue-network/ap.env --up --commit-ti
 sudo ./scripts/configure-ap.sh --env /etc/rescue-network/ap.env --commit
 #   확정 안 하면 → 자동 --down (원상복구)
 ```
-`configure-batman.sh` 도 동일하게 지원합니다.
+(AP 구성 스크립트에 적용되는 안전장치입니다.)
 
 ### ⑤ 모니터링·알림
 두 앱에 Prometheus 형식 `GET /metrics`(대기/전송중/완료/실패 개수, 최고령 대기
@@ -567,7 +548,7 @@ curl http://127.0.0.1:8080/metrics    # receiver
 NODE_ROLE=receiver RESCUE_REQUIRE_SIGNATURE=1 RESCUE_SHARED_TOKEN=<secret> \
   uvicorn rescue_network.receiver_app:app --port 8080
 NODE_ROLE=field RESCUE_REQUIRE_SIGNATURE=1 RESCUE_SHARED_TOKEN=<secret> \
-  RECEIVER_URL=http://10.10.0.254:8080 python -m rescue_network.forwarder
+  RECEIVER_URL=http://192.168.50.1:8080 python -m rescue_network.forwarder
 ```
 헤더: `X-Rescue-Signature`(HMAC-SHA256), `X-Rescue-Timestamp`. 서명이 틀리거나
 타임스탬프가 허용 오차를 벗어나면 `401`.
@@ -609,10 +590,8 @@ sudo ./scripts/configure-gateway.sh --env /etc/rescue-network/gateway.env --up
 | `NODE_ID` | `node-01` | 1 | 노드 식별자(로그·요청 출발지) |
 | `DATA_DIR` | `./data` | 1 | SQLite 파일이 저장될 쓰기 가능 디렉터리 |
 | `WEB_HOST` / `WEB_PORT` | `0.0.0.0` / `80` | 1 | 웹 서버 바인딩 |
-| `AP_INTERFACE` / `MESH_INTERFACE` | `wlan0` / `wlan1` | 4/5 | 무선 인터페이스 |
-| `AP_ADDRESS` / `BAT_ADDRESS` | `192.168.10.1/24` / `10.10.0.1/24` | 4/5 | AP / bat0 주소 |
-| `MESH_BACKEND` | `80211s` | 5 | `80211s` / `ibss` |
-| `RECEIVER_URL` | `http://10.10.0.254:8080` | 2 | 구조대 수신 서버 |
+| `AP_INTERFACE` / `AP_ADDRESS` | `wlan0` / `192.168.10.1/24` | 4 | 조난자 AP 인터페이스·주소 |
+| `RECEIVER_URL` | `http://192.168.50.1:8080` | 2 | 구조대 수신 서버(기존 bat0 IP) |
 | `RESCUE_SHARED_TOKEN` | `change-me` | 2 | 노드 간 공유 토큰(로그에 출력 금지) |
 | `FORWARDER_POLL_INTERVAL_SECONDS` | `2.0` | 2 | forwarder 폴링 주기 |
 | `DELIVERY_TIMEOUT_SECONDS` | `10.0` | 2 | 전달 HTTP 타임아웃 |
@@ -670,20 +649,19 @@ rescue-network/
 ├── tests/{unit,integration}/
 ├── systemd/               # 3개 서비스 유닛 (Phase 3)
 ├── config/
-│   ├── examples/          # field/receiver/relay/ap/mesh EnvironmentFile 예시
+│   ├── examples/          # field/receiver/relay/ap/gateway EnvironmentFile 예시
 │   ├── hostapd/           # hostapd.conf 템플릿 (Phase 4)
-│   ├── dnsmasq/           # dnsmasq 템플릿 (Phase 4)
-│   └── batman/            # batman-adv 모듈로드 템플릿 (Phase 5)
+│   └── dnsmasq/           # dnsmasq 템플릿 (Phase 4 / Phase 6 게이트웨이)
 └── scripts/
     ├── install-services.sh       # 안전한 서비스 설치(dry-run)
     ├── lib/common.sh             # 공용 헬퍼(로그·dry-run·백업)
     ├── check-capabilities.sh     # 하드웨어/모드 점검(읽기전용)
     ├── detect-network.sh         # 인터페이스 탐지/제안(읽기전용)
-    ├── configure-ap.sh           # AP 구성(dry-run·백업·--up/--down·--commit-timeout)
-    ├── configure-batman.sh       # 메시 구성(dry-run·백업·--up/--down·--commit-timeout)
+    ├── configure-ap.sh           # 조난자 AP 구성(dry-run·백업·--up/--down·--commit-timeout)
     ├── configure-gateway.sh      # 유선 노트북 게이트웨이(Phase 6 ②)
-    ├── verify-network.sh         # AP·메시·폼 도달 검증(읽기전용)
+    ├── verify-network.sh         # AP·(기존)메시·폼 도달 검증(읽기전용)
     └── rollback-network.sh       # 백업 복구
+# 메시 bring-up은 rescue 범위 밖 — 저장소 루트의 scripts/*mesh*.sh 사용
 ```
 
 ## 로드맵
@@ -692,5 +670,5 @@ rescue-network/
 - **Phase 2 ✅** receiver API + 중복 제거 + forwarder(재시도) + 대시보드
 - **Phase 3 ✅** systemd 배포 (field-web / forwarder / receiver)
 - **Phase 4 ✅** 조난자 AP (hostapd/dnsmasq, dry-run·백업·rollback)
-- **Phase 5 ✅** B.A.T.M.A.N.-adv 메시망 (802.11s / IBSS, bat0, 종단 간 전달)
+- **Phase 5 ✅** 기존 HANSEL B.A.T.M.A.N.-adv 메시 재사용 + 종단 간 전달 검증
 - **Phase 6 ✅** 선택 기능: 자동 롤백·모니터링/알림·HMAC 인증·SSE 실시간·captive portal·유선 게이트웨이
