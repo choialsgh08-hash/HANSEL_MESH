@@ -42,15 +42,16 @@ class Settings(BaseSettings):
     node_role: NodeRole = NodeRole.FIELD
     node_id: str = "node-01"
 
-    # ---- wireless (later phases) -----------------------------------------
+    # ---- victim AP (configured by scripts/configure-ap.sh; here for reference)
     ap_interface: str = "wlan0"
-    mesh_interface: str = "wlan1"
     ap_address: str = "192.168.10.1/24"
-    bat_address: str = "10.10.0.1/24"
-    mesh_backend: str = "80211s"
 
     # ---- delivery (Phase 2) ----------------------------------------------
-    receiver_url: str = "http://10.10.0.254:8080"
+    # The receiver is reached over the EXISTING HANSEL B.A.T.M.A.N. mesh
+    # (bat0, 192.168.50.0/24). rescue-network does not set up its own mesh;
+    # bring the mesh up with the repo's scripts/*mesh*.sh, then point this at
+    # the receiver node's bat0 IP (base node = 192.168.50.1 by convention).
+    receiver_url: str = "http://192.168.50.1:8080"
     rescue_shared_token: SecretStr = SecretStr("change-me")
 
     # ---- enhanced auth (Phase 6) -----------------------------------------

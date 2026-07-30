@@ -11,9 +11,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
 
 # Load whatever config is available; --env FILE overrides last.
+# (rescue-network configures the AP only; the mesh is the existing HANSEL one.)
 ENV_OVERRIDE=""
 [[ "${1:-}" == "--env" && -n "${2:-}" ]] && ENV_OVERRIDE="$2"
-for f in /etc/rescue-network/ap.env /etc/rescue-network/mesh.env "$ENV_OVERRIDE"; do
+for f in /etc/rescue-network/ap.env "$ENV_OVERRIDE"; do
   # shellcheck disable=SC1090
   [[ -n "$f" && -r "$f" ]] && source "$f"
 done
@@ -47,7 +48,7 @@ fi
 # --- B.A.T.M.A.N. mesh ----------------------------------------------------
 MESH_INTERFACE="${MESH_INTERFACE:-}"; BAT_IP="${BAT_ADDRESS:-}"; BAT_IP="${BAT_IP%%/*}"; BAT_PEER="${BAT_PEER:-}"
 if [[ -e /sys/class/net/bat0 || -n "$MESH_INTERFACE" ]]; then
-  section "B.A.T.M.A.N. mesh (bat0)"
+  section "B.A.T.M.A.N. mesh (bat0) — existing HANSEL mesh, read-only check"
   ok_or_fail "batman_adv loaded" bash -c "lsmod 2>/dev/null | grep -q batman_adv"
   ok_or_fail "bat0 exists" test -e /sys/class/net/bat0
   ok_or_fail "bat0 is UP" bash -c "ip link show bat0 2>/dev/null | grep -q ',UP'"
@@ -64,7 +65,7 @@ if [[ -e /sys/class/net/bat0 || -n "$MESH_INTERFACE" ]]; then
   if [[ -n "$BAT_PEER" ]]; then
     ok_or_fail "ping peer bat0 ${BAT_PEER}" ping -c1 -W2 "$BAT_PEER"
   else
-    dim "(set BAT_PEER in mesh.env to ping a peer bat0 IP)"
+    dim "(export BAT_PEER=<peer bat0 IP> before running to ping a mesh peer)"
   fi
 else
   dim "(no mesh configured on this node — skipping mesh checks)"
