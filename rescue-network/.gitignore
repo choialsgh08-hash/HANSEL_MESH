@@ -1,0 +1,5 @@
+# Runtime SQLite data (field.db / receiver.db + WAL/SHM). Never commit.
+/data/
+*.db
+*.db-wal
+*.db-shm

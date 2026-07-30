@@ -1,0 +1,14 @@
+# dnsmasq DHCP for the wired rescue laptop — RENDERED by configure-gateway.sh.
+# Serves DHCP only on the LAN interface; advertises the receiver as gateway/DNS.
+# Placeholders __LIKE_THIS__ are substituted from gateway.env.
+
+interface=__LAN_INTERFACE__
+bind-interfaces
+except-interface=lo
+
+dhcp-range=__LAN_DHCP_START__,__LAN_DHCP_END__,__LAN_DHCP_LEASE__
+dhcp-option=3,__LAN_IP__
+dhcp-option=6,__LAN_IP__
+
+no-resolv
+dhcp-authoritative
