@@ -16,7 +16,13 @@ import struct
 import time
 from typing import Deque, List, Optional, Sequence, Tuple, Union
 
-from common.sensor_contract import RadarFrame, RadarPoint, SensorHeader
+from common.sensor_contract import (
+    MAX_RADAR_HEATMAP_CELLS,
+    RadarFrame,
+    RadarHeatmap,
+    RadarPoint,
+    SensorHeader,
+)
 
 
 TI_MAGIC_WORD = b"\x02\x01\x04\x03\x06\x05\x08\x07"
@@ -27,6 +33,14 @@ TLV_HEADER_SIZE = 8
 DEFAULT_FLOAT_POINT_TLV = 1
 DEFAULT_SIDE_INFO_TLV = 7
 DEFAULT_COMPRESSED_POINT_TLV = 301
+RANGE_AZIMUTH_HEATMAP_MAJOR_TLV = 304
+RANGE_AZIMUTH_HEATMAP_MINOR_TLV = 305
+_KNOWN_STANDARD_TLV_TYPES = frozenset(range(1, 10))
+_KNOWN_EXTENDED_TLV_TYPES = frozenset(range(301, 319))
+_HEATMAP_MODE_BY_TLV = {
+    RANGE_AZIMUTH_HEATMAP_MAJOR_TLV: "major",
+    RANGE_AZIMUTH_HEATMAP_MINOR_TLV: "minor",
+}
 
 
 class TiMmwaveParseError(ValueError):
@@ -63,6 +77,30 @@ class TiRadarPoint:
 
 
 @dataclass(frozen=True)
+class TiRadarHeatmap:
+    data: bytes
+    range_bins: int
+    azimuth_bins: int
+    range_step_m: float
+    tlv_type: int
+    motion_mode: str
+    floor_db: float
+    ceiling_db: float
+
+    def to_sensor_heatmap(self) -> RadarHeatmap:
+        return RadarHeatmap(
+            data=self.data,
+            range_bins=self.range_bins,
+            azimuth_bins=self.azimuth_bins,
+            range_step_m=self.range_step_m,
+            tlv_type=self.tlv_type,
+            motion_mode=self.motion_mode,
+            floor_db=self.floor_db,
+            ceiling_db=self.ceiling_db,
+        )
+
+
+@dataclass(frozen=True)
 class TiRadarFrame:
     header: TiPacketHeader
     header_size: int
@@ -71,6 +109,7 @@ class TiRadarFrame:
     point_format: str
     unknown_tlvs: Tuple[Tuple[int, int], ...]
     warnings: Tuple[str, ...]
+    heatmap: Optional[TiRadarHeatmap] = None
     host_receipt_monotonic_ns: Optional[int] = None
     host_receipt_uncertainty_ns: Optional[int] = None
 
@@ -112,6 +151,11 @@ class TiRadarFrame:
             frame_transition=frame_transition,
             profile_id=profile_id,
             capture_baudrate=capture_baudrate,
+            heatmap=(
+                None
+                if self.heatmap is None
+                else self.heatmap.to_sensor_heatmap()
+            ),
         )
 
 
@@ -124,6 +168,7 @@ class _ParsedTlvs:
     warnings: Tuple[str, ...]
     trailing_padding: int
     recognized_point_tlvs: int
+    heatmap: Optional[TiRadarHeatmap]
 
 
 class TiMmwavePacketParser:
@@ -140,7 +185,12 @@ class TiMmwavePacketParser:
         float_point_tlv: int = DEFAULT_FLOAT_POINT_TLV,
         side_info_tlv: int = DEFAULT_SIDE_INFO_TLV,
         compressed_point_tlv: int = DEFAULT_COMPRESSED_POINT_TLV,
+        heatmap_azimuth_bins: Optional[int] = None,
+        heatmap_range_bins: Optional[int] = None,
+        heatmap_range_step_m: Optional[float] = None,
         tlv_length_includes_header: bool = False,
+        allow_elided_empty_point_tlv: bool = False,
+        allow_nonzero_padding: bool = False,
         max_packet_bytes: int = 4 * 1024 * 1024,
         max_points: int = 8192,
         max_tlvs: int = 128,
@@ -154,17 +204,77 @@ class TiMmwavePacketParser:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
+        heatmap_configuration = (
+            heatmap_azimuth_bins,
+            heatmap_range_bins,
+            heatmap_range_step_m,
+        )
+        if any(value is not None for value in heatmap_configuration) and not all(
+            value is not None for value in heatmap_configuration
+        ):
+            raise ValueError(
+                "heatmap_azimuth_bins, heatmap_range_bins, and "
+                "heatmap_range_step_m "
+                "must be supplied together"
+            )
+        if heatmap_azimuth_bins is not None and (
+            isinstance(heatmap_azimuth_bins, bool)
+            or not isinstance(heatmap_azimuth_bins, int)
+            or heatmap_azimuth_bins < 1
+        ):
+            raise ValueError("heatmap_azimuth_bins must be positive")
+        if heatmap_range_bins is not None and (
+            isinstance(heatmap_range_bins, bool)
+            or not isinstance(heatmap_range_bins, int)
+            or heatmap_range_bins < 1
+        ):
+            raise ValueError("heatmap_range_bins must be positive")
+        if heatmap_range_step_m is not None and (
+            isinstance(heatmap_range_step_m, bool)
+            or not isinstance(heatmap_range_step_m, (int, float))
+            or not math.isfinite(float(heatmap_range_step_m))
+            or float(heatmap_range_step_m) <= 0
+        ):
+            raise ValueError("heatmap_range_step_m must be positive")
+        if (
+            heatmap_azimuth_bins is not None
+            and heatmap_range_bins is not None
+            and heatmap_azimuth_bins * heatmap_range_bins
+            > MAX_RADAR_HEATMAP_CELLS
+        ):
+            raise ValueError(
+                "heatmap dimensions exceed limit of "
+                f"{MAX_RADAR_HEATMAP_CELLS} cells"
+            )
         if max_packet_bytes < DOCUMENTED_HEADER_SIZE:
             raise ValueError("max_packet_bytes is too small")
         if max_points < 1:
             raise ValueError("max_points must be positive")
         if max_tlvs < 1:
             raise ValueError("max_tlvs must be positive")
+        for name, value in (
+            (
+                "allow_elided_empty_point_tlv",
+                allow_elided_empty_point_tlv,
+            ),
+            ("allow_nonzero_padding", allow_nonzero_padding),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean")
         self.header_size = header_size
         self.float_point_tlv = float_point_tlv
         self.side_info_tlv = side_info_tlv
         self.compressed_point_tlv = compressed_point_tlv
+        self.heatmap_azimuth_bins = heatmap_azimuth_bins
+        self.heatmap_range_bins = heatmap_range_bins
+        self.heatmap_range_step_m = (
+            None
+            if heatmap_range_step_m is None
+            else float(heatmap_range_step_m)
+        )
         self.tlv_length_includes_header = tlv_length_includes_header
+        self.allow_elided_empty_point_tlv = allow_elided_empty_point_tlv
+        self.allow_nonzero_padding = allow_nonzero_padding
         self.max_packet_bytes = max_packet_bytes
         self.max_points = max_points
         self.max_tlvs = max_tlvs
@@ -208,7 +318,8 @@ class TiMmwavePacketParser:
                 errors.append(f"{candidate_size}-byte header: {exc}")
                 continue
             score = (
-                parsed.recognized_point_tlvs,
+                parsed.recognized_point_tlvs
+                + (1 if parsed.heatmap is not None else 0),
                 1 if len(parsed.points) == header.num_detected_obj else 0,
                 -parsed.trailing_padding,
             )
@@ -227,6 +338,7 @@ class TiMmwavePacketParser:
             point_format=selected.point_format,
             unknown_tlvs=selected.unknown_tlvs,
             warnings=selected.warnings,
+            heatmap=selected.heatmap,
             host_receipt_monotonic_ns=None,
             host_receipt_uncertainty_ns=None,
         )
@@ -241,6 +353,7 @@ class TiMmwavePacketParser:
         raw_float_points: Optional[List[Tuple[float, float, float, float]]] = None
         raw_side_info: Optional[List[Tuple[float, float]]] = None
         compressed_points: Optional[List[TiRadarPoint]] = None
+        heatmap: Optional[TiRadarHeatmap] = None
         unknown: List[Tuple[int, int]] = []
         warnings: List[str] = []
         recognized = 0
@@ -282,14 +395,40 @@ class TiMmwavePacketParser:
                     raise TiMmwaveParseError("duplicate compressed point TLV")
                 compressed_points = self._parse_compressed_points(payload)
                 recognized += 1
+            elif (
+                self.heatmap_azimuth_bins is not None
+                and tlv_type in _HEATMAP_MODE_BY_TLV
+            ):
+                if heatmap is not None:
+                    raise TiMmwaveParseError(
+                        "packet contains multiple range-azimuth heatmaps"
+                    )
+                heatmap = self._parse_heatmap(payload, tlv_type)
             else:
                 unknown.append((tlv_type, payload_length))
 
         trailing = packet[cursor:]
-        if any(value != 0 for value in trailing):
-            raise TiMmwaveParseError("non-zero bytes remain after declared TLVs")
         if len(trailing) > 31:
             raise TiMmwaveParseError("more than 31 padding bytes remain")
+        if any(value != 0 for value in trailing):
+            if not self.allow_nonzero_padding:
+                raise TiMmwaveParseError(
+                    "non-zero bytes remain after declared TLVs"
+                )
+            expected_padding = (-cursor) % 32
+            if (
+                len(packet) % 32 != 0
+                or len(trailing) != expected_padding
+            ):
+                raise TiMmwaveParseError(
+                    "non-zero trailing bytes are not valid 32-byte padding"
+                )
+            if self._starts_with_plausible_tlv(trailing):
+                raise TiMmwaveParseError(
+                    "non-zero trailing bytes begin with a plausible "
+                    "undeclared TLV"
+                )
+            warnings.append(f"nonzero_padding:{len(trailing)}")
 
         if raw_float_points is not None and compressed_points is not None:
             raise TiMmwaveParseError(
@@ -321,7 +460,17 @@ class TiMmwavePacketParser:
             point_format = "float"
         else:
             points = []
-            point_format = "none"
+            if (
+                self.allow_elided_empty_point_tlv
+                and header.num_detected_obj == 0
+                and header.num_tlvs > 0
+                and raw_side_info is None
+            ):
+                point_format = "empty"
+                recognized += 1
+                warnings.append("empty_point_tlv_elided")
+            else:
+                point_format = "none"
 
         complete = True
         if len(points) != header.num_detected_obj:
@@ -349,7 +498,33 @@ class TiMmwavePacketParser:
             warnings=tuple(warnings),
             trailing_padding=len(trailing),
             recognized_point_tlvs=recognized,
+            heatmap=heatmap,
         )
+
+    def _starts_with_plausible_tlv(self, trailing: bytes) -> bool:
+        if len(trailing) < TLV_HEADER_SIZE:
+            return False
+        tlv_type, declared_length = struct.unpack_from("<II", trailing, 0)
+        known_types = (
+            _KNOWN_STANDARD_TLV_TYPES
+            | _KNOWN_EXTENDED_TLV_TYPES
+            | {
+                self.float_point_tlv,
+                self.side_info_tlv,
+                self.compressed_point_tlv,
+            }
+        )
+        if tlv_type in known_types:
+            return True
+        if tlv_type == 0:
+            return False
+        if self.tlv_length_includes_header:
+            if declared_length < TLV_HEADER_SIZE:
+                return False
+            payload_length = declared_length - TLV_HEADER_SIZE
+        else:
+            payload_length = declared_length
+        return payload_length <= len(trailing) - TLV_HEADER_SIZE
 
     def _parse_float_points(
         self,
@@ -428,6 +603,90 @@ class TiMmwavePacketParser:
             )
         return result
 
+    def _parse_heatmap(
+        self,
+        payload: bytes,
+        tlv_type: int,
+    ) -> TiRadarHeatmap:
+        assert self.heatmap_azimuth_bins is not None
+        assert self.heatmap_range_bins is not None
+        assert self.heatmap_range_step_m is not None
+        if not payload:
+            raise TiMmwaveParseError("range-azimuth heatmap TLV is empty")
+        if len(payload) % 4:
+            raise TiMmwaveParseError(
+                "range-azimuth heatmap length is not a multiple of uint32"
+            )
+        cells = len(payload) // 4
+        if cells > MAX_RADAR_HEATMAP_CELLS:
+            raise TiMmwaveParseError(
+                "range-azimuth heatmap exceeds cell limit"
+            )
+        expected_cells = (
+            self.heatmap_range_bins * self.heatmap_azimuth_bins
+        )
+        if cells != expected_cells:
+            raise TiMmwaveParseError(
+                "range-azimuth heatmap cell count does not match configured "
+                f"shape ({cells} != {self.heatmap_range_bins} * "
+                f"{self.heatmap_azimuth_bins})"
+            )
+        raw_values = struct.unpack(f"<{cells}I", payload)
+        data, floor_db, ceiling_db = self._quantize_heatmap(raw_values)
+        return TiRadarHeatmap(
+            data=data,
+            range_bins=self.heatmap_range_bins,
+            azimuth_bins=self.heatmap_azimuth_bins,
+            range_step_m=self.heatmap_range_step_m,
+            tlv_type=tlv_type,
+            motion_mode=_HEATMAP_MODE_BY_TLV[tlv_type],
+            floor_db=floor_db,
+            ceiling_db=ceiling_db,
+        )
+
+    @staticmethod
+    def _quantize_heatmap(
+        raw_values: Sequence[int],
+    ) -> Tuple[bytes, float, float]:
+        """Robustly map TI detMatrix uint32 values to an 8-bit dB image."""
+
+        log_values = [
+            20.0 * math.log10(value)
+            for value in raw_values
+            if value > 0
+        ]
+        if not log_values:
+            return bytes(len(raw_values)), 0.0, 1.0
+
+        ordered = sorted(log_values)
+        floor_db = TiMmwavePacketParser._percentile(ordered, 0.01)
+        ceiling_db = TiMmwavePacketParser._percentile(ordered, 0.99)
+        if ceiling_db - floor_db < 1.0:
+            midpoint = (floor_db + ceiling_db) * 0.5
+            floor_db = midpoint - 0.5
+            ceiling_db = midpoint + 0.5
+        scale = 255.0 / (ceiling_db - floor_db)
+        quantized = bytearray(len(raw_values))
+        for index, value in enumerate(raw_values):
+            if value == 0:
+                continue
+            db = 20.0 * math.log10(value)
+            mapped = round((db - floor_db) * scale)
+            quantized[index] = min(255, max(0, mapped))
+        return bytes(quantized), floor_db, ceiling_db
+
+    @staticmethod
+    def _percentile(ordered: Sequence[float], fraction: float) -> float:
+        if len(ordered) == 1:
+            return ordered[0]
+        position = (len(ordered) - 1) * fraction
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
     @staticmethod
     def _require_finite(values: Sequence[float], name: str) -> None:
         if any(not math.isfinite(value) for value in values):
@@ -450,12 +709,27 @@ class TiMmwaveStreamDecoder:
         self.max_buffer_bytes = max_buffer_bytes
         self.discarded_bytes = 0
         self.parse_errors = 0
+        self.synchronized = False
+        self.startup_sync_discarded_bytes = 0
+        self.startup_sync_parse_errors = 0
         self._buffer = bytearray()
         self._receipt_segments: Deque[Tuple[int, int, int]] = deque()
 
     @property
     def buffered_bytes(self) -> int:
         return len(self._buffer)
+
+    @property
+    def post_sync_discarded_bytes(self) -> int:
+        if not self.synchronized:
+            return 0
+        return self.discarded_bytes - self.startup_sync_discarded_bytes
+
+    @property
+    def post_sync_parse_errors(self) -> int:
+        if not self.synchronized:
+            return 0
+        return self.parse_errors - self.startup_sync_parse_errors
 
     def feed(
         self,
@@ -539,6 +813,10 @@ class TiMmwaveStreamDecoder:
                 self.discarded_bytes += 1
                 self.parse_errors += 1
                 continue
+            if not self.synchronized:
+                self.synchronized = True
+                self.startup_sync_discarded_bytes = self.discarded_bytes
+                self.startup_sync_parse_errors = self.parse_errors
             self._discard_prefix(total_length)
             frames.append(
                 replace(
@@ -547,6 +825,9 @@ class TiMmwaveStreamDecoder:
                     host_receipt_uncertainty_ns=frame_uncertainty_ns,
                 )
             )
+        if not self.synchronized:
+            self.startup_sync_discarded_bytes = self.discarded_bytes
+            self.startup_sync_parse_errors = self.parse_errors
         return frames
 
     def _find_next_plausible_magic(self) -> Optional[int]:

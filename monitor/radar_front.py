@@ -10,8 +10,8 @@ Without IMU/odometry this is a current, robot-relative view rather than a map.
 from __future__ import annotations
 
 import argparse
+import base64
 from collections import deque
-from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -29,65 +29,31 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from common.radar_geometry import RadarAxes  # noqa: E402
 from common.sensor_contract import (  # noqa: E402
     RadarFrame,
     RadarPoint,
     SensorHeader,
     SensorHealth,
 )
+from monitor.radar_scene import RadarSceneEstimator  # noqa: E402
 from sensors.mission_log import (  # noqa: E402
     DEFAULT_MAX_LINE_BYTES,
     decode_log_entry,
     iter_replay,
+)
+from sensors.radar_calibration import load_clutter_model  # noqa: E402
+from sensors.radar_parent_lease import (  # noqa: E402
+    start_parent_death_watcher,
 )
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
-
-
-@dataclass(frozen=True)
-class RadarAxes:
-    """Map TI/native x-y values into screen forward/lateral coordinates.
-
-    The IWRL6432 demo convention is X right and Y forward.  ``lateral_m`` in
-    the web API is positive to screen/robot right.
-    """
-
-    forward_axis: str = "y"
-    forward_sign: int = 1
-    lateral_axis: str = "x"
-    lateral_sign: int = 1
-
-    def __post_init__(self) -> None:
-        if self.forward_axis not in {"x", "y"}:
-            raise ValueError("forward_axis must be x or y")
-        if self.lateral_axis not in {"x", "y"}:
-            raise ValueError("lateral_axis must be x or y")
-        if self.forward_axis == self.lateral_axis:
-            raise ValueError("forward_axis and lateral_axis must differ")
-        if self.forward_sign not in {-1, 1}:
-            raise ValueError("forward_sign must be -1 or 1")
-        if self.lateral_sign not in {-1, 1}:
-            raise ValueError("lateral_sign must be -1 or 1")
-
-    def map_point(self, point: RadarPoint) -> Tuple[float, float]:
-        values = {"x": point.x_m, "y": point.y_m}
-        return (
-            values[self.forward_axis] * self.forward_sign,
-            values[self.lateral_axis] * self.lateral_sign,
-        )
-
-    def to_dict(self) -> Dict[str, object]:
-        return {
-            "forward_axis": self.forward_axis,
-            "forward_sign": self.forward_sign,
-            "lateral_axis": self.lateral_axis,
-            "lateral_sign": self.lateral_sign,
-            "lateral_positive": "right",
-            "frame": "robot_relative_uncalibrated",
-        }
+UI_BUILD_ID = "20260729-lidar-operator-r10"
+RADAR_VALID_MIN_RANGE_M = 0.07
+SUPERVISOR_BLOCKED_WARNING = "RADAR RECONNECTING \u00b7 DRIVE STOP"
 
 
 class RadarFrontState:
@@ -97,12 +63,15 @@ class RadarFrontState:
         self,
         source_mode: str,
         axes: RadarAxes = RadarAxes(),
-        max_points: int = 768,
-        max_range_m: float = 20.0,
-        min_forward_m: float = 0.05,
+        max_points: int = 2048,
+        max_range_m: float = 3.0,
+        min_forward_m: float = 0.0,
+        history_window_s: float = 0.3,
         stale_after_s: float = 0.75,
         fault_after_s: float = 2.0,
         clock: Callable[[], float] = time.monotonic,
+        scene_estimator: Optional[RadarSceneEstimator] = None,
+        supervisor_manifest_path: Optional[Path] = None,
     ) -> None:
         if max_points < 1:
             raise ValueError("max_points must be positive")
@@ -110,6 +79,13 @@ class RadarFrontState:
             raise ValueError("max_range_m must be finite and positive")
         if min_forward_m < 0 or not math.isfinite(min_forward_m):
             raise ValueError("min_forward_m must be finite and non-negative")
+        if (
+            not math.isfinite(history_window_s)
+            or not 0.1 <= history_window_s <= 1.2
+        ):
+            raise ValueError(
+                "history_window_s must be between 0.1 and 1.2 seconds"
+            )
         if stale_after_s <= 0 or not math.isfinite(stale_after_s):
             raise ValueError("stale_after_s must be finite and positive")
         if fault_after_s <= stale_after_s or not math.isfinite(fault_after_s):
@@ -120,13 +96,30 @@ class RadarFrontState:
         self.max_points = max_points
         self.max_range_m = max_range_m
         self.min_forward_m = min_forward_m
+        self.history_window_s = history_window_s
         self.stale_after_s = stale_after_s
         self.fault_after_s = fault_after_s
         self._clock = clock
+        if (
+            supervisor_manifest_path is not None
+            and not isinstance(supervisor_manifest_path, Path)
+        ):
+            raise ValueError("supervisor_manifest_path must be a Path or None")
+        self.supervisor_manifest_path = supervisor_manifest_path
+        self.scene_estimator = scene_estimator or RadarSceneEstimator(
+            axes=axes,
+            clutter_model=None,
+            require_calibration=(source_mode != "demo"),
+            synthetic=(source_mode == "demo"),
+            clock=clock,
+        )
         self._lock = threading.Lock()
         self._frame: Optional[Dict[str, object]] = None
         self._frame_received_at: Optional[float] = None
         self._arrival_times: Deque[float] = deque(maxlen=64)
+        self._point_history: Deque[
+            Tuple[float, List[List[Optional[float]]]]
+        ] = deque()
         self._frames_received = 0
         self._valid_frames = 0
         self._incomplete_frames = 0
@@ -139,9 +132,11 @@ class RadarFrontState:
         self._device_discontinuities_total = 0
         self._log_sequence_errors_total = 0
         self._last_sensor_seq_by_producer: Dict[str, int] = {}
+        self._scene_producer_id: Optional[str] = None
         self._source_error: Optional[str] = None
         self._source_note = "waiting for first radar frame"
-        self._degraded_reason: Optional[str] = None
+        self._capture_degraded_reason: Optional[str] = None
+        self._integrity_degraded_reason: Optional[str] = None
         self._health_status: Optional[str] = None
         self._health_detail: Optional[str] = None
         self._replay_ended = False
@@ -184,8 +179,12 @@ class RadarFrontState:
                     self._device_discontinuities_total,
                     record.device_discontinuities_total,
                 )
-                if record.status not in {"ok", "starting"}:
-                    self._degraded_reason = f"sensor_health_{record.status}"
+                if record.status == "ok":
+                    self._capture_degraded_reason = None
+                elif record.status != "starting":
+                    self._capture_degraded_reason = (
+                        f"sensor_health_{record.status}"
+                    )
             return True
 
         if not isinstance(record, RadarFrame):
@@ -198,8 +197,15 @@ class RadarFrontState:
             self._replay_ended = False
             self._source_error = None
             self._source_note = "receiving radar frames"
+            producer_id = record.header.producer_id
+            if (
+                self._scene_producer_id is not None
+                and producer_id != self._scene_producer_id
+            ):
+                self.scene_estimator.reset("producer_change")
+            self._scene_producer_id = producer_id
             previous_sensor_seq = self._last_sensor_seq_by_producer.get(
-                record.header.producer_id
+                producer_id
             )
             sensor_sequence_issue: Optional[str] = None
             if previous_sensor_seq is not None:
@@ -212,7 +218,7 @@ class RadarFrontState:
                     self._sensor_sequence_errors_total += 1
                     sensor_sequence_issue = "sensor_sequence_discontinuity"
             self._last_sensor_seq_by_producer[
-                record.header.producer_id
+                producer_id
             ] = record.header.seq
             self._frame_gaps_total += record.dropped_frames_since_previous
             if record.frame_transition in {
@@ -220,13 +226,16 @@ class RadarFrontState:
                 "reset_or_out_of_order",
             }:
                 self._device_discontinuities_total += 1
-                self._degraded_reason = "device_frame_discontinuity"
+                self._capture_degraded_reason = "device_frame_discontinuity"
+                if not record.complete:
+                    self.scene_estimator.reset(record.frame_transition)
 
             if not record.complete:
                 self._incomplete_frames += 1
-                self._degraded_reason = "incomplete_point_cloud"
+                self._capture_degraded_reason = "incomplete_point_cloud"
                 return False
 
+            self.scene_estimator.ingest(record, received_at=now)
             mapped: List[Tuple[float, List[Optional[float]]]] = []
             for point in record.points:
                 forward_m, lateral_m = self.axes.map_point(point)
@@ -269,6 +278,25 @@ class RadarFrontState:
                 ),
                 default=None,
             )
+            source_heatmap = getattr(record, "heatmap", None)
+            default_heatmap_axes = self.axes == RadarAxes()
+            heatmap = (
+                self._heatmap_payload(source_heatmap)
+                if default_heatmap_axes
+                else None
+            )
+            if heatmap is None and self.source_mode == "demo":
+                heatmap = self._demo_heatmap_payload(display_points)
+            if source_heatmap is None:
+                heatmap_status = "not_provided"
+            elif not default_heatmap_axes:
+                heatmap_status = "disabled_nondefault_axes"
+            elif heatmap is None:
+                heatmap_status = "invalid_metadata"
+            else:
+                heatmap_status = "available"
+            if self.source_mode == "demo" and heatmap is not None:
+                heatmap_status = "synthetic"
             self._frame = {
                 "number": record.frame_number,
                 "subframe": record.subframe_number,
@@ -301,37 +329,213 @@ class RadarFrontState:
                     else round(nearest_corridor, 3)
                 ),
                 "points": display_points,
+                "heatmap": heatmap,
+                "heatmap_status": heatmap_status,
             }
             self._frame_received_at = now
             self._arrival_times.append(now)
+            self._point_history.append((now, display_points))
+            self._trim_history(now)
             self._valid_frames += 1
             if record.dropped_frames_since_previous:
-                self._degraded_reason = "frame_gap"
+                self._capture_degraded_reason = "frame_gap"
             elif sensor_sequence_issue is not None:
-                self._degraded_reason = sensor_sequence_issue
+                self._capture_degraded_reason = sensor_sequence_issue
         return True
+
+    def _heatmap_payload(self, heatmap: object) -> Optional[Dict[str, object]]:
+        """Encode a canonical heatmap for JSON transport without expanding it."""
+
+        if heatmap is None:
+            return None
+        try:
+            range_bins = int(getattr(heatmap, "range_bins"))
+            azimuth_bins = int(getattr(heatmap, "azimuth_bins"))
+            range_step_m = float(getattr(heatmap, "range_step_m"))
+            encoding = str(getattr(heatmap, "encoding", "log-u8"))
+            raw_values = getattr(heatmap, "values", None)
+            if raw_values is None:
+                raw_values = getattr(heatmap, "data")
+            values = bytes(raw_values)
+            floor_db = float(getattr(heatmap, "floor_db"))
+            ceiling_db = float(getattr(heatmap, "ceiling_db"))
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+        if (
+            range_bins < 1
+            or azimuth_bins < 1
+            or len(values) != range_bins * azimuth_bins
+            or range_step_m <= 0
+            or not math.isfinite(range_step_m)
+            or not math.isfinite(floor_db)
+            or not math.isfinite(ceiling_db)
+            or ceiling_db <= floor_db
+        ):
+            return None
+        mode = getattr(
+            heatmap,
+            "mode",
+            getattr(
+                heatmap,
+                "motion_mode",
+                getattr(heatmap, "type", "range-azimuth"),
+            ),
+        )
+        payload: Dict[str, object] = {
+            "range_bins": range_bins,
+            "azimuth_bins": azimuth_bins,
+            "range_step_m": round(range_step_m, 9),
+            "encoding": encoding,
+            "data_base64": base64.b64encode(values).decode("ascii"),
+            "floor_db": round(floor_db, 3),
+            "ceiling_db": round(ceiling_db, 3),
+            "motion_mode": str(mode),
+            "source": "radar",
+            "azimuth_layout": "fft-shifted-spatial-frequency",
+            "lambda_over_d_x": 2.0,
+            "azimuth_min_deg": -70.0,
+            "azimuth_max_deg": 70.0,
+            "valid_min_range_m": RADAR_VALID_MIN_RANGE_M,
+            "valid_max_range_m": 7.5,
+            "layout": "range-major_azimuth-minor",
+        }
+        tlv_type = getattr(heatmap, "tlv_type", None)
+        if isinstance(tlv_type, int):
+            payload["tlv_type"] = tlv_type
+        return payload
+
+    @staticmethod
+    def _demo_heatmap_payload(
+        points: Sequence[Sequence[Optional[float]]],
+    ) -> Dict[str, object]:
+        """Create a deterministic intensity fan for UI-only demo mode."""
+
+        range_bins = 100
+        azimuth_bins = 81
+        range_step_m = 0.05
+        values = bytearray(range_bins * azimuth_bins)
+        for point in points:
+            forward = float(point[0] or 0.0)
+            lateral = float(point[1] or 0.0)
+            distance = math.hypot(forward, lateral)
+            if forward <= 0 or distance >= range_bins * range_step_m:
+                continue
+            angle_deg = math.degrees(math.atan2(lateral, forward))
+            if not -60.0 <= angle_deg <= 60.0:
+                continue
+            range_index = min(
+                range_bins - 1,
+                int(distance / range_step_m),
+            )
+            azimuth_index = min(
+                azimuth_bins - 1,
+                max(
+                    0,
+                    int((angle_deg + 60.0) / 120.0 * azimuth_bins),
+                ),
+            )
+            snr = 14.0 if point[4] is None else float(point[4])
+            peak = round(max(76.0, min(255.0, 70.0 + snr * 6.0)))
+            for range_offset in range(-2, 3):
+                target_range = range_index + range_offset
+                if not 0 <= target_range < range_bins:
+                    continue
+                for angle_offset in range(-2, 3):
+                    target_angle = azimuth_index + angle_offset
+                    if not 0 <= target_angle < azimuth_bins:
+                        continue
+                    falloff = 1.0 - (
+                        abs(range_offset) + abs(angle_offset)
+                    ) / 6.0
+                    value = round(peak * max(0.22, falloff))
+                    offset = target_range * azimuth_bins + target_angle
+                    values[offset] = max(values[offset], value)
+        return {
+            "range_bins": range_bins,
+            "azimuth_bins": azimuth_bins,
+            "range_step_m": range_step_m,
+            "encoding": "log-u8",
+            "data_base64": base64.b64encode(bytes(values)).decode("ascii"),
+            "floor_db": -40.0,
+            "ceiling_db": 30.0,
+            "motion_mode": "synthetic-point-derived",
+            "source": "synthetic-point-derived",
+            "azimuth_layout": "linear-degrees",
+            "azimuth_min_deg": -60.0,
+            "azimuth_max_deg": 60.0,
+            "valid_min_range_m": 0.05,
+            "valid_max_range_m": 5.0,
+            "layout": "range-major_azimuth-minor",
+        }
+
+    def _trim_history(self, now: float) -> None:
+        oldest = now - self.history_window_s
+        while self._point_history and self._point_history[0][0] < oldest:
+            self._point_history.popleft()
+
+    def _occupancy_payload(self, now: float) -> Dict[str, object]:
+        self._trim_history(now)
+        history_points: List[List[Optional[float]]] = []
+        for received_at, points in self._point_history:
+            age_s = max(0.0, now - received_at)
+            persistence = max(0.0, 1.0 - age_s / self.history_window_s)
+            age_ms = round(age_s * 1000.0)
+            for point in points:
+                history_points.append(
+                    list(point)
+                    + [age_ms, round(persistence, 3)]
+                )
+        history_limit = min(8192, self.max_points * 12)
+        truncated = len(history_points) > history_limit
+        if truncated:
+            history_points = history_points[-history_limit:]
+        return {
+            "mode": "temporal-return-evidence",
+            "semantics": "return_evidence_only_unknown_elsewhere",
+            "history_window_ms": round(self.history_window_s * 1000.0),
+            "frames": len(self._point_history),
+            "point_fields": [
+                "forward_m",
+                "lateral_m",
+                "height_m",
+                "radial_velocity_mps",
+                "snr_db",
+                "age_ms",
+                "persistence",
+            ],
+            "points": history_points,
+            "truncated": truncated,
+        }
 
     def reset_sensor_sequence_tracking(self) -> None:
         """Forget replay-only sequence baselines without clearing diagnostics.
 
-        Degraded diagnostics remain latched for the lifetime of this viewer
-        process so a short gap cannot disappear between browser polls.
+        Cumulative diagnostics and integrity failures remain latched. Capture
+        degradation clears only through explicit ``ok`` sensor health.
         """
 
         with self._lock:
             self._last_sensor_seq_by_producer.clear()
+            self._scene_producer_id = None
+            self.scene_estimator.reset("replay_loop_restart")
 
     def note_parse_error(self, detail: str) -> None:
         with self._lock:
             self._parse_errors_total += 1
             self._source_error = detail[:240]
-            self._degraded_reason = "invalid_log_record"
+            self._integrity_degraded_reason = "invalid_log_record"
 
     def note_log_sequence_error(self, detail: str) -> None:
         with self._lock:
             self._log_sequence_errors_total += 1
             self._source_error = detail[:240]
-            self._degraded_reason = "log_sequence_discontinuity"
+            self._integrity_degraded_reason = "log_sequence_discontinuity"
+
+    def _degraded_reason_locked(self) -> Optional[str]:
+        return (
+            self._integrity_degraded_reason
+            or self._capture_degraded_reason
+        )
 
     def set_source_note(self, note: str) -> None:
         with self._lock:
@@ -349,7 +553,29 @@ class RadarFrontState:
 
     def snapshot(self, now: Optional[float] = None) -> Dict[str, object]:
         current = self._clock() if now is None else now
+        supervisor_state: Optional[str] = None
+        supervisor_reason: Optional[str] = None
+        if self.supervisor_manifest_path is not None:
+            try:
+                supervisor_payload = json.loads(
+                    self.supervisor_manifest_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(supervisor_payload, dict):
+                    raise ValueError("supervisor manifest must be an object")
+                supervisor_state = supervisor_payload.get("state")
+                supervisor_reason = supervisor_payload.get("last_reason")
+                if not isinstance(supervisor_state, str):
+                    raise ValueError("supervisor manifest state is missing")
+                if (
+                    supervisor_reason is not None
+                    and not isinstance(supervisor_reason, str)
+                ):
+                    supervisor_reason = None
+            except (OSError, ValueError, TypeError):
+                supervisor_state = "UNAVAILABLE"
+                supervisor_reason = "supervisor_manifest_unavailable"
         with self._lock:
+            occupancy = self._occupancy_payload(current)
             frame = self._frame
             received_at = self._frame_received_at
             age_s = None if received_at is None else max(0.0, current - received_at)
@@ -358,6 +584,7 @@ class RadarFrontState:
                 elapsed = self._arrival_times[-1] - self._arrival_times[0]
                 if elapsed > 0:
                     fps = (len(self._arrival_times) - 1) / elapsed
+            degraded_reason = self._degraded_reason_locked()
 
             if frame is None:
                 status = "fault" if self._source_error else "waiting"
@@ -371,16 +598,38 @@ class RadarFrontState:
                 frame.get("source_format") == "ti-mmwave-none"
             ):
                 status = "degraded"
-            elif self._degraded_reason is not None:
+            elif degraded_reason is not None:
                 status = "degraded"
             else:
                 status = "live"
 
             warning = self._warning_for(status, frame)
+            supervisor_blocked = (
+                supervisor_state is not None
+                and supervisor_state != "RUNNING"
+            )
+            if supervisor_blocked:
+                status = "fault"
+                warning = SUPERVISOR_BLOCKED_WARNING
+                frame = None
+                age_s = None
+                fps = 0.0
+                occupancy["frames"] = 0
+                occupancy["points"] = []
+                occupancy["truncated"] = False
+            if status in {"waiting", "stale", "fault", "replay_end"}:
+                self._scene_producer_id = None
+            scene = self.scene_estimator.snapshot(
+                source_status=status,
+                now=current,
+            )
             return {
                 "version": API_VERSION,
+                "ui_build_id": UI_BUILD_ID,
                 "status": status,
                 "warning": warning,
+                "supervisor_state": supervisor_state,
+                "supervisor_reason": supervisor_reason,
                 "source": {
                     "mode": self.source_mode,
                     "note": self._source_note,
@@ -395,11 +644,16 @@ class RadarFrontState:
                     "max_points": self.max_points,
                     "max_range_m": self.max_range_m,
                     "min_forward_m": self.min_forward_m,
+                    "history_window_ms": round(
+                        self.history_window_s * 1000.0
+                    ),
                     "stale_after_ms": round(self.stale_after_s * 1000.0),
                     "fault_after_ms": round(self.fault_after_s * 1000.0),
                     "display_limit_only": True,
                 },
                 "frame": frame,
+                "occupancy": occupancy,
+                "scene": scene,
                 "counters": {
                     "frames_received": self._frames_received,
                     "valid_frames": self._valid_frames,
@@ -424,7 +678,7 @@ class RadarFrontState:
                 "health": {
                     "status": self._health_status,
                     "detail": self._health_detail,
-                    "degraded_reason": self._degraded_reason,
+                    "degraded_reason": degraded_reason,
                 },
             }
 
@@ -434,25 +688,28 @@ class RadarFrontState:
         frame: Optional[Dict[str, object]],
     ) -> str:
         if status == "waiting":
-            return "레이더 프레임 대기 중 — 주행하지 마세요"
+            return "레이더 프레임 대기 중 · 주행하지 마세요"
         if status == "fault":
-            return "RADAR FAULT — 즉시 정지"
+            return "RADAR FAULT · 즉시 정지"
         if status == "stale":
-            return "RADAR STALE — 오래된 화면, 즉시 정지"
+            return "RADAR STALE · 오래된 화면, 즉시 정지"
         if status == "replay_end":
-            return "REPLAY END — 마지막 프레임이 고정되어 있습니다"
+            return "REPLAY END · 마지막 프레임이 고정되어 있습니다"
         if status == "degraded":
             if (
                 frame is not None
                 and frame.get("source_format") == "ti-mmwave-none"
             ):
                 return (
-                    "RADAR DEGRADED — point-cloud TLV 없음, cfg 확인"
+                    "RADAR DEGRADED · point-cloud TLV 없음, cfg 확인"
                 )
-            return "RADAR DEGRADED — 누락/불완전 프레임 확인"
+            return "RADAR DEGRADED · 누락/불완전 프레임 확인"
         if frame is not None and frame["display_point_count"] == 0:
-            return "NO RETURNS — 빈 공간이라는 뜻이 아닙니다"
-        return "현재 프레임 · 로봇 상대 좌표 (SLAM 아님)"
+            return "NO RETURNS · 빈 공간이라는 뜻이 아니라 미확인입니다"
+        return (
+            f"반사 강도와 {self.history_window_s:.2f}초 단기 누적 · "
+            "로봇 상대 좌표 (SLAM 아님)"
+        )
 
 
 def make_demo_frame(
@@ -465,6 +722,28 @@ def make_demo_frame(
     generator = random.Random(seed + frame_number)
     points: List[RadarPoint] = []
     if frame_number % 120 != 90:
+        # Close-range tilted panel for the 0-50 cm operator-view demo.
+        for row in range(4):
+            for column in range(7):
+                lateral = -0.18 + column * 0.06
+                height = -0.09 + row * 0.06
+                forward = (
+                    0.18
+                    + column * 0.012
+                    + row * 0.008
+                    + generator.uniform(-0.004, 0.004)
+                )
+                points.append(
+                    RadarPoint(
+                        x_m=lateral,
+                        y_m=forward,
+                        z_m=height,
+                        radial_velocity_mps=generator.uniform(-0.02, 0.02),
+                        snr_db=generator.uniform(18.0, 31.0),
+                        noise_db=generator.uniform(3.0, 7.0),
+                    )
+                )
+
         for side in (-1.0, 1.0):
             for index in range(24):
                 forward = 0.65 + index * 0.31
@@ -765,6 +1044,10 @@ def build_handler(
             "radar_panel.js",
             "text/javascript; charset=utf-8",
         ),
+        "/radar_scene.js": (
+            "radar_scene.js",
+            "text/javascript; charset=utf-8",
+        ),
     }
 
     class RadarRequestHandler(BaseHTTPRequestHandler):
@@ -848,9 +1131,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8081)
-    parser.add_argument("--max-points", type=int, default=768)
-    parser.add_argument("--max-range-m", type=float, default=20.0)
-    parser.add_argument("--min-forward-m", type=float, default=0.05)
+    parser.add_argument("--max-points", type=int, default=2048)
+    parser.add_argument("--max-range-m", type=float, default=3.0)
+    parser.add_argument("--min-forward-m", type=float, default=0.0)
+    parser.add_argument(
+        "--history-window",
+        type=float,
+        default=0.2,
+        help="point evidence persistence in seconds (0.1 to 1.2)",
+    )
     parser.add_argument("--stale-after", type=float, default=0.75)
     parser.add_argument("--fault-after", type=float, default=2.0)
     parser.add_argument(
@@ -890,6 +1179,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="loop completed replay input",
     )
+    parser.add_argument(
+        "--clutter-calibration",
+        help="profile-bound radar self-clutter calibration JSON",
+    )
+    parser.add_argument(
+        "--supervisor-manifest",
+        type=Path,
+        help="atomic radar supervisor state side channel",
+    )
+    parser.add_argument(
+        "--supervisor-parent-lease",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -907,6 +1210,11 @@ def parse_args(
         parser.error("--max-range-m must be finite and positive")
     if not math.isfinite(args.min_forward_m) or args.min_forward_m < 0:
         parser.error("--min-forward-m must be finite and non-negative")
+    if (
+        not math.isfinite(args.history_window)
+        or not 0.1 <= args.history_window <= 1.2
+    ):
+        parser.error("--history-window must be between 0.1 and 1.2")
     if not math.isfinite(args.stale_after) or args.stale_after <= 0:
         parser.error("--stale-after must be finite and positive")
     if (
@@ -926,6 +1234,16 @@ def parse_args(
 
 
 def run(args: argparse.Namespace) -> int:
+    parent_watcher = None
+    if args.supervisor_parent_lease is not None:
+        parent_watcher = start_parent_death_watcher(
+            args.supervisor_parent_lease
+        )
+        if not parent_watcher.ready.wait(5.0):
+            raise RuntimeError("parent-death watcher did not become ready")
+        if parent_watcher.stop_requested.is_set():
+            return 0
+
     axes = RadarAxes(
         forward_axis=args.forward_axis,
         forward_sign=args.forward_sign,
@@ -933,14 +1251,28 @@ def run(args: argparse.Namespace) -> int:
         lateral_sign=args.lateral_sign,
     )
     mode = "demo" if args.demo else ("follow" if args.follow else "replay")
+    clutter_model = (
+        None
+        if args.clutter_calibration is None
+        else load_clutter_model(Path(args.clutter_calibration))
+    )
+    scene_estimator = RadarSceneEstimator(
+        axes=axes,
+        clutter_model=clutter_model,
+        require_calibration=(mode != "demo"),
+        synthetic=(mode == "demo"),
+    )
     state = RadarFrontState(
         source_mode=mode,
         axes=axes,
         max_points=args.max_points,
         max_range_m=args.max_range_m,
         min_forward_m=args.min_forward_m,
+        history_window_s=args.history_window,
         stale_after_s=args.stale_after,
         fault_after_s=args.fault_after,
+        scene_estimator=scene_estimator,
+        supervisor_manifest_path=args.supervisor_manifest,
     )
     stop_event = threading.Event()
     if args.demo:
@@ -976,6 +1308,17 @@ def run(args: argparse.Namespace) -> int:
         build_handler(state, quiet=args.quiet),
     )
     server.daemon_threads = True
+    if parent_watcher is not None:
+        def shutdown_after_parent_exit() -> None:
+            parent_watcher.stop_requested.wait()
+            stop_event.set()
+            server.shutdown()
+
+        threading.Thread(
+            target=shutdown_after_parent_exit,
+            name="radar-front-parent-death",
+            daemon=True,
+        ).start()
     print(
         f"HANSEL front radar: http://{args.bind}:{args.http_port} "
         f"(mode={mode})"

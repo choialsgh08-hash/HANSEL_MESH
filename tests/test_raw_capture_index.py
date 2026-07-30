@@ -96,7 +96,88 @@ class RawCaptureIndexTests(unittest.TestCase):
             self.assertTrue(report["footer_present"])
             self.assertEqual(report["profile_id"], "sdk5502-profile")
             self.assertEqual(report["baudrate"], 115200)
+            self.assertIsNone(report["allow_elided_empty_point_tlv"])
+            self.assertIsNone(report["allow_nonzero_padding"])
             json.dumps(report)
+
+    def test_compatibility_flags_are_boolean_and_stable_when_present(self):
+        flags = {
+            "allow_elided_empty_point_tlv": True,
+            "allow_nonzero_padding": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "radar.bin"
+            index = root / "radar.bin.chunks.jsonl"
+            raw.write_bytes(b"abcd")
+            index.write_bytes(
+                encode_lines(
+                    chunk_record(1, 0, 2, 100, 110, **flags),
+                    chunk_record(
+                        2,
+                        2,
+                        2,
+                        120,
+                        130,
+                        **{
+                            **flags,
+                            "allow_nonzero_padding": False,
+                        },
+                    ),
+                    footer(2, b"abcd", **flags),
+                )
+            )
+
+            report = inspect_uart_chunk_index(raw, index)
+
+            self.assertFalse(report["healthy"])
+            self.assertTrue(
+                any(
+                    "allow_nonzero_padding" in error
+                    for error in report["errors"]
+                )
+            )
+
+    def test_compatibility_flags_must_be_supplied_as_a_boolean_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = root / "radar.bin"
+            index = root / "radar.bin.chunks.jsonl"
+            raw.write_bytes(b"ab")
+            index.write_bytes(
+                encode_lines(
+                    chunk_record(
+                        1,
+                        0,
+                        2,
+                        100,
+                        110,
+                        allow_elided_empty_point_tlv="yes",
+                        allow_nonzero_padding=False,
+                    ),
+                    footer(
+                        1,
+                        b"ab",
+                        allow_elided_empty_point_tlv=True,
+                    ),
+                )
+            )
+
+            report = inspect_uart_chunk_index(raw, index)
+
+            self.assertFalse(report["healthy"])
+            self.assertTrue(
+                any(
+                    "compatibility metadata must include both" in error
+                    for error in report["errors"]
+                )
+            )
+            self.assertTrue(
+                any(
+                    "allow_elided_empty_point_tlv must be a boolean" in error
+                    for error in report["errors"]
+                )
+            )
 
     def test_missing_footer_is_unhealthy(self):
         with tempfile.TemporaryDirectory() as directory:

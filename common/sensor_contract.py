@@ -11,6 +11,8 @@ stores a heuristic timing-quality scale in that field, not a strict bound.
 
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass
 import math
 import re
@@ -19,6 +21,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 SENSOR_SCHEMA_VERSION = 1
 MAX_RADAR_POINTS = 8192
+MAX_RADAR_HEATMAP_CELLS = 1024 * 1024
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
 
@@ -40,6 +43,8 @@ _RADAR_FRAME_TRANSITIONS = {
     "duplicate",
     "reset_or_out_of_order",
 }
+_RADAR_HEATMAP_MODES = {"major", "minor"}
+_RADAR_HEATMAP_TLV_TYPES = {304: "major", 305: "minor"}
 
 
 def _require_mapping(value: object, name: str) -> Mapping[str, Any]:
@@ -222,6 +227,61 @@ class RadarPoint:
 
 
 @dataclass(frozen=True)
+class RadarHeatmap:
+    """One range-major, azimuth-minor 8-bit intensity image.
+
+    ``data`` contains exactly ``range_bins * azimuth_bins`` log-compressed
+    cells.  A cell value of 0 maps to ``floor_db`` and 255 maps to
+    ``ceiling_db``.  The floor and ceiling preserve the parser's
+    ``20 * log10(detMatrix)`` scale.  These dB values are relative to the TI
+    demo's uint32 heatmap units; they are not calibrated received power.
+    """
+
+    data: bytes
+    range_bins: int
+    azimuth_bins: int
+    range_step_m: float
+    tlv_type: int
+    motion_mode: str
+    floor_db: float
+    ceiling_db: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes):
+            raise ValueError("data must be bytes")
+        _require_int(self.range_bins, "range_bins", 1)
+        _require_int(self.azimuth_bins, "azimuth_bins", 1)
+        cells = self.range_bins * self.azimuth_bins
+        if cells > MAX_RADAR_HEATMAP_CELLS:
+            raise ValueError(
+                "heatmap dimensions exceed limit of "
+                f"{MAX_RADAR_HEATMAP_CELLS} cells"
+            )
+        if len(self.data) != cells:
+            raise ValueError(
+                "data length must equal range_bins * azimuth_bins"
+            )
+        range_step_m = _require_float(self.range_step_m, "range_step_m")
+        if range_step_m <= 0:
+            raise ValueError("range_step_m must be positive")
+        object.__setattr__(self, "range_step_m", range_step_m)
+        _require_int(self.tlv_type, "tlv_type", 0, 2**32 - 1)
+        if self.motion_mode not in _RADAR_HEATMAP_MODES:
+            raise ValueError("motion_mode is invalid")
+        expected_mode = _RADAR_HEATMAP_TLV_TYPES.get(self.tlv_type)
+        if expected_mode is None:
+            raise ValueError("tlv_type is not a supported heatmap TLV")
+        if self.motion_mode != expected_mode:
+            raise ValueError("motion_mode does not match tlv_type")
+        floor_db = _require_float(self.floor_db, "floor_db")
+        ceiling_db = _require_float(self.ceiling_db, "ceiling_db")
+        if ceiling_db <= floor_db:
+            raise ValueError("ceiling_db must be greater than floor_db")
+        object.__setattr__(self, "floor_db", floor_db)
+        object.__setattr__(self, "ceiling_db", ceiling_db)
+
+
+@dataclass(frozen=True)
 class RadarFrame:
     header: SensorHeader
     frame_number: int
@@ -235,6 +295,7 @@ class RadarFrame:
     frame_transition: str = "unknown"
     profile_id: Optional[str] = None
     capture_baudrate: Optional[int] = None
+    heatmap: Optional[RadarHeatmap] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.header, SensorHeader):
@@ -270,6 +331,11 @@ class RadarFrame:
             1,
             10_000_000,
         )
+        if self.heatmap is not None and not isinstance(
+            self.heatmap,
+            RadarHeatmap,
+        ):
+            raise ValueError("heatmap must be a RadarHeatmap or null")
 
 
 @dataclass(frozen=True)
@@ -590,6 +656,67 @@ def _point_from_dict(value: object, index: int) -> RadarPoint:
     )
 
 
+def _heatmap_to_dict(heatmap: RadarHeatmap) -> Dict[str, Any]:
+    return {
+        "data_base64": base64.b64encode(heatmap.data).decode("ascii"),
+        "range_bins": heatmap.range_bins,
+        "azimuth_bins": heatmap.azimuth_bins,
+        "range_step_m": heatmap.range_step_m,
+        "tlv_type": heatmap.tlv_type,
+        "motion_mode": heatmap.motion_mode,
+        "floor_db": heatmap.floor_db,
+        "ceiling_db": heatmap.ceiling_db,
+    }
+
+
+def _heatmap_from_dict(value: object) -> RadarHeatmap:
+    data = _require_mapping(value, "payload.heatmap")
+    encoded = _payload_value(data, "data_base64")
+    if not isinstance(encoded, str):
+        raise ValueError("payload.heatmap.data_base64 must be a string")
+    try:
+        raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise ValueError(
+            "payload.heatmap.data_base64 is not valid base64"
+        ) from exc
+    motion_mode = _payload_value(data, "motion_mode")
+    if not isinstance(motion_mode, str):
+        raise ValueError("payload.heatmap.motion_mode must be a string")
+    return RadarHeatmap(
+        data=raw,
+        range_bins=_require_int(
+            _payload_value(data, "range_bins"),
+            "payload.heatmap.range_bins",
+            1,
+        ),
+        azimuth_bins=_require_int(
+            _payload_value(data, "azimuth_bins"),
+            "payload.heatmap.azimuth_bins",
+            1,
+        ),
+        range_step_m=_require_float(
+            _payload_value(data, "range_step_m"),
+            "payload.heatmap.range_step_m",
+        ),
+        tlv_type=_require_int(
+            _payload_value(data, "tlv_type"),
+            "payload.heatmap.tlv_type",
+            0,
+            2**32 - 1,
+        ),
+        motion_mode=motion_mode,
+        floor_db=_require_float(
+            _payload_value(data, "floor_db"),
+            "payload.heatmap.floor_db",
+        ),
+        ceiling_db=_require_float(
+            _payload_value(data, "ceiling_db"),
+            "payload.heatmap.ceiling_db",
+        ),
+    )
+
+
 def record_to_dict(record: SensorRecord) -> Dict[str, Any]:
     """Convert a validated record into the versioned wire representation."""
 
@@ -607,6 +734,11 @@ def record_to_dict(record: SensorRecord) -> Dict[str, Any]:
             "frame_transition": record.frame_transition,
             "profile_id": record.profile_id,
             "capture_baudrate": record.capture_baudrate,
+            "heatmap": (
+                None
+                if record.heatmap is None
+                else _heatmap_to_dict(record.heatmap)
+            ),
         }
     elif isinstance(record, ImuSample):
         record_type = "imu_sample"
@@ -779,6 +911,11 @@ def record_from_dict(
                 "payload.capture_baudrate",
                 1,
                 10_000_000,
+            ),
+            heatmap=(
+                None
+                if payload.get("heatmap") is None
+                else _heatmap_from_dict(payload.get("heatmap"))
             ),
         )
 

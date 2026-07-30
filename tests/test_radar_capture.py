@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 from common.sensor_json import strict_json_loads
+from monitor.radar_front import RadarFrontState
 from sensors.mission_log import iter_mission_log
 from sensors.radar_capture import (
     capture_radar_uart,
@@ -41,6 +42,68 @@ def one_point_packet(frame_number=1):
     return header + body + padding
 
 
+def one_point_heatmap_packet(frame_number=1, tlv_type=304):
+    units = struct.pack("<4f2H", 0.01, 0.1, 0.5, 1.0, 1, 0)
+    point = struct.pack("<hhhhBB", 10, 20, 0, -2, 8, 3)
+    point_payload = units + point
+    heatmap_payload = struct.pack(
+        "<8I",
+        0,
+        1,
+        10,
+        100,
+        1_000,
+        10_000,
+        100_000,
+        1_000_000,
+    )
+    body = (
+        struct.pack("<II", 301, len(point_payload))
+        + point_payload
+        + struct.pack("<II", tlv_type, len(heatmap_payload))
+        + heatmap_payload
+    )
+    padding = b"\x00" * ((-(40 + len(body))) % 32)
+    total = 40 + len(body) + len(padding)
+    header = TI_MAGIC_WORD + struct.pack(
+        "<8I",
+        0x05050002,
+        total,
+        0xA6432,
+        frame_number,
+        123,
+        1,
+        2,
+        0,
+    )
+    return header + body + padding
+
+
+def elided_empty_point_packet(frame_number=1):
+    payload = b"\x01\x02\x03\x04"
+    body = struct.pack("<II", 302, len(payload)) + payload
+    padding = b"\x00" * ((-(40 + len(body))) % 32)
+    total = 40 + len(body) + len(padding)
+    header = TI_MAGIC_WORD + struct.pack(
+        "<8I",
+        0x05050402,
+        total,
+        0xA6432,
+        frame_number,
+        0,
+        0,
+        1,
+        0,
+    )
+    return header + body + padding
+
+
+def nonzero_padding_packet(frame_number=1):
+    raw = bytearray(one_point_packet(frame_number=frame_number))
+    raw[-1] = 0xA5
+    return bytes(raw)
+
+
 class FakeSerial:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -67,6 +130,59 @@ class ResettingFakeSerial(FakeSerial):
         ]
 
 
+class ElidedEmptyPointFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.reads = [elided_empty_point_packet()]
+
+
+class MidStreamAttachFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.reads = [
+            one_point_packet(frame_number=1)[17:],
+            one_point_packet(frame_number=2),
+        ]
+
+
+class DelayedMidStreamAttachFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.read_count = 0
+
+    def read(self, size):
+        self.read_count += 1
+        if self.read_count == 1:
+            return one_point_packet(frame_number=1)[17:]
+        if self.read_count == 2:
+            time.sleep(0.02)
+            return b""
+        if self.read_count == 3:
+            return one_point_packet(frame_number=2)
+        raise KeyboardInterrupt
+
+
+class PostSyncCorruptionFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.reads = [
+            one_point_packet(frame_number=1),
+            b"corruption" + one_point_packet(frame_number=2),
+        ]
+
+
+class NonzeroPaddingFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.reads = [nonzero_padding_packet()]
+
+
+class HeatmapFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.reads = [one_point_heatmap_packet()]
+
+
 class PeriodicDiagnosticFakeSerial(FakeSerial):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -82,7 +198,58 @@ class PeriodicDiagnosticFakeSerial(FakeSerial):
         raise KeyboardInterrupt
 
 
+class GapThenQuietFakeSerial(FakeSerial):
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.read_count = 0
+
+    def read(self, size):
+        del size
+        self.read_count += 1
+        if self.read_count == 1:
+            return one_point_packet(1) + one_point_packet(3)
+        if self.read_count == 2:
+            time.sleep(0.02)
+            return b""
+        if self.read_count == 3:
+            return one_point_packet(4)
+        if self.read_count == 4:
+            time.sleep(0.02)
+            return b""
+        raise KeyboardInterrupt
+
+
 class RadarCaptureTests(unittest.TestCase):
+    def test_parent_stop_request_flushes_capture_without_reading_uart(self):
+        class NoReadSerial(FakeSerial):
+            def read(self, size):
+                del size
+                raise AssertionError("stop request must precede UART read")
+
+        fake_serial_module = SimpleNamespace(Serial=NoReadSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            root = Path(directory)
+            mission = root / "mission.jsonl"
+            raw = root / "radar.bin"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=115200,
+                mission_log=mission,
+                mission_id="mission-1",
+                raw_capture=raw,
+                stop_requested=lambda: True,
+            )
+
+            self.assertEqual(stats.frames_decoded, 0)
+            index_lines = Path(stats.raw_index).read_bytes().splitlines()
+            footer = strict_json_loads(index_lines[-1])
+            self.assertEqual(footer["record_type"], "capture_end")
+            self.assertEqual(footer["stop_reason"], "stop_requested")
+            self.assertTrue(mission.is_file())
+
     def test_live_capture_writes_raw_frame_and_health_record(self):
         fake_serial_module = SimpleNamespace(Serial=FakeSerial)
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
@@ -106,6 +273,8 @@ class RadarCaptureTests(unittest.TestCase):
             self.assertEqual(stats.frames_decoded, 1)
             self.assertEqual(stats.points_decoded, 1)
             self.assertEqual(stats.point_cloud_frames, 1)
+            self.assertEqual(stats.empty_point_frames, 0)
+            self.assertEqual(stats.nonzero_padding_frames, 0)
             self.assertEqual(stats.parser_errors, 0)
             self.assertEqual(raw.read_bytes(), one_point_packet())
             self.assertEqual(stats.raw_index, f"{raw}.chunks.jsonl")
@@ -162,6 +331,273 @@ class RadarCaptureTests(unittest.TestCase):
                 "uncalibrated",
             )
             self.assertGreater(stats.max_timing_quality_metric_ns, 0)
+
+    def test_live_capture_persists_heatmap_and_health_counters(self):
+        fake_serial_module = SimpleNamespace(Serial=HeatmapFakeSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            root = Path(directory)
+            mission = root / "mission.jsonl"
+            raw = root / "radar.bin"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="sdk5504-heatmap-test",
+                boot_id="boot-1",
+                raw_capture=raw,
+                heatmap_azimuth_bins=4,
+                heatmap_range_bins=2,
+                heatmap_range_step_m=0.05,
+            )
+
+            self.assertEqual(stats.heatmap_frames, 1)
+            self.assertEqual(stats.major_heatmap_frames, 1)
+            self.assertEqual(stats.minor_heatmap_frames, 0)
+            self.assertEqual(stats.missing_heatmap_frames, 0)
+            self.assertEqual(stats.heatmap_cells_decoded, 8)
+            self.assertEqual(stats.heatmap_azimuth_bins, 4)
+            self.assertEqual(stats.heatmap_range_bins, 2)
+            self.assertEqual(stats.heatmap_range_step_m, 0.05)
+            records = [entry.record for entry in iter_mission_log(mission)]
+            self.assertEqual(records[0].heatmap.range_bins, 2)
+            self.assertEqual(records[0].heatmap.azimuth_bins, 4)
+            self.assertEqual(records[0].heatmap.range_step_m, 0.05)
+            self.assertEqual(records[-1].status, "ok")
+            self.assertIn("heatmap_frames=1", records[-1].detail)
+            self.assertIn("heatmap_cells_decoded=8", records[-1].detail)
+            self.assertIn("heatmap_expected=true", records[-1].detail)
+            self.assertIn("heatmap_azimuth_bins=4", records[-1].detail)
+            self.assertIn("heatmap_range_bins=2", records[-1].detail)
+            self.assertIn("heatmap_range_step_m=0.05", records[-1].detail)
+
+            index_lines = Path(stats.raw_index).read_bytes().splitlines()
+            index_record = strict_json_loads(index_lines[0])
+            footer = strict_json_loads(index_lines[1])
+            self.assertEqual(index_record["heatmap_azimuth_bins"], 4)
+            self.assertEqual(index_record["heatmap_range_bins"], 2)
+            self.assertEqual(index_record["heatmap_range_step_m"], 0.05)
+            self.assertEqual(footer["heatmap_azimuth_bins"], 4)
+            self.assertEqual(footer["heatmap_range_bins"], 2)
+            self.assertEqual(footer["heatmap_range_step_m"], 0.05)
+
+    def test_requested_but_missing_heatmap_degrades_health(self):
+        fake_serial_module = SimpleNamespace(Serial=FakeSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="sdk5504-heatmap-test",
+                boot_id="boot-1",
+                heatmap_azimuth_bins=4,
+                heatmap_range_bins=2,
+                heatmap_range_step_m=0.05,
+            )
+
+            health = list(iter_mission_log(mission))[-1].record
+            self.assertEqual(stats.heatmap_frames, 0)
+            self.assertEqual(stats.missing_heatmap_frames, 1)
+            self.assertEqual(health.status, "degraded")
+            self.assertIn("missing_heatmap_frames=1", health.detail)
+
+    def test_heatmap_capture_configuration_requires_all_dimensions(self):
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=Path("mission.jsonl"),
+                mission_id="mission-1",
+                heatmap_azimuth_bins=4,
+                heatmap_range_step_m=0.05,
+            )
+
+    def test_official_demo_elided_empty_frame_is_healthy_with_opt_in(self):
+        fake_serial_module = SimpleNamespace(
+            Serial=ElidedEmptyPointFakeSerial
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="lsdk-05.05.04.02-test",
+                boot_id="boot-1",
+                allow_elided_empty_point_tlv=True,
+            )
+
+            entries = list(iter_mission_log(mission))
+            radar = entries[0].record
+            health = entries[-1].record
+            self.assertEqual(stats.frames_decoded, 1)
+            self.assertEqual(stats.point_cloud_frames, 1)
+            self.assertEqual(stats.empty_point_frames, 1)
+            self.assertEqual(stats.missing_point_tlv_frames, 0)
+            self.assertEqual(radar.source_format, "ti-mmwave-empty")
+            self.assertEqual(radar.points, ())
+            self.assertEqual(health.status, "ok")
+
+    def test_mid_stream_attach_is_recorded_but_not_permanently_degraded(self):
+        fake_serial_module = SimpleNamespace(Serial=MidStreamAttachFakeSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="lsdk-05.05.04.02-test",
+                boot_id="boot-1",
+            )
+
+            health = list(iter_mission_log(mission))[-1].record
+            self.assertEqual(stats.frames_decoded, 1)
+            self.assertGreater(stats.parser_discarded_bytes, 0)
+            self.assertEqual(
+                stats.startup_sync_discarded_bytes,
+                stats.parser_discarded_bytes,
+            )
+            self.assertEqual(stats.post_sync_discarded_bytes, 0)
+            self.assertEqual(stats.post_sync_parse_errors, 0)
+            self.assertEqual(health.status, "ok")
+            self.assertEqual(health.parse_errors_total, 0)
+            self.assertIn(
+                "startup_sync_discarded_bytes=",
+                health.detail,
+            )
+
+    def test_periodic_startup_sync_does_not_latch_viewer_degraded(self):
+        fake_serial_module = SimpleNamespace(
+            Serial=DelayedMidStreamAttachFakeSerial
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="lsdk-05.05.04.02-test",
+                boot_id="boot-1",
+                health_interval_s=0.01,
+            )
+
+            records = [entry.record for entry in iter_mission_log(mission)]
+            health_records = [
+                record
+                for record in records
+                if type(record).__name__ == "SensorHealth"
+            ]
+            self.assertEqual(health_records[0].status, "starting")
+            self.assertEqual(health_records[0].parse_errors_total, 0)
+            self.assertEqual(health_records[-1].status, "ok")
+            self.assertEqual(stats.post_sync_discarded_bytes, 0)
+
+            state = RadarFrontState("follow")
+            for record in records:
+                state.ingest(record)
+            self.assertEqual(state.snapshot()["status"], "live")
+
+    def test_periodic_health_recovers_after_quiet_interval_without_erasing_gap(
+        self,
+    ):
+        fake_serial_module = SimpleNamespace(Serial=GapThenQuietFakeSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="lsdk-05.05.04.02-test",
+                boot_id="boot-1",
+                health_interval_s=0.01,
+            )
+
+            health_records = [
+                entry.record
+                for entry in iter_mission_log(mission)
+                if type(entry.record).__name__ == "SensorHealth"
+            ]
+            periodic = [
+                record
+                for record in health_records
+                if record.detail.startswith("health_kind=periodic")
+            ]
+            final = health_records[-1]
+            self.assertEqual(periodic[0].status, "degraded")
+            self.assertEqual(periodic[-1].status, "ok")
+            self.assertTrue(
+                all(item.seq_gaps_total == 1 for item in periodic)
+            )
+            self.assertEqual(final.status, "degraded")
+            self.assertEqual(final.seq_gaps_total, 1)
+
+    def test_post_sync_corruption_degrades_live_health(self):
+        fake_serial_module = SimpleNamespace(
+            Serial=PostSyncCorruptionFakeSerial
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="lsdk-05.05.04.02-test",
+                boot_id="boot-1",
+            )
+
+            health = list(iter_mission_log(mission))[-1].record
+            self.assertGreater(stats.post_sync_discarded_bytes, 0)
+            self.assertEqual(health.status, "degraded")
+
+    def test_nonzero_padding_compatibility_is_preserved_in_diagnostics(self):
+        fake_serial_module = SimpleNamespace(Serial=NonzeroPaddingFakeSerial)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            sys.modules,
+            {"serial": fake_serial_module},
+        ):
+            mission = Path(directory) / "mission.jsonl"
+            stats = capture_radar_uart(
+                port="COM_TEST",
+                baudrate=1_250_000,
+                mission_log=mission,
+                mission_id="mission-1",
+                profile_id="lsdk-05.05.04.02-test",
+                boot_id="boot-1",
+                allow_nonzero_padding=True,
+            )
+
+            health = list(iter_mission_log(mission))[-1].record
+            self.assertEqual(stats.nonzero_padding_frames, 1)
+            self.assertEqual(health.status, "ok")
+            self.assertIn("nonzero_padding_frames=1", health.detail)
 
     def test_frame_gap_handles_normal_sequence_gap_and_wrap(self):
         self.assertEqual(frame_gap(None, 10), 0)
@@ -247,7 +683,8 @@ class RadarCaptureTests(unittest.TestCase):
                 if type(entry.record).__name__ == "SensorHealth"
             ]
             self.assertGreaterEqual(len(health_records), 2)
-            self.assertEqual(health_records[0].status, "degraded")
+            self.assertEqual(health_records[0].status, "starting")
+            self.assertEqual(health_records[-1].status, "degraded")
             self.assertIn(
                 "health_kind=periodic",
                 health_records[0].detail,
