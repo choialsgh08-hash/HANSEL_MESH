@@ -1,28 +1,22 @@
 # Rescue Network (구조 요청 메시 네트워크)
 
 인터넷이 없는 재난 환경에서 조난자의 구조 요청을 수집하고, B.A.T.M.A.N.-adv
-메시망을 통해 구조대 서버로 전달하기 위한 시스템입니다. `HANSEL_MESH` 저장소의
-자가완결형 서브프로젝트(`rescue-network/`)로 존재합니다.
+메시망을 통해 구조대 서버로 전달하는 시스템이다.
 
-> **현재 상태: Phase 1–6 전체 구현됨** — 코어(구조 요청 앱·receiver·forwarder·대시보드),
-> systemd 배포, 조난자 AP, **기존 HANSEL 메시 재사용**, 그리고 선택 기능(자동 롤백·모니터링·
-> HMAC 인증·SSE·captive portal·유선 게이트웨이)까지 완료.
->
-> 처음이라면 아래 **[동작 원리](#동작-원리-구조와-원리)** → **[실행 순서](#실행-순서-한눈에)** 순서로 읽으세요.
+
 
 ## 프로젝트 목적
 
 1. 조난자가 스마트폰으로 현장 Raspberry Pi의 Wi-Fi AP에 접속한다.
 2. 브라우저에서 `http://192.168.10.1/` 를 열어 구조 요청 양식을 작성한다.
-3. 현장 노드가 요청을 **먼저 SQLite에 저장**한다.
+3. 현장 노드가 요청을 먼저 SQLite에 저장한다.
 4. 별도 전달 프로세스가 요청을 구조대 서버로 전송하고, 실패 시 재시도한다.
 5. 구조대 서버는 요청을 중복 없이 저장하고 대시보드로 확인한다.
 
 ## 네트워크 구조 (전체 목표)
 
-rescue-network는 **기존 HANSEL B.A.T.M.A.N.-adv 메시(bat0, 192.168.50.0/24)를 그대로
-재사용**합니다. 별도의 메시를 만들지 않습니다 — 메시 구성은 저장소 루트의
-`scripts/*mesh*.sh` + `configs/*.env`가 담당합니다.
+rescue-network는 기존 HANSEL B.A.T.M.A.N.-adv 메시(bat0, 192.168.50.0/24)를 그대로
+재사용한다. 메시 구성은 저장소 루트의 scripts/mesh.sh 와 configs/.env가 담당한다.
 
 ```text
 [스마트폰] --Wi-Fi AP(192.168.10.0/24)--> [field Pi]
@@ -34,16 +28,16 @@ rescue-network는 **기존 HANSEL B.A.T.M.A.N.-adv 메시(bat0, 192.168.50.0/24)
                                           [구조대 대시보드]
 ```
 
-**두 주소 대역을 혼동하지 마세요:**
+
 
 | 대역 | 용도 | 예시 |
 |---|---|---|
-| **AP 네트워크** | 스마트폰 ↔ 현장 Pi | `http://192.168.10.1/` (스마트폰 접속 주소) |
-| **bat0 메시 대역** | Pi ↔ Pi (기존 HANSEL 메시) | `192.168.50.1:8080` (내부 전달 주소) |
+| AP 네트워크 | 스마트폰 ↔ 현장 Pi | http://192.168.10.1 (스마트폰 접속 주소) |
+| bat0 메시 | Pi ↔ Pi (기존 HANSEL 메시) | 192.168.50.1:8080 (내부 전달 주소) |
 
-`192.168.50.1` 은 스마트폰 접속 주소가 **아닙니다** — 메시망 내부(구조대 노드) 주소입니다.
+<br>
 
-## 노드 역할 (`NODE_ROLE`)
+## 노드 역할 
 
 | 역할 | 실행하는 것 |
 |---|---|
@@ -51,22 +45,20 @@ rescue-network는 **기존 HANSEL B.A.T.M.A.N.-adv 메시(bat0, 192.168.50.0/24)
 | `relay` | BATMAN-adv 중계만 (웹/HTTP 중계 서버 없음) |
 | `receiver` | 수신 API · SQLite(중복 제거) · 대시보드 · BATMAN-adv |
 
-중간 노드는 Layer 2 프레임만 전달하며, HTTP 중계 애플리케이션을 두지 않습니다.
+중간 노드는 Layer 2 프레임만 전달하며, HTTP 중계 애플리케이션을 두지 않는다. ROS 통합을 위해 노드 개념으로 정리함.
 
----
+<br>
 
 ## 동작 원리 (구조와 원리)
 
-### 한 문장 요약
+### 요약
 
-> 조난자는 **현장 노드(field)** 의 웹 폼에 구조 요청을 쓴다 → 현장 노드는 그것을
-> **자기 SQLite에 먼저 저장**한다 → **별도의 forwarder 프로세스**가 그 요청을
-> 메시망 너머 **구조대 노드(receiver)** 로 HTTP POST 한다 → receiver는 **중복 없이
-> 저장**하고 ACK를 돌려준다 → 구조대는 **대시보드**로 실시간 확인한다.
+1. 조난자가 웹 폼에 구조 요청 작성 
+2. 현장 노드는 그것을 자기 SQLite에 저장
+3. forwarder 프로세스가 구조 요청을 메시망 너머 구조대 노드(receiver)로 전달
+4. receiver는 중복 없이 저장*하고 ACK를 돌려준다. 구조대는 대시보드로 들어오는 요청을 실시간 확인한다.
 
-핵심 설계 원칙은 **"저장 우선, 전달은 나중에"(store-and-forward)** 입니다. 재난
-환경의 무선 링크는 자주 끊기므로, 요청을 받는 즉시 로컬에 안전하게 적어두고,
-네트워크 전달은 실패해도 사라지지 않도록 재시도로 분리했습니다.
+store-and-forward 방식으로 설계했다. 재난환경의 무선 링크는 자주 끊기므로, 요청을 받는 즉시 로컬에 안전하게 적어둔다. 네트워크 전달 시스템과는 분리했다.
 
 ### 컴포넌트 지도
 
@@ -79,23 +71,23 @@ rescue-network는 **기존 HANSEL B.A.T.M.A.N.-adv 메시(bat0, 192.168.50.0/24)
          │   rescue_service ─▶ rescue_repository ─▶ [ field.db (SQLite/WAL) ]  │
          │                         ▲  같은 파일 공유  │                        │
          └─────────────────────────┼─────────────────┼────────────────────────┘
-                                   │                  │ HTTP POST (bat0 경유)
-                                   │                  │  X-Rescue-Token 헤더
-                                   │                  ▼
-         ┌──────────────── receiver 노드 (구조대) ─────────────────────┐
-         │   receiver_app.py (FastAPI)                                  │
- 구조대  │   POST /api/rescue/receive ─▶ receiver_service(멱등)         │
+                                   │                 │ HTTP POST (bat0 경유)
+                                   │                 │  X-Rescue-Token 헤더
+                                   │                 ▼
+         ┌──────────────── receiver 노드 (구조대) ───────────────────────────┐
+         │   receiver_app.py (FastAPI)                                     │
+ 구조대   │   POST /api/rescue/receive ─▶ receiver_service                 │
  브라우저─┼─▶ GET /dashboard  ◀─ GET /api/received ─▶ received_repository │
-         │                                     │                        │
-         │                                     ▼                        │
-         │                            [ receiver.db (request_id UNIQUE) ]│
-         └──────────────────────────────────────────────────────────────┘
+         │                                     │                           │
+         │                                     ▼                           │
+         │                            [ receiver.db (request_id UNIQUE) ]  │
+         └─────────────────────────────────────────────────────────────────┘
 ```
 
-`relay` 노드는 이 그림에 **애플리케이션이 없습니다**. 기존 HANSEL 메시가 올라와
+relay 노드는 이 그림에 포함시키지 않았다. 기존 HANSEL 메시가 올라와
 있으면 Linux 라우팅 + B.A.T.M.A.N.-adv가 field↔receiver 사이의 Layer 2 프레임을 옮기고,
 앱은 그저 `RECEIVER_URL`(`192.168.50.1:8080`)로 HTTP를 쏘면 커널이 경로를 정합니다.
-**rescue-network는 메시를 만들지 않고, 이미 도는 메시 위에 얹힙니다.**
+
 
 ### 코드 계층 (책임 분리)
 
@@ -116,46 +108,21 @@ rescue-network는 **기존 HANSEL B.A.T.M.A.N.-adv 메시(bat0, 192.168.50.0/24)
 | 전달 루프 | `forwarder.py` | 폴링·복구·프로세스 수명(`python -m rescue_network.forwarder`) |
 | 인증 | `security.py` | 공유 토큰 상수시간 비교 |
 
-### 구조 요청의 일생 (delivery_status 상태 기계)
+### 구조 요청 state machine (delivery_status state machine)
 
 한 요청은 현장 노드 DB 안에서 다음 상태를 오갑니다.
 
-```text
-  POST /api/rescue
-        │  (로컬 저장 성공 = 조난자에게 즉시 "접수됨" 응답)
-        ▼
-    ┌─────────┐  forwarder가 집음      ┌─────────┐   유효한 ACK    ┌───────────┐
-    │ pending │ ─────────────────────▶ │ sending │ ──────────────▶ │ delivered │ (끝)
-    └─────────┘                        └─────────┘                 └───────────┘
-        ▲                                   │
-        │  네트워크·timeout·5xx·인증오류     │  잘못된 데이터로 인한 4xx(400/422 등)
-        │  (retry_count++, backoff 후 재시도) │
-        └───────────────────────────────────┤
-                                            ▼
-                                       ┌────────┐
-                                       │ failed │ (영구 실패, 더 재시도 안 함)
-                                       └────────┘
+pending — 저장됨, 아직 안 보냄 <br>
+sending — 지금 보내는 중<br>
+delivered — 성공 (구조대가 받음)<br>
+failed — 영구 실패 (재시도 무의미)<br>
 
-    프로세스가 sending 도중 죽으면? → stale_sending_seconds 경과 후 pending으로 자동 복구
-```
 
-- **pending → 즉시 응답:** 로컬 저장만 성공하면 전달 성공 여부와 무관하게
-  조난자에게 접수 응답을 돌려줍니다. (재난 상황에서 사용자 대기 최소화)
-- **재시도:** exponential backoff — 초기 5초, 2배씩 증가, 최대 5분, ±20% jitter,
-  **무한 재시도**. 계산은 `retry.py`의 순수 함수라 단위 테스트가 결정적입니다.
-- **영구 실패 판정:** "네트워크/일시적"인가 "데이터가 잘못됐나"로 나눕니다.
-  네트워크·timeout·5xx·`401/403/408/429`는 재시도, 그 밖의 4xx(잘못된 본문)는
-  `failed`. 재시도해도 소용없는 요청만 버려 구조 요청 유실을 최소화합니다.
-- **크래시 복구:** `sending`은 전송 시작을 뜻하며 **HTTP 호출 전에 커밋**됩니다.
-  forwarder가 그 사이 죽으면 행이 `sending`으로 남고, 다음 패스에서
-  `stale_sending_seconds`(기본 120초)가 지난 것을 `pending`으로 되돌립니다.
+### 중복 없이 저장
 
-### 중복 없이 저장 (멱등성)
+같은 요청이 두 번 도착할 수 있기에, receiver는 이를 안전하게 처리한다.
 
-같은 요청이 두 번 도착할 수 있습니다(예: ACK가 유실되어 forwarder가 재전송).
-receiver는 이를 안전하게 처리합니다.
-
-1. `received_rescue_requests.request_id`에 **UNIQUE 제약**을 겁니다(근본 방어선).
+1. `received_rescue_requests.request_id`에 **UNIQUE 제약**을 건다.
 2. `receiver_service.store_received()`는 먼저 조회 → 있으면 `duplicate=true`로
    기존 행 반환, 없으면 삽입. 경합으로 삽입이 충돌하면 `IntegrityError`를 잡아
    역시 중복으로 처리합니다.
@@ -187,8 +154,7 @@ field 노드에서는 웹 서버와 forwarder **두 프로세스가 같은 `fiel
 Python 3.11+ (권장) · FastAPI · Uvicorn · SQLAlchemy 2.x · Pydantic 2.x ·
 SQLite · httpx · Jinja2 · Vanilla JS · pytest · Ruff · systemd · Bash.
 
-> 개발 박스에 3.10만 있는 경우에도 동작하도록 `requires-python`은 `>=3.10`으로
-> 두었습니다. 운영은 3.11+를 권장합니다.
+개발 박스에 3.10만 있는 경우에도 동작하도록 `requires-python`은 `>=3.10`으로 두었습니다. 운영은 3.11+를 권장합니다.
 
 ---
 
@@ -212,8 +178,6 @@ network-online.target
    └▶ (relay)    rescue 서비스 없음 — 기존 HANSEL 메시(hansel-mesh@)만 실행
 ```
 
-> 전제: 세 역할 모두 **기존 HANSEL 메시(bat0)가 이미 올라와 있어야** 전달이 됩니다.
-> 메시 자체는 저장소 루트의 `scripts/*mesh*.sh`로 구성합니다(rescue-network 범위 밖).
 
 구체적 명령은 아래 [개발 환경 실행](#개발-환경-실행-방법) /
 [receiver·forwarder 실행](#receiver--forwarder-실행-방법-phase-2) /
@@ -664,11 +628,3 @@ rescue-network/
 # 메시 bring-up은 rescue 범위 밖 — 저장소 루트의 scripts/*mesh*.sh 사용
 ```
 
-## 로드맵
-
-- **Phase 1 ✅** 로컬 구조 요청 앱
-- **Phase 2 ✅** receiver API + 중복 제거 + forwarder(재시도) + 대시보드
-- **Phase 3 ✅** systemd 배포 (field-web / forwarder / receiver)
-- **Phase 4 ✅** 조난자 AP (hostapd/dnsmasq, dry-run·백업·rollback)
-- **Phase 5 ✅** 기존 HANSEL B.A.T.M.A.N.-adv 메시 재사용 + 종단 간 전달 검증
-- **Phase 6 ✅** 선택 기능: 자동 롤백·모니터링/알림·HMAC 인증·SSE 실시간·captive portal·유선 게이트웨이
