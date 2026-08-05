@@ -91,6 +91,167 @@ test("drops a track at the exact 300ms freshness boundary", () => {
   assert.deepEqual(sceneApi.filterFreshTracks(tracks), [{ track_id: 1, age_ms: 299 }]);
 });
 
+test("separates confirmed obstacles from reflection evidence", () => {
+  const obstacle = {
+    track_id: 1,
+    age_ms: 0,
+    source: "point",
+    point_confirmed: true,
+    classification: "confirmed_obstacle",
+    distance_m: 0.4,
+    forward_m: 0.4,
+    lateral_m: 0,
+  };
+  const reflection = {
+    track_id: 2,
+    age_ms: 0,
+    source: "heatmap",
+    point_confirmed: false,
+    classification: "reflection_evidence",
+    distance_m: 0.6,
+    forward_m: 0.6,
+    lateral_m: 0.1,
+  };
+  const parsed = sceneApi.parseRadarScene(makeSnapshot({
+    scene: {
+      tracks: [obstacle, reflection],
+      obstacle_tracks: [obstacle],
+      reference_tracks: [reflection],
+    },
+  }));
+
+  assert.deepEqual(parsed.tracks.map((track) => track.track_id), [1]);
+  assert.deepEqual(parsed.referenceTracks.map((track) => track.track_id), [2]);
+});
+
+test("preserves the one-centimeter planned path and motion estimate", () => {
+  const snapshot = makeSnapshot({
+    scene: {
+      planned_path: {
+        status: "limited",
+        resolution_m: 0.01,
+        length_m: 0.02,
+        points: [[0, 0], [0.01, 0], [0.02, 0.001]],
+      },
+      motion_compensation: {
+        status: "ok",
+        applied: true,
+        matched_points: 5,
+      },
+    },
+  });
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.equal(parsed.plannedPath.resolution_m, 0.01);
+  assert.equal(parsed.plannedPath.points.length, 3);
+  assert.equal(parsed.motionCompensation.applied, true);
+  assert.equal(parsed.motionCompensation.matched_points, 5);
+});
+
+test("rejects a planned path that is not sampled at one centimeter", () => {
+  assert.throws(
+    () => sceneApi.parseRadarScene(makeSnapshot({
+      scene: {
+        planned_path: {
+          status: "clear",
+          resolution_m: 0.05,
+          length_m: 1,
+          points: [[0, 0], [0.05, 0]],
+        },
+      },
+    })),
+    /planned path contract/,
+  );
+});
+
+test("preserves five-second accumulated strong obstacles", () => {
+  const obstacle = {
+    obstacle_id: 3,
+    forward_m: 0.7,
+    lateral_m: -0.2,
+    confidence: 0.9,
+    age_ms: 1200,
+    remaining_ms: 3800,
+  };
+  const parsed = sceneApi.parseRadarScene(makeSnapshot({
+    scene: {
+      accumulated_obstacles: [obstacle],
+      obstacle_memory_window_ms: 5000,
+    },
+  }));
+
+  assert.deepEqual(parsed.accumulatedObstacles, [obstacle]);
+  assert.equal(parsed.obstacleMemoryWindowMs, 5000);
+});
+
+test("prefers motion-relative persistent near obstacles for display", () => {
+  const persistent = {
+    forward_m: 0.35,
+    lateral_m: 0.1,
+    confidence: 0.91,
+    age_ms: 900,
+    remaining_ms: 4100,
+  };
+  const parsed = sceneApi.parseRadarScene(makeSnapshot({
+    scene: {
+      accumulated_obstacles: [],
+      persistent_near_obstacles: [persistent],
+      persistent_near_obstacle_memory: { window_ms: 5000 },
+    },
+  }));
+
+  assert.deepEqual(parsed.accumulatedObstacles, [persistent]);
+  assert.equal(parsed.obstacleMemoryWindowMs, 5000);
+});
+
+test("preserves the robot-centred fifty-centimeter rolling map", () => {
+  const behindRobot = {
+    forward_m: -0.20,
+    lateral_m: 0.10,
+    distance_m: Math.hypot(0.20, 0.10),
+    confidence: 0.95,
+    hits: 4,
+    age_ms: 60_000,
+  };
+  const parsed = sceneApi.parseRadarScene(makeSnapshot({
+    scene: {
+      rolling_local_map: {
+        radius_m: 0.50,
+        resolution_m: 0.005,
+        minimum_hits: 2,
+        motion_relative: true,
+        retention: "until_outside_radius_or_scene_reset",
+        cells: [behindRobot],
+      },
+    },
+  }));
+
+  assert.deepEqual(parsed.rollingMapObstacles, [behindRobot]);
+  assert.equal(parsed.rollingMap.radiusM, 0.50);
+  assert.equal(parsed.rollingMap.motionRelative, true);
+});
+
+test("preserves the radar-motion travel trail ending at robot center", () => {
+  const parsed = sceneApi.parseRadarScene(makeSnapshot({
+    scene: {
+      travel_trail: {
+        radius_m: 0.50,
+        resolution_m: 0.01,
+        motion_relative: true,
+        source: "radar_ego_motion",
+        points: [[-0.20, 0.04], [-0.10, 0.02], [0, 0]],
+      },
+    },
+  }));
+
+  assert.deepEqual(
+    parsed.travelTrail.points,
+    [[-0.20, 0.04], [-0.10, 0.02], [0, 0]],
+  );
+  assert.equal(parsed.travelTrail.source, "radar_ego_motion");
+});
+
 test("normal preserves uncertainty without safe or free surface claims", () => {
   const parsed = sceneApi.parseRadarScene(makeSnapshot());
 

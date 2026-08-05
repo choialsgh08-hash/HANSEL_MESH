@@ -161,7 +161,9 @@ function makeHarness() {
     "raw-point-value",
     "confirmed-track-value",
     "clutter-rejected-value",
-    "heatmap-rejected-value",
+    "heatmap-candidate-value",
+    "heatmap-cluster-value",
+    "reflection-value",
     "grid-status-value",
     "scene-hazard-value",
     "axis-warning",
@@ -281,6 +283,38 @@ function makeHarness() {
     contexts: [mainContext, collisionContext],
   };
 }
+
+test("main rolling-map transform keeps the radar at circle center", () => {
+  const harness = makeHarness();
+  const transform = harness.panel.makeCircularViewportTransform(
+    600,
+    500,
+    0.5,
+    { top: 50, right: 25, bottom: 50, left: 25 },
+  );
+
+  assert.equal(transform.originX, 300);
+  assert.equal(transform.originY, 250);
+  assert.equal(transform.scale, 400);
+  assert.equal(transform.centeredCircle, true);
+});
+
+test("3d point cloud uses live height and filters beyond fifty centimeters", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[0];
+
+  panel.drawPointCloud3d(context, 360, 260, {
+    points: [
+      [0.30, 0.10, 0.10, 0, 24],
+      [0.60, 0.00, 0.00, 0, 30],
+      [0.20, 0.00, null, 0, 20],
+    ],
+  });
+
+  assert.ok(context.fillTextCalls.some(
+    (entry) => entry[0] === "XYZ 1 POINTS · DRAG TO ROTATE",
+  ));
+});
 
 test("live point tracks render their distance label without a rendering error", () => {
   const { panel, contexts } = makeHarness();
@@ -454,7 +488,9 @@ test("every blocked reason replaces stale live metrics and sectors with sensor f
         "#raw-point-value",
         "#confirmed-track-value",
         "#clutter-rejected-value",
-        "#heatmap-rejected-value",
+        "#heatmap-candidate-value",
+        "#heatmap-cluster-value",
+        "#reflection-value",
       ]) {
         assert.equal(
           elements.get(selector).textContent,

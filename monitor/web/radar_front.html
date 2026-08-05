@@ -292,6 +292,52 @@
         background: #020608;
       }
 
+      #pointcloud-3d-panel {
+        position: absolute;
+        z-index: 5;
+        top: 310px;
+        right: 12px;
+        width: min(350px, 36%);
+        min-width: 260px;
+        height: 286px;
+        padding: 9px;
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        gap: 7px;
+        border: 2px solid rgba(73, 168, 255, 0.55);
+        background: rgba(3, 10, 16, 0.96);
+        box-shadow: 0 8px 28px rgba(0, 0, 0, 0.54);
+      }
+
+      #pointcloud-3d-panel header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 12px;
+      }
+
+      #pointcloud-3d-status {
+        color: #89cdff;
+        font: 750 10px/1 ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+
+      #pointcloud-3d-canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        border: 1px solid rgba(73, 168, 255, 0.22);
+        background: #020609;
+        touch-action: none;
+        cursor: grab;
+      }
+
+      #pointcloud-3d-canvas:active {
+        cursor: grabbing;
+      }
+
       .sector-strip {
         position: absolute;
         z-index: 4;
@@ -518,6 +564,11 @@
         height: min(330px, 38vh);
       }
 
+      #radar-panel:fullscreen #pointcloud-3d-panel {
+        width: min(390px, 32vw);
+        height: min(330px, 38vh);
+      }
+
       @media (max-width: 980px) {
         .shell {
           grid-template-rows: auto auto auto auto;
@@ -566,7 +617,7 @@
         .radar-stage {
           min-height: 0;
           display: grid;
-          grid-template-rows: 470px 236px auto;
+          grid-template-rows: 470px 236px 286px auto;
           gap: 8px;
           padding-bottom: 8px;
           overflow: visible;
@@ -592,6 +643,15 @@
           margin: 0 8px;
         }
 
+        #pointcloud-3d-panel {
+          position: relative;
+          inset: auto;
+          width: calc(100% - 16px);
+          min-width: 0;
+          height: 286px;
+          margin: 0 8px;
+        }
+
         .sector-strip {
           position: relative;
           inset: auto;
@@ -614,6 +674,14 @@
         #radar-panel:fullscreen #collision-inset {
           position: absolute;
           inset: 10px 10px auto auto;
+          width: min(330px, calc(100% - 20px));
+          height: min(230px, 34vh);
+          margin: 0;
+        }
+
+        #radar-panel:fullscreen #pointcloud-3d-panel {
+          position: absolute;
+          inset: auto 10px 10px auto;
           width: min(330px, calc(100% - 20px));
           height: min(230px, 34vh);
           margin: 0;
@@ -645,7 +713,7 @@
       <header class="page-header">
         <div class="brand">
           <p class="eyebrow">HANSEL MESH / RADAR OPERATOR VIEW</p>
-          <h1>0~3m LiDAR형 전방 점유 지도</h1>
+          <h1>반지름 50cm 원형 롤링 지도</h1>
           <p class="subtitle">
             측정된 반사 증거만 표시 · UNKNOWN ≠ FREE · 카메라 영상 및 SLAM 아님
           </p>
@@ -664,19 +732,27 @@
         <div class="radar-stage" id="radar-panel">
           <canvas
             id="radar-main-canvas"
-            aria-label="전방 0~3미터 LiDAR형 레이더 점유 지도"
+            aria-label="레이더 중심 반지름 50센티미터 원형 롤링 지도"
           ></canvas>
 
           <div class="stage-tags">
-            <span class="tag">0~3m FORWARD MAP</span>
-            <span class="tag">ROBOT RELATIVE</span>
+            <span class="tag">50cm ROLLING CIRCLE</span>
+            <span class="tag">RADAR AT CENTER</span>
+            <span class="tag">AZIMUTH ONLY</span>
             <span class="tag">5cm OCCUPANCY</span>
             <span class="tag">UNKNOWN ≠ FREE</span>
-            <span class="tag" id="build-tag">UI R10</span>
+            <span class="tag">1cm PATH</span>
+            <span class="tag">BLUE = TRAVEL TRAIL</span>
+            <span class="tag">MIN GAP 15cm</span>
+            <span class="tag">1s REACTIVE MAP</span>
+            <span class="tag">RETAIN UNTIL OUTSIDE</span>
+            <span class="tag">±60° TRUSTED FOV</span>
+            <span class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>
+            <span class="tag" id="build-tag">UI R31</span>
             <span class="tag" id="axis-warning">장착축/보정 확인</span>
           </div>
 
-          <section id="collision-inset" data-hazard="UNKNOWN">
+          <section id="collision-inset" data-hazard="UNKNOWN" hidden>
             <header>
               <strong>0~50cm 충돌 확대</strong>
               <span id="collision-distance">-- cm</span>
@@ -684,6 +760,17 @@
             <canvas
               id="collision-canvas"
               aria-label="전방 0~50센티미터 충돌 확대 지도"
+            ></canvas>
+          </section>
+
+          <section id="pointcloud-3d-panel">
+            <header>
+              <strong>3D POINT CLOUD · 0~50cm</strong>
+              <span id="pointcloud-3d-status">XYZ LIVE</span>
+            </header>
+            <canvas
+              id="pointcloud-3d-canvas"
+              aria-label="레이더 좌우 전후 상하 3차원 포인트 클라우드"
             ></canvas>
           </section>
 
@@ -737,7 +824,7 @@
               </div>
               <div>
                 <span class="swatch point"></span>
-                <span>선명한 원: point track · z는 실측값만</span>
+                <span>선명한 원: point track · 높이 제외, 좌우각만 사용</span>
               </div>
               <div>
                 <span class="swatch danger"></span>
@@ -753,6 +840,9 @@
               <dt>프로필</dt><dd id="profile-value">--</dd>
               <dt>보정 상태</dt><dd id="calibration-value">--</dd>
               <dt>Pose 모드</dt><dd id="pose-mode-value">ROBOT RELATIVE</dd>
+              <dt>이동 보정</dt><dd id="motion-status-value">--</dd>
+              <dt>계획 경로</dt><dd id="path-status-value">--</dd>
+              <dt>경로 신뢰도</dt><dd id="path-confidence-value">--</dd>
               <dt>프레임</dt><dd id="frame-value">--</dd>
               <dt>프레임 누락</dt><dd id="gap-value">--</dd>
             </dl>
@@ -764,7 +854,11 @@
               <dt>Raw point</dt><dd id="raw-point-value">--</dd>
               <dt>확인 track</dt><dd id="confirmed-track-value">--</dd>
               <dt>Clutter 제거</dt><dd id="clutter-rejected-value">--</dd>
-              <dt>Heatmap 제거</dt><dd id="heatmap-rejected-value">--</dd>
+              <dt>Heatmap 후보 셀</dt><dd id="heatmap-candidate-value">--</dd>
+              <dt>Heatmap cluster</dt><dd id="heatmap-cluster-value">--</dd>
+              <dt>Reflection evidence</dt><dd id="reflection-value">--</dd>
+              <dt>원형 누적 장애물</dt><dd id="obstacle-memory-value">--</dd>
+              <dt>안정 점유 셀</dt><dd id="stable-cell-value">--</dd>
               <dt>Grid decode</dt><dd id="grid-status-value">대기</dd>
               <dt>Scene hazard</dt><dd id="scene-hazard-value">UNKNOWN</dd>
             </dl>
@@ -785,7 +879,7 @@
       <footer>
         <span>
           <strong>안전:</strong>
-          10cm 이내 확인 장애물 없음 · 미관측 영역 존재
+          <span id="safety-footer-text">10cm 이내 확인 장애물 없음 · 미관측 영역 존재</span>
         </span>
         <span>
           현재 로봇 상대 지도 · track 최대 300ms · UNKNOWN은 FREE/SAFE가 아님
@@ -793,8 +887,8 @@
       </footer>
     </main>
 
-    <script src="/radar_scene.js?v=20260729-lidar-operator-r10"></script>
-    <script src="/radar_panel.js?v=20260729-lidar-operator-r10"></script>
+    <script src="/radar_scene.js?v=20260802-xyz-pointcloud-r31"></script>
+    <script src="/radar_panel.js?v=20260802-xyz-pointcloud-r31"></script>
     <script>
       const panel = new window.HanselRadarPanel(
         document.querySelector("#radar-panel"),

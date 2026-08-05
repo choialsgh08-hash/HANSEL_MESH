@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import base64
+import heapq
 import math
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from common.radar_geometry import RadarAxes
 from common.sensor_contract import RadarFrame
@@ -13,6 +14,7 @@ from sensors.radar_calibration import RadarClutterModel
 
 
 SCENE_SCHEMA_VERSION = 1
+SCENE_PROJECTION_MODE = "range_azimuth_2d"
 GRID_RESOLUTION_M = 0.05
 GRID_FORWARD_CELLS = 60
 GRID_LATERAL_CELLS = 60
@@ -20,11 +22,79 @@ GRID_ORIGIN_FORWARD_CELL = 0
 GRID_ORIGIN_LATERAL_CELL = 30
 SCENE_MAX_FORWARD_M = 3.0
 SCENE_HALF_WIDTH_M = 1.5
+MOTION_MAX_TRANSLATION_M = 0.08
+MOTION_MAX_YAW_DEG = 8
+MOTION_TRANSLATION_BIN_M = 0.005
+MOTION_ASSOCIATION_M = 0.16
+MOTION_MIN_MATCHES = 3
+MOTION_MIN_MATCH_RATIO = 0.45
+MOTION_MAX_RMSE_M = 0.09
+MOTION_STABILITY_TRANSLATION_M = 0.05
+MOTION_STABILITY_YAW_DEG = 2.0
+PATH_RESOLUTION_M = 0.01
+PATH_MAX_LENGTH_M = 3.0
+PATH_ROBOT_WIDTH_M = 0.15
+PATH_SAFETY_MARGIN_M = 0.03
+PATH_NEAR_FIELD_EXCLUSION_M = 0.12
+PATH_GOAL_LATERAL_M = 0.0
+PATH_GOAL_WEIGHT = 0.8
+PATH_SEARCH_STEP_M = 0.05
+PATH_SEARCH_GRID_M = 0.025
+PATH_COLLISION_GRID_M = 0.025
+PATH_HEADING_BINS = 36
+PATH_HEADING_STEP_RAD = 2.0 * math.pi / PATH_HEADING_BINS
+PATH_CURVATURES = (
+    -2.0 * PATH_HEADING_STEP_RAD / PATH_SEARCH_STEP_M,
+    0.0,
+    2.0 * PATH_HEADING_STEP_RAD / PATH_SEARCH_STEP_M,
+)
+PATH_LOCAL_MAX_RANGE_M = 0.60
+PATH_FOV_AZIMUTH_DEG = 60.0
+PATH_SEARCH_MAX_ARC_M = 1.20
+PATH_SEARCH_MAX_EXPANSIONS = 12_000
+PATH_GOAL_FORWARD_M = 0.55
+PATH_DYNAMIC_GOAL_RANGE_M = 0.50
+PATH_DYNAMIC_GOAL_TOLERANCE_M = 0.04
+NEAR_OCCUPANCY_RESOLUTION_M = 0.025
+NEAR_OCCUPANCY_TTL_NS = 1_000_000_000
+NEAR_POINT_MIN_CONFIDENCE = 0.50
+NEAR_POINT_REACTIVE_MIN_CONFIDENCE = 0.85
+NEAR_HEATMAP_MIN_CONFIDENCE = 0.85
+STABLE_OCCUPANCY_RESOLUTION_M = 0.05
+STABLE_OCCUPANCY_WALL_LINK_M = 0.18
+OBSTACLE_CLUSTER_LINK_M = 0.10
+OBSTACLE_CLUSTER_CROSS_SOURCE_LINK_M = 0.075
+OBSTACLE_CLUSTER_MAX_AZIMUTH_DELTA_DEG = 25.0
+OBSTACLE_CLUSTER_MAX_RANGE_DELTA_M = 0.10
+STABLE_OCCUPANCY_MIN_HITS = 2
+STABLE_OCCUPANCY_TTL_NS = 5_000_000_000
+ROLLING_MAP_RADIUS_M = 0.50
+ROLLING_MAP_RESOLUTION_M = 0.005
+ROLLING_MAP_MIN_HITS = 2
+TRAVEL_TRAIL_RESOLUTION_M = 0.01
+ACCUMULATED_OBSTACLE_TTL_S = 5.0
+ACCUMULATED_OBSTACLE_TTL_NS = 5_000_000_000
+ACCUMULATED_POINT_MIN_CONFIDENCE = 0.70
+ACCUMULATED_HEATMAP_MIN_CONFIDENCE = 0.85
+ACCUMULATED_HEATMAP_MIN_PEAK_DB = 12.0
+ACCUMULATED_OBSTACLE_ASSOCIATION_M = 0.22
 TRACK_ASSOCIATION_M = 0.18
 TRACK_TTL_S = 0.300
 TRACK_TTL_NS = 300_000_000
-HEATMAP_MIN_RESIDUAL_DB = 6.0
-HEATMAP_MAD_MULTIPLIER = 4.0
+HEATMAP_ENTER_MIN_RESIDUAL_DB = 8.0
+HEATMAP_EXIT_MIN_RESIDUAL_DB = 5.0
+HEATMAP_ENTER_MAD_MULTIPLIER = 5.0
+HEATMAP_EXIT_MAD_MULTIPLIER = 3.0
+HEATMAP_SINGLE_CELL_PEAK_DB = 16.0
+HEATMAP_TRACK_ASSOCIATION_M = 0.24
+HEATMAP_POINT_ASSOCIATION_M = 0.25
+HEATMAP_CONFIRM_HITS = 3
+HEATMAP_POINT_CONFIRM_HITS = 2
+HEATMAP_HISTORY_FRAMES = 5
+HEATMAP_MAX_POSITION_JITTER_M = 0.15
+HEATMAP_MAX_CLUSTER_RADIUS_M = 0.30
+HEATMAP_MAX_RANGE_UNCERTAINTY_M = 0.20
+HEATMAP_MAX_CLUSTERS_PER_FRAME = 64
 DANGER_ENTER_M = 0.10
 DANGER_EXIT_M = 0.13
 FAULT_SOURCE_STATUSES = {
@@ -178,9 +248,30 @@ class RadarSceneEstimator:
         self._scene_point_count = 0
         self._clutter_points_rejected = 0
         self._heatmap_cells_accepted = 0
+        self._heatmap_candidate_cells = 0
+        self._heatmap_cluster_count = 0
+        self._heatmap_reflection_count = 0
+        self._heatmap_confirmed_count = 0
         self._hazard_evaluator = RadarHazardEvaluator()
         self._producer_id: Optional[str] = None
         self._last_reset_reason: Optional[str] = None
+        self._previous_point_positions: List[Tuple[float, float]] = []
+        self._motion_candidates: List[Dict[str, object]] = []
+        self._motion: Dict[str, object] = self._empty_motion("initializing")
+        self._accumulated_obstacles: List[Dict[str, object]] = []
+        self._next_accumulated_obstacle_id = 1
+        self._stable_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
+        self._near_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
+        self._rolling_map_cells: Dict[
+            Tuple[int, int], Dict[str, object]
+        ] = {}
+        self._travel_trail: List[Tuple[float, float]] = [(0.0, 0.0)]
+        self._selected_path_curvature: Optional[float] = None
+        self._selected_path_since_ns = 0
+        self._pending_path_curvature: Optional[float] = None
+        self._pending_path_hits = 0
+        self._planned_path: Optional[Dict[str, object]] = None
+        self._path_stability_status = "initializing"
 
     def reset(self, reason: str) -> None:
         self._clear_evidence(reason)
@@ -193,6 +284,25 @@ class RadarSceneEstimator:
         self._scene_point_count = 0
         self._clutter_points_rejected = 0
         self._heatmap_cells_accepted = 0
+        self._heatmap_candidate_cells = 0
+        self._heatmap_cluster_count = 0
+        self._heatmap_reflection_count = 0
+        self._heatmap_confirmed_count = 0
+        self._previous_point_positions = []
+        self._motion_candidates = []
+        self._motion = self._empty_motion("reset")
+        self._accumulated_obstacles = []
+        self._next_accumulated_obstacle_id = 1
+        self._stable_cells = {}
+        self._near_cells = {}
+        self._rolling_map_cells = {}
+        self._travel_trail = [(0.0, 0.0)]
+        self._selected_path_curvature = None
+        self._selected_path_since_ns = 0
+        self._pending_path_curvature = None
+        self._pending_path_hits = 0
+        self._planned_path = None
+        self._path_stability_status = "reset"
         self._last_reset_reason = reason
 
     def ingest(
@@ -220,21 +330,8 @@ class RadarSceneEstimator:
             self._clear_evidence(self._calibration_status)
             return
         self._expire_tracks(now)
-        elapsed_frame_windows = min(
-            3,
-            frame.dropped_frames_since_previous + 1,
-        )
-        for track in self._tracks:
-            hits = track["_point_hits"]
-            assert isinstance(hits, list)
-            hits.extend([False] * elapsed_frame_windows)
-            del hits[:-3]
-            track["point_confirmed"] = sum(hits) >= 2
-            track["_updated_by_point"] = False
-        point_count = 0
+        accepted_points: List[Tuple[object, float, float]] = []
         rejected = 0
-        heatmap_count = 0
-
         for point in frame.points:
             forward_m, lateral_m = self.axes.map_point(point)
             if not self._in_scene(forward_m, lateral_m):
@@ -250,15 +347,71 @@ class RadarSceneEstimator:
             ):
                 rejected += 1
                 continue
+            accepted_points.append((point, forward_m, lateral_m))
+
+        current_point_positions = [
+            (forward_m, lateral_m)
+            for _, forward_m, lateral_m in accepted_points
+        ]
+        self._motion = self._stabilize_motion(
+            self._estimate_ego_motion(
+                self._previous_point_positions,
+                current_point_positions,
+            )
+        )
+        if bool(self._motion["applied"]):
+            self._transform_tracks(
+                float(self._motion["transform_forward_m"]),
+                float(self._motion["transform_lateral_m"]),
+                math.radians(float(self._motion["transform_yaw_deg"])),
+            )
+        self._previous_point_positions = current_point_positions
+
+        elapsed_frame_windows = min(
+            3,
+            frame.dropped_frames_since_previous + 1,
+        )
+        for track in self._tracks:
+            hits = track["_point_hits"]
+            assert isinstance(hits, list)
+            hits.extend([False] * elapsed_frame_windows)
+            del hits[:-3]
+            track["point_confirmed"] = sum(hits) >= 2
+            track["_updated_by_point"] = False
+            if track["source"] == "point":
+                track["classification"] = (
+                    "confirmed_obstacle"
+                    if track["point_confirmed"]
+                    else "point_candidate"
+                )
+            heatmap_hits = track.get("_heatmap_hits")
+            if isinstance(heatmap_hits, list):
+                heatmap_hits.extend([False] * elapsed_frame_windows)
+                del heatmap_hits[:-HEATMAP_HISTORY_FRAMES]
+            point_association_hits = track.get("_point_association_hits")
+            if isinstance(point_association_hits, list):
+                point_association_hits.extend(
+                    [False] * elapsed_frame_windows
+                )
+                del point_association_hits[:-HEATMAP_HISTORY_FRAMES]
+            track["_updated_by_heatmap"] = False
+        point_count = 0
+        accepted_point_positions: List[Tuple[float, float]] = []
+
+        for point, forward_m, lateral_m in accepted_points:
             self._upsert_track(
                 forward_m=forward_m,
                 lateral_m=lateral_m,
-                height_m=point.z_m,
+                # The operator map is deliberately azimuth-only.  Keep the
+                # measured z above for calibrated clutter rejection, but do
+                # not let elevation enter tracking, occupancy, or the API.
+                height_m=None,
                 range_uncertainty_m=0.0,
                 confidence=self._point_confidence(point.snr_db),
                 source="point",
                 received_at=now,
             )
+            accepted_point_positions.append((forward_m, lateral_m))
             point_count += 1
 
         if (
@@ -267,64 +420,75 @@ class RadarSceneEstimator:
             and self._calibration_status == "ok"
             and self.axes.signature() == RadarAxes().signature()
         ):
-            heatmap = frame.heatmap
-            model = self.clutter_model
-            assert model is not None
-            span_db = heatmap.ceiling_db - heatmap.floor_db
-            for range_index in range(1, heatmap.range_bins):
-                range_m = range_index * heatmap.range_step_m
-                if range_m > SCENE_MAX_FORWARD_M:
-                    break
-                for azimuth_index in range(heatmap.azimuth_bins):
-                    flat_index = (
-                        range_index * heatmap.azimuth_bins + azimuth_index
-                    )
-                    observed_db = (
-                        heatmap.floor_db
-                        + heatmap.data[flat_index] / 255.0 * span_db
-                    )
-                    residual_db = (
-                        observed_db - model.heatmap_median_db[flat_index]
-                    )
-                    threshold_db = max(
-                        HEATMAP_MIN_RESIDUAL_DB,
-                        HEATMAP_MAD_MULTIPLIER
-                        * model.heatmap_mad_db[flat_index],
-                    )
-                    if residual_db < threshold_db:
-                        continue
-                    angle_argument = (
-                        2.0
-                        * (
-                            azimuth_index
-                            - heatmap.azimuth_bins / 2.0
-                        )
-                        / heatmap.azimuth_bins
-                    )
-                    angle_rad = math.asin(
-                        max(-1.0, min(1.0, angle_argument))
-                    )
-                    angle_rad = math.radians(
-                        max(-70.0, min(70.0, math.degrees(angle_rad)))
-                    )
-                    forward_m = range_m * math.cos(angle_rad)
-                    lateral_m = range_m * math.sin(angle_rad)
-                    if not self._in_scene(forward_m, lateral_m):
-                        continue
-                    self._upsert_track(
-                        forward_m=forward_m,
-                        lateral_m=lateral_m,
-                        height_m=None,
-                        range_uncertainty_m=heatmap.range_step_m,
-                        confidence=min(1.0, residual_db / 20.0),
-                        source="heatmap",
-                        received_at=now,
-                    )
-                    heatmap_count += 1
+            clusters, candidate_cell_count = self._heatmap_clusters(
+                frame,
+            )
+            point_supported_clusters = set()
+            for point_forward, point_lateral in accepted_point_positions:
+                nearest_cluster_index = min(
+                    range(len(clusters)),
+                    key=lambda index: math.hypot(
+                        point_forward - float(clusters[index]["forward_m"]),
+                        point_lateral - float(clusters[index]["lateral_m"]),
+                    ),
+                    default=None,
+                )
+                if nearest_cluster_index is None:
+                    continue
+                cluster = clusters[nearest_cluster_index]
+                if math.hypot(
+                    point_forward - float(cluster["forward_m"]),
+                    point_lateral - float(cluster["lateral_m"]),
+                ) <= max(
+                    HEATMAP_POINT_ASSOCIATION_M,
+                    frame.heatmap.range_step_m * 1.5,
+                ):
+                    point_supported_clusters.add(nearest_cluster_index)
+            for cluster_index, cluster in enumerate(clusters):
+                forward_m = float(cluster["forward_m"])
+                lateral_m = float(cluster["lateral_m"])
+                point_correlated = (
+                    cluster_index in point_supported_clusters
+                )
+                self._upsert_track(
+                    forward_m=forward_m,
+                    lateral_m=lateral_m,
+                    height_m=None,
+                    range_uncertainty_m=float(
+                        cluster["range_uncertainty_m"]
+                    ),
+                    confidence=float(cluster["strength_confidence"]),
+                    source="heatmap",
+                    received_at=now,
+                    point_correlated=point_correlated,
+                    cluster_cells=int(cluster["cell_count"]),
+                    peak_residual_db=float(cluster["peak_residual_db"]),
+                )
+            self._heatmap_candidate_cells = candidate_cell_count
+            self._heatmap_cluster_count = len(clusters)
+        else:
+            self._heatmap_candidate_cells = 0
+            self._heatmap_cluster_count = 0
 
         self._scene_point_count = point_count
         self._clutter_points_rejected = rejected
-        self._heatmap_cells_accepted = heatmap_count
+        self._heatmap_cells_accepted = self._heatmap_candidate_cells
+        heatmap_tracks = [
+            track for track in self._tracks if track["source"] == "heatmap"
+        ]
+        self._heatmap_confirmed_count = sum(
+            track.get("classification") == "confirmed_obstacle"
+            for track in heatmap_tracks
+        )
+        self._heatmap_reflection_count = (
+            len(heatmap_tracks) - self._heatmap_confirmed_count
+        )
+        self._update_accumulated_obstacles(now)
+        if self._motion["status"] not in {"unstable", "low_confidence"}:
+            self._update_near_occupancy(now)
+            self._update_stable_occupancy(now)
+            self._update_rolling_map(now)
+        self._update_stable_path(now)
 
     def snapshot(
         self,
@@ -336,6 +500,9 @@ class RadarSceneEstimator:
         if source_status in FAULT_SOURCE_STATUSES:
             self.reset(source_status)
         self._expire_tracks(observed_at)
+        self._expire_accumulated_obstacles(observed_at)
+        self._expire_stable_cells(observed_at)
+        self._expire_near_cells(observed_at)
         tracks = [
             {
                 key: value
@@ -354,8 +521,72 @@ class RadarSceneEstimator:
             }
             for track in self._tracks
         ]
+        obstacle_tracks = [
+            track
+            for track in tracks
+            if track.get("classification") == "confirmed_obstacle"
+        ]
+        reference_tracks = [
+            track
+            for track in tracks
+            if track.get("classification") != "confirmed_obstacle"
+        ]
+        accumulated_obstacles = [
+            {
+                key: value
+                for key, value in obstacle.items()
+                if not key.startswith("_")
+            }
+            | {
+                "age_ms": max(
+                    0,
+                    (
+                        observed_at_ns
+                        - int(obstacle["_last_seen_ns"])
+                    )
+                    // 1_000_000,
+                ),
+                "remaining_ms": max(
+                    0,
+                    (
+                        ACCUMULATED_OBSTACLE_TTL_NS
+                        - (
+                            observed_at_ns
+                            - int(obstacle["_last_seen_ns"])
+                        )
+                    )
+                    // 1_000_000,
+                ),
+            }
+            for obstacle in self._accumulated_obstacles
+        ]
+        stable_obstacles = self._stable_obstacle_payload(observed_at)
+        rolling_map_obstacles = self._rolling_map_payload(observed_at)
+        persistent_near_obstacles = [
+            obstacle
+            for obstacle in stable_obstacles
+            if math.hypot(
+                float(obstacle["forward_m"]),
+                float(obstacle["lateral_m"]),
+            ) <= PATH_LOCAL_MAX_RANGE_M
+        ]
+        near_obstacles = self._near_obstacle_payload(observed_at)
+        planned_path = dict(
+            self._planned_path
+            if self._planned_path is not None
+            else self._plan_path(
+                self._planning_obstacle_payload(observed_at)
+            )
+        )
         grid = bytearray(GRID_FORWARD_CELLS * GRID_LATERAL_CELLS)
-        for track in tracks:
+        # Keep newly confirmed returns visible immediately while retaining the
+        # multi-frame stable cells that the path planner trusts.  Duplicate
+        # cells are harmless because the grid stores the maximum confidence.
+        for track in [
+            *obstacle_tracks,
+            *near_obstacles,
+            *persistent_near_obstacles,
+        ]:
             forward_cell = min(
                 GRID_FORWARD_CELLS - 1,
                 int(float(track["forward_m"]) / GRID_RESOLUTION_M),
@@ -386,6 +617,8 @@ class RadarSceneEstimator:
         return {
             "schema_version": SCENE_SCHEMA_VERSION,
             "pose_mode": "robot_relative",
+            "projection_mode": SCENE_PROJECTION_MODE,
+            "elevation_used": False,
             "calibration_status": self._calibration_status,
             "grid": {
                 "resolution_m": GRID_RESOLUTION_M,
@@ -399,6 +632,50 @@ class RadarSceneEstimator:
                 "data_base64": base64.b64encode(bytes(grid)).decode("ascii"),
             },
             "tracks": tracks,
+            "obstacle_tracks": obstacle_tracks,
+            "reference_tracks": reference_tracks,
+            "accumulated_obstacles": accumulated_obstacles,
+            "persistent_near_obstacles": persistent_near_obstacles,
+            "rolling_local_map": {
+                "radius_m": ROLLING_MAP_RADIUS_M,
+                "resolution_m": ROLLING_MAP_RESOLUTION_M,
+                "minimum_hits": ROLLING_MAP_MIN_HITS,
+                "motion_relative": True,
+                "retention": "until_outside_radius_or_scene_reset",
+                "cells": rolling_map_obstacles,
+            },
+            "travel_trail": {
+                "radius_m": ROLLING_MAP_RADIUS_M,
+                "resolution_m": TRAVEL_TRAIL_RESOLUTION_M,
+                "motion_relative": True,
+                "source": "radar_ego_motion",
+                "points": self._travel_trail_payload(),
+            },
+            "persistent_near_obstacle_memory": {
+                "window_ms": STABLE_OCCUPANCY_TTL_NS // 1_000_000,
+                "point_min_confidence": ACCUMULATED_POINT_MIN_CONFIDENCE,
+                "heatmap_min_confidence": (
+                    ACCUMULATED_HEATMAP_MIN_CONFIDENCE
+                ),
+                "heatmap_min_peak_db": ACCUMULATED_HEATMAP_MIN_PEAK_DB,
+                "motion_relative": True,
+            },
+            "obstacle_memory_window_ms": round(
+                ACCUMULATED_OBSTACLE_TTL_S * 1000
+            ),
+            "stable_occupancy": {
+                "resolution_m": STABLE_OCCUPANCY_RESOLUTION_M,
+                "minimum_hits": STABLE_OCCUPANCY_MIN_HITS,
+                "window_ms": STABLE_OCCUPANCY_TTL_NS // 1_000_000,
+                "cells": stable_obstacles,
+            },
+            "near_occupancy": {
+                "resolution_m": NEAR_OCCUPANCY_RESOLUTION_M,
+                "window_ms": NEAR_OCCUPANCY_TTL_NS // 1_000_000,
+                "cells": near_obstacles,
+            },
+            "motion_compensation": dict(self._motion),
+            "planned_path": planned_path,
             "hazard": self._hazard_evaluator.update(
                 tracks,
                 self._calibration_status,
@@ -409,9 +686,1664 @@ class RadarSceneEstimator:
                 "scene_point_count": self._scene_point_count,
                 "clutter_points_rejected": self._clutter_points_rejected,
                 "heatmap_cells_accepted": self._heatmap_cells_accepted,
+                "heatmap_candidate_cells": self._heatmap_candidate_cells,
+                "heatmap_cluster_count": self._heatmap_cluster_count,
+                "heatmap_confirmed_obstacles": (
+                    self._heatmap_confirmed_count
+                ),
+                "heatmap_reflection_evidence": (
+                    self._heatmap_reflection_count
+                ),
+                "occupancy_track_count": len(obstacle_tracks),
+                "accumulated_obstacle_count": len(accumulated_obstacles),
+                "stable_occupancy_cell_count": len(stable_obstacles),
+                "near_occupancy_cell_count": len(near_obstacles),
+                "persistent_near_obstacle_count": len(
+                    persistent_near_obstacles
+                ),
+                "rolling_local_map_cell_count": len(
+                    rolling_map_obstacles
+                ),
+                "travel_trail_point_count": len(
+                    self._travel_trail_payload()
+                ),
+                "motion_status": self._motion["status"],
+                "motion_matches": self._motion["matched_points"],
+                "path_length_m": planned_path["length_m"],
+                "path_stability_status": self._path_stability_status,
+                "path_pending_frames": self._pending_path_hits,
                 "last_reset_reason": self._last_reset_reason,
             },
         }
+
+    @staticmethod
+    def _empty_motion(status: str) -> Dict[str, object]:
+        return {
+            "status": status,
+            "applied": False,
+            "confidence": 0.0,
+            "matched_points": 0,
+            "match_ratio": 0.0,
+            "rmse_m": None,
+            "ego_forward_m": 0.0,
+            "ego_lateral_m": 0.0,
+            "ego_yaw_deg": 0.0,
+            "transform_forward_m": 0.0,
+            "transform_lateral_m": 0.0,
+            "transform_yaw_deg": 0.0,
+        }
+
+    @classmethod
+    def _estimate_ego_motion(
+        cls,
+        previous: Sequence[Tuple[float, float]],
+        current: Sequence[Tuple[float, float]],
+    ) -> Dict[str, object]:
+        """Estimate the rigid transform mapping the previous scan to current.
+
+        A yaw/translation vote followed by one-to-one nearest-neighbour scoring
+        keeps moving outliers from defining robot motion.  The transform is
+        only authorized when at least a small static consensus exists.
+        """
+        if len(previous) < MOTION_MIN_MATCHES or len(current) < MOTION_MIN_MATCHES:
+            return cls._empty_motion("insufficient_points")
+
+        best: Optional[Tuple[int, float, float, float, float, float]] = None
+        for yaw_deg in range(-MOTION_MAX_YAW_DEG, MOTION_MAX_YAW_DEG + 1):
+            yaw_rad = math.radians(yaw_deg)
+            cosine = math.cos(yaw_rad)
+            sine = math.sin(yaw_rad)
+            rotated = [
+                (
+                    cosine * forward - sine * lateral,
+                    sine * forward + cosine * lateral,
+                )
+                for forward, lateral in previous
+            ]
+            votes: Dict[Tuple[int, int], int] = {}
+            for old_forward, old_lateral in rotated:
+                for new_forward, new_lateral in current:
+                    delta_forward = new_forward - old_forward
+                    delta_lateral = new_lateral - old_lateral
+                    if (
+                        abs(delta_forward) > MOTION_MAX_TRANSLATION_M
+                        or abs(delta_lateral) > MOTION_MAX_TRANSLATION_M
+                    ):
+                        continue
+                    key = (
+                        round(delta_forward / MOTION_TRANSLATION_BIN_M),
+                        round(delta_lateral / MOTION_TRANSLATION_BIN_M),
+                    )
+                    votes[key] = votes.get(key, 0) + 1
+            for (forward_bin, lateral_bin), _ in sorted(
+                votes.items(), key=lambda item: item[1], reverse=True
+            )[:4]:
+                delta_forward = forward_bin * MOTION_TRANSLATION_BIN_M
+                delta_lateral = lateral_bin * MOTION_TRANSLATION_BIN_M
+                pairs: List[Tuple[float, int, int]] = []
+                for old_index, (old_forward, old_lateral) in enumerate(rotated):
+                    transformed_forward = old_forward + delta_forward
+                    transformed_lateral = old_lateral + delta_lateral
+                    for new_index, (new_forward, new_lateral) in enumerate(current):
+                        distance = math.hypot(
+                            transformed_forward - new_forward,
+                            transformed_lateral - new_lateral,
+                        )
+                        if distance <= MOTION_ASSOCIATION_M:
+                            pairs.append((distance, old_index, new_index))
+                used_old = set()
+                used_new = set()
+                residuals: List[float] = []
+                for distance, old_index, new_index in sorted(pairs):
+                    if old_index in used_old or new_index in used_new:
+                        continue
+                    used_old.add(old_index)
+                    used_new.add(new_index)
+                    residuals.append(distance)
+                if not residuals:
+                    continue
+                rmse = math.sqrt(
+                    sum(value * value for value in residuals) / len(residuals)
+                )
+                regularized_error = (
+                    rmse
+                    + abs(yaw_deg) * 0.004
+                    + math.hypot(delta_forward, delta_lateral) * 0.03
+                )
+                candidate = (
+                    len(residuals),
+                    regularized_error,
+                    rmse,
+                    float(yaw_deg),
+                    delta_forward,
+                    delta_lateral,
+                )
+                if best is None or (
+                    candidate[0] > best[0]
+                    or (
+                        candidate[0] == best[0]
+                        and candidate[1] < best[1]
+                    )
+                ):
+                    best = candidate
+
+        if best is None:
+            return cls._empty_motion("no_consensus")
+        (
+            matches,
+            _,
+            rmse,
+            yaw_deg,
+            delta_forward,
+            delta_lateral,
+        ) = best
+        match_ratio = matches / min(len(previous), len(current))
+        authorized = (
+            matches >= MOTION_MIN_MATCHES
+            and match_ratio >= MOTION_MIN_MATCH_RATIO
+            and rmse <= MOTION_MAX_RMSE_M
+        )
+        result = cls._empty_motion("ok" if authorized else "low_confidence")
+        yaw_rad = math.radians(yaw_deg)
+        cosine = math.cos(yaw_rad)
+        sine = math.sin(yaw_rad)
+        ego_forward = -(
+            cosine * delta_forward + sine * delta_lateral
+        )
+        ego_lateral = -(
+            -sine * delta_forward + cosine * delta_lateral
+        )
+        confidence = min(
+            1.0,
+            match_ratio * max(0.0, 1.0 - rmse / MOTION_ASSOCIATION_M),
+        )
+        result.update(
+            {
+                "applied": authorized,
+                "confidence": round(confidence, 3),
+                "matched_points": matches,
+                "match_ratio": round(match_ratio, 3),
+                "rmse_m": round(rmse, 4),
+                "ego_forward_m": round(ego_forward, 4),
+                "ego_lateral_m": round(ego_lateral, 4),
+                "ego_yaw_deg": round(-yaw_deg, 3),
+                "transform_forward_m": round(delta_forward, 4),
+                "transform_lateral_m": round(delta_lateral, 4),
+                "transform_yaw_deg": round(yaw_deg, 3),
+            }
+        )
+        return result
+
+    def _stabilize_motion(
+        self,
+        candidate: Dict[str, object],
+    ) -> Dict[str, object]:
+        if not bool(candidate.get("applied")):
+            self._motion_candidates = []
+            return candidate
+        self._motion_candidates.append(candidate)
+        del self._motion_candidates[:-2]
+        if len(self._motion_candidates) < 2:
+            pending = dict(candidate)
+            pending["status"] = "stabilizing"
+            pending["applied"] = False
+            return pending
+        previous, current = self._motion_candidates
+        stable = (
+            abs(
+                float(previous["transform_forward_m"])
+                - float(current["transform_forward_m"])
+            ) <= MOTION_STABILITY_TRANSLATION_M
+            and abs(
+                float(previous["transform_lateral_m"])
+                - float(current["transform_lateral_m"])
+            ) <= MOTION_STABILITY_TRANSLATION_M
+            and abs(
+                float(previous["transform_yaw_deg"])
+                - float(current["transform_yaw_deg"])
+            ) <= MOTION_STABILITY_YAW_DEG
+        )
+        if stable:
+            return candidate
+        rejected = dict(candidate)
+        rejected["status"] = "unstable"
+        rejected["applied"] = False
+        return rejected
+
+    def _transform_tracks(
+        self,
+        delta_forward: float,
+        delta_lateral: float,
+        yaw_rad: float,
+    ) -> None:
+        cosine = math.cos(yaw_rad)
+        sine = math.sin(yaw_rad)
+
+        def transform(position: Tuple[float, float]) -> Tuple[float, float]:
+            forward, lateral = position
+            return (
+                cosine * forward - sine * lateral + delta_forward,
+                sine * forward + cosine * lateral + delta_lateral,
+            )
+
+        retained: List[Dict[str, object]] = []
+        for track in self._tracks:
+            forward, lateral = transform(
+                (float(track["forward_m"]), float(track["lateral_m"]))
+            )
+            if not self._in_scene(forward, lateral):
+                continue
+            track["forward_m"] = forward
+            track["lateral_m"] = lateral
+            track["distance_m"] = math.hypot(forward, lateral)
+            history = track.get("_position_history")
+            if isinstance(history, list):
+                track["_position_history"] = [
+                    transform((float(point[0]), float(point[1])))
+                    for point in history
+                ]
+            retained.append(track)
+        self._tracks = retained
+
+        retained_obstacles: List[Dict[str, object]] = []
+        for obstacle in self._accumulated_obstacles:
+            forward, lateral = transform(
+                (
+                    float(obstacle["forward_m"]),
+                    float(obstacle["lateral_m"]),
+                )
+            )
+            if not self._in_scene(forward, lateral):
+                continue
+            obstacle["forward_m"] = forward
+            obstacle["lateral_m"] = lateral
+            obstacle["distance_m"] = math.hypot(forward, lateral)
+            retained_obstacles.append(obstacle)
+        self._accumulated_obstacles = retained_obstacles
+
+        transformed_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
+        for cell in self._stable_cells.values():
+            forward, lateral = transform(
+                (float(cell["forward_m"]), float(cell["lateral_m"]))
+            )
+            if not self._in_scene(forward, lateral):
+                continue
+            key = (
+                round(forward / STABLE_OCCUPANCY_RESOLUTION_M),
+                round(lateral / STABLE_OCCUPANCY_RESOLUTION_M),
+            )
+            existing = transformed_cells.get(key)
+            transformed = {
+                **cell,
+                "forward_m": key[0] * STABLE_OCCUPANCY_RESOLUTION_M,
+                "lateral_m": key[1] * STABLE_OCCUPANCY_RESOLUTION_M,
+            }
+            if existing is None:
+                transformed_cells[key] = transformed
+            else:
+                existing["hits"] = min(
+                    255, int(existing["hits"]) + int(cell["hits"])
+                )
+                existing["confidence"] = max(
+                    float(existing["confidence"]),
+                    float(cell["confidence"]),
+                )
+                existing["_last_seen_ns"] = max(
+                    int(existing["_last_seen_ns"]),
+                    int(cell["_last_seen_ns"]),
+                )
+        self._stable_cells = transformed_cells
+
+        transformed_near_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
+        for cell in self._near_cells.values():
+            forward, lateral = transform(
+                (float(cell["forward_m"]), float(cell["lateral_m"]))
+            )
+            distance = math.hypot(forward, lateral)
+            if distance > PATH_LOCAL_MAX_RANGE_M or not self._in_scene(
+                forward, lateral
+            ):
+                continue
+            key = (
+                round(forward / NEAR_OCCUPANCY_RESOLUTION_M),
+                round(lateral / NEAR_OCCUPANCY_RESOLUTION_M),
+            )
+            existing = transformed_near_cells.get(key)
+            transformed = {
+                **cell,
+                "forward_m": key[0] * NEAR_OCCUPANCY_RESOLUTION_M,
+                "lateral_m": key[1] * NEAR_OCCUPANCY_RESOLUTION_M,
+            }
+            if existing is None or float(transformed["confidence"]) > float(
+                existing["confidence"]
+            ):
+                transformed_near_cells[key] = transformed
+        self._near_cells = transformed_near_cells
+
+        transformed_rolling_cells: Dict[
+            Tuple[int, int], Dict[str, object]
+        ] = {}
+        for cell in self._rolling_map_cells.values():
+            forward, lateral = transform(
+                (float(cell["forward_m"]), float(cell["lateral_m"]))
+            )
+            if math.hypot(forward, lateral) > ROLLING_MAP_RADIUS_M:
+                continue
+            key = (
+                round(forward / ROLLING_MAP_RESOLUTION_M),
+                round(lateral / ROLLING_MAP_RESOLUTION_M),
+            )
+            transformed = {
+                **cell,
+                "forward_m": key[0] * ROLLING_MAP_RESOLUTION_M,
+                "lateral_m": key[1] * ROLLING_MAP_RESOLUTION_M,
+                "distance_m": math.hypot(
+                    key[0] * ROLLING_MAP_RESOLUTION_M,
+                    key[1] * ROLLING_MAP_RESOLUTION_M,
+                ),
+            }
+            existing = transformed_rolling_cells.get(key)
+            if existing is None:
+                transformed_rolling_cells[key] = transformed
+            else:
+                existing["hits"] = min(
+                    255, int(existing["hits"]) + int(cell["hits"])
+                )
+                existing["confidence"] = max(
+                    float(existing["confidence"]),
+                    float(cell["confidence"]),
+                )
+                existing["_last_seen_ns"] = max(
+                    int(existing["_last_seen_ns"]),
+                    int(cell["_last_seen_ns"]),
+                )
+        self._rolling_map_cells = transformed_rolling_cells
+
+        transformed_trail = [
+            transformed
+            for point in self._travel_trail
+            for transformed in [transform(point)]
+            if math.hypot(transformed[0], transformed[1])
+            <= ROLLING_MAP_RADIUS_M
+        ]
+        if not transformed_trail:
+            transformed_trail = [(0.0, 0.0)]
+        if math.hypot(
+            transformed_trail[-1][0], transformed_trail[-1][1]
+        ) >= TRAVEL_TRAIL_RESOLUTION_M:
+            transformed_trail.append((0.0, 0.0))
+        self._travel_trail = transformed_trail
+
+    def _update_accumulated_obstacles(self, received_at: float) -> None:
+        self._expire_accumulated_obstacles(received_at)
+        for track in self._tracks:
+            if track.get("classification") != "confirmed_obstacle":
+                continue
+            source = str(track["source"])
+            updated = (
+                bool(track.get("_updated_by_point"))
+                if source == "point"
+                else bool(track.get("_updated_by_heatmap"))
+            )
+            if not updated:
+                continue
+            confidence = float(track["confidence"])
+            if source == "point":
+                if confidence < ACCUMULATED_POINT_MIN_CONFIDENCE:
+                    continue
+            elif (
+                confidence < ACCUMULATED_HEATMAP_MIN_CONFIDENCE
+                or float(track.get("peak_residual_db", 0.0))
+                < ACCUMULATED_HEATMAP_MIN_PEAK_DB
+            ):
+                continue
+            forward = float(track["forward_m"])
+            lateral = float(track["lateral_m"])
+            nearest = min(
+                self._accumulated_obstacles,
+                key=lambda obstacle: math.hypot(
+                    float(obstacle["forward_m"]) - forward,
+                    float(obstacle["lateral_m"]) - lateral,
+                ),
+                default=None,
+            )
+            if (
+                nearest is not None
+                and math.hypot(
+                    float(nearest["forward_m"]) - forward,
+                    float(nearest["lateral_m"]) - lateral,
+                ) <= ACCUMULATED_OBSTACLE_ASSOCIATION_M
+            ):
+                smoothing = 0.30
+                nearest["forward_m"] = (
+                    float(nearest["forward_m"]) * (1.0 - smoothing)
+                    + forward * smoothing
+                )
+                nearest["lateral_m"] = (
+                    float(nearest["lateral_m"]) * (1.0 - smoothing)
+                    + lateral * smoothing
+                )
+                nearest["distance_m"] = math.hypot(
+                    float(nearest["forward_m"]),
+                    float(nearest["lateral_m"]),
+                )
+                nearest["confidence"] = max(
+                    float(nearest["confidence"]), confidence
+                )
+                nearest["range_uncertainty_m"] = max(
+                    float(nearest["range_uncertainty_m"]),
+                    float(track.get("range_uncertainty_m", 0.0)),
+                )
+                nearest["hits"] = int(nearest["hits"]) + 1
+                nearest["source"] = source
+                nearest["_last_seen_ns"] = self._seconds_to_ns(received_at)
+                continue
+            self._accumulated_obstacles.append(
+                {
+                    "obstacle_id": self._next_accumulated_obstacle_id,
+                    "forward_m": forward,
+                    "lateral_m": lateral,
+                    "distance_m": math.hypot(forward, lateral),
+                    "range_uncertainty_m": float(
+                        track.get("range_uncertainty_m", 0.0)
+                    ),
+                    "confidence": confidence,
+                    "source": source,
+                    "hits": 1,
+                    "_last_seen_ns": self._seconds_to_ns(received_at),
+                }
+            )
+            self._next_accumulated_obstacle_id += 1
+
+    def _expire_accumulated_obstacles(self, now: float) -> None:
+        now_ns = self._seconds_to_ns(now)
+        self._accumulated_obstacles = [
+            obstacle
+            for obstacle in self._accumulated_obstacles
+            if now_ns - int(obstacle["_last_seen_ns"])
+            < ACCUMULATED_OBSTACLE_TTL_NS
+        ]
+
+    def _strong_updated_tracks(self) -> List[Dict[str, object]]:
+        strong: List[Dict[str, object]] = []
+        for track in self._tracks:
+            if track.get("classification") != "confirmed_obstacle":
+                continue
+            source = str(track["source"])
+            updated = (
+                bool(track.get("_updated_by_point"))
+                if source == "point"
+                else bool(track.get("_updated_by_heatmap"))
+            )
+            if not updated:
+                continue
+            confidence = float(track["confidence"])
+            if source == "point":
+                if confidence < ACCUMULATED_POINT_MIN_CONFIDENCE:
+                    continue
+            elif (
+                confidence < ACCUMULATED_HEATMAP_MIN_CONFIDENCE
+                or float(track.get("peak_residual_db", 0.0))
+                < ACCUMULATED_HEATMAP_MIN_PEAK_DB
+            ):
+                continue
+            strong.append(track)
+        return strong
+
+    def _update_stable_occupancy(self, received_at: float) -> None:
+        self._expire_stable_cells(received_at)
+        received_at_ns = self._seconds_to_ns(received_at)
+        for track in self._strong_updated_tracks():
+            forward = float(track["forward_m"])
+            lateral = float(track["lateral_m"])
+            key = (
+                round(forward / STABLE_OCCUPANCY_RESOLUTION_M),
+                round(lateral / STABLE_OCCUPANCY_RESOLUTION_M),
+            )
+            cell = self._stable_cells.get(key)
+            if cell is None:
+                self._stable_cells[key] = {
+                    "forward_m": key[0] * STABLE_OCCUPANCY_RESOLUTION_M,
+                    "lateral_m": key[1] * STABLE_OCCUPANCY_RESOLUTION_M,
+                    "range_uncertainty_m": 0.0,
+                    "confidence": float(track["confidence"]),
+                    "source": str(track["source"]),
+                    "hits": 1,
+                    "_last_seen_ns": received_at_ns,
+                }
+                continue
+            cell["hits"] = min(255, int(cell["hits"]) + 1)
+            cell["confidence"] = max(
+                float(cell["confidence"]), float(track["confidence"])
+            )
+            cell["source"] = str(track["source"])
+            cell["_last_seen_ns"] = received_at_ns
+
+    def _update_rolling_map(self, received_at: float) -> None:
+        """Accumulate strong obstacles in a 50 cm robot-centred circle."""
+        received_at_ns = self._seconds_to_ns(received_at)
+        for track in self._strong_updated_tracks():
+            forward = float(track["forward_m"])
+            lateral = float(track["lateral_m"])
+            if math.hypot(forward, lateral) > ROLLING_MAP_RADIUS_M:
+                continue
+            key = (
+                round(forward / ROLLING_MAP_RESOLUTION_M),
+                round(lateral / ROLLING_MAP_RESOLUTION_M),
+            )
+            cell = self._rolling_map_cells.get(key)
+            if cell is None:
+                self._rolling_map_cells[key] = {
+                    "forward_m": key[0] * ROLLING_MAP_RESOLUTION_M,
+                    "lateral_m": key[1] * ROLLING_MAP_RESOLUTION_M,
+                    "distance_m": math.hypot(
+                        key[0] * ROLLING_MAP_RESOLUTION_M,
+                        key[1] * ROLLING_MAP_RESOLUTION_M,
+                    ),
+                    "range_uncertainty_m": 0.0,
+                    "confidence": float(track["confidence"]),
+                    "source": str(track["source"]),
+                    "hits": 1,
+                    "_last_seen_ns": received_at_ns,
+                }
+                continue
+            cell["hits"] = min(255, int(cell["hits"]) + 1)
+            cell["confidence"] = max(
+                float(cell["confidence"]), float(track["confidence"])
+            )
+            cell["source"] = str(track["source"])
+            cell["_last_seen_ns"] = received_at_ns
+
+    def _rolling_map_payload(
+        self,
+        now: float,
+    ) -> List[Dict[str, object]]:
+        now_ns = self._seconds_to_ns(now)
+        return [
+            {
+                key: value
+                for key, value in cell.items()
+                if not key.startswith("_")
+            }
+            | {
+                "age_ms": max(
+                    0,
+                    (now_ns - int(cell["_last_seen_ns"])) // 1_000_000,
+                )
+            }
+            for cell in self._rolling_map_cells.values()
+            if int(cell["hits"]) >= ROLLING_MAP_MIN_HITS
+            and math.hypot(
+                float(cell["forward_m"]),
+                float(cell["lateral_m"]),
+            ) <= ROLLING_MAP_RADIUS_M
+        ]
+
+    def _travel_trail_payload(self) -> List[List[float]]:
+        points = list(self._travel_trail)
+        if not points or math.hypot(points[-1][0], points[-1][1]) > 1e-9:
+            points.append((0.0, 0.0))
+        return [
+            [round(forward, 4), round(lateral, 4)]
+            for forward, lateral in points
+        ]
+
+    def _update_near_occupancy(self, received_at: float) -> None:
+        """Keep recent, confirmed near-field evidence for reactive planning."""
+        self._expire_near_cells(received_at)
+        received_at_ns = self._seconds_to_ns(received_at)
+        for track in self._tracks:
+            source = str(track["source"])
+            updated = bool(
+                track.get(
+                    "_updated_by_point"
+                    if source == "point"
+                    else "_updated_by_heatmap"
+                )
+            )
+            if not updated:
+                continue
+            confidence = float(track["confidence"])
+            if source == "point":
+                confirmed = (
+                    track.get("classification") == "confirmed_obstacle"
+                )
+                if (
+                    confidence
+                    < (
+                        NEAR_POINT_MIN_CONFIDENCE
+                        if confirmed
+                        else NEAR_POINT_REACTIVE_MIN_CONFIDENCE
+                    )
+                ):
+                    continue
+            elif (
+                track.get("classification") != "confirmed_obstacle"
+                or confidence < NEAR_HEATMAP_MIN_CONFIDENCE
+            ):
+                continue
+            forward = float(track["forward_m"])
+            lateral = float(track["lateral_m"])
+            distance = math.hypot(forward, lateral)
+            if not (
+                PATH_NEAR_FIELD_EXCLUSION_M
+                <= distance
+                <= PATH_LOCAL_MAX_RANGE_M
+            ):
+                continue
+            if abs(math.degrees(math.atan2(lateral, forward))) > (
+                PATH_FOV_AZIMUTH_DEG
+            ):
+                continue
+            key = (
+                round(forward / NEAR_OCCUPANCY_RESOLUTION_M),
+                round(lateral / NEAR_OCCUPANCY_RESOLUTION_M),
+            )
+            cell = self._near_cells.get(key)
+            if cell is None:
+                self._near_cells[key] = {
+                    "forward_m": key[0] * NEAR_OCCUPANCY_RESOLUTION_M,
+                    "lateral_m": key[1] * NEAR_OCCUPANCY_RESOLUTION_M,
+                    "range_uncertainty_m": float(
+                        track.get("range_uncertainty_m", 0.0)
+                    ),
+                    "confidence": confidence,
+                    "source": source,
+                    "hits": 1,
+                    "reactive": True,
+                    "_last_seen_ns": received_at_ns,
+                }
+                continue
+            cell["hits"] = min(255, int(cell["hits"]) + 1)
+            cell["confidence"] = max(float(cell["confidence"]), confidence)
+            cell["source"] = source
+            cell["_last_seen_ns"] = received_at_ns
+
+    def _expire_near_cells(self, now: float) -> None:
+        now_ns = self._seconds_to_ns(now)
+        self._near_cells = {
+            key: cell
+            for key, cell in self._near_cells.items()
+            if now_ns - int(cell["_last_seen_ns"]) < NEAR_OCCUPANCY_TTL_NS
+        }
+
+    def _near_obstacle_payload(self, now: float) -> List[Dict[str, object]]:
+        now_ns = self._seconds_to_ns(now)
+        return [
+            {
+                key: value
+                for key, value in cell.items()
+                if not key.startswith("_")
+            }
+            | {
+                "age_ms": max(
+                    0,
+                    (now_ns - int(cell["_last_seen_ns"])) // 1_000_000,
+                )
+            }
+            for cell in self._near_cells.values()
+        ]
+
+    def _expire_stable_cells(self, now: float) -> None:
+        now_ns = self._seconds_to_ns(now)
+        self._stable_cells = {
+            key: cell
+            for key, cell in self._stable_cells.items()
+            if now_ns - int(cell["_last_seen_ns"])
+            < STABLE_OCCUPANCY_TTL_NS
+        }
+
+    def _stable_obstacle_payload(
+        self,
+        now: float,
+    ) -> List[Dict[str, object]]:
+        now_ns = self._seconds_to_ns(now)
+        return [
+            {
+                "forward_m": float(cell["forward_m"]),
+                "lateral_m": float(cell["lateral_m"]),
+                "range_uncertainty_m": 0.0,
+                "confidence": float(cell["confidence"]),
+                "source": str(cell["source"]),
+                "hits": int(cell["hits"]),
+                "age_ms": max(
+                    0,
+                    (now_ns - int(cell["_last_seen_ns"])) // 1_000_000,
+                ),
+                "remaining_ms": max(
+                    0,
+                    (
+                        STABLE_OCCUPANCY_TTL_NS
+                        - (now_ns - int(cell["_last_seen_ns"]))
+                    )
+                    // 1_000_000,
+                ),
+            }
+            for cell in self._stable_cells.values()
+            if int(cell["hits"]) >= STABLE_OCCUPANCY_MIN_HITS
+        ]
+
+    def _update_stable_path(self, now: float) -> None:
+        obstacles = self._planning_obstacle_payload(now)
+        candidate = self._plan_path(obstacles)
+        motion_factor = {
+            "ok": 1.0,
+            "stabilizing": 0.85,
+            "insufficient_points": 0.70,
+            "initializing": 0.70,
+            "unstable": 0.60,
+            "low_confidence": 0.55,
+        }.get(str(self._motion["status"]), 0.65)
+        evidence_factor = 0.72 + 0.28 * min(1.0, len(obstacles) / 5.0)
+        confidence = (
+            float(candidate["geometry_confidence"])
+            * motion_factor
+            * evidence_factor
+        )
+        candidate["confidence"] = round(confidence, 3)
+        candidate["confidence_level"] = (
+            "high" if confidence >= 0.80
+            else "medium" if confidence >= 0.55
+            else "low"
+        )
+        candidate_curvature = float(candidate["curvature_per_m"])
+        now_ns = self._seconds_to_ns(now)
+        previous_curvature = self._selected_path_curvature
+        if self._selected_path_curvature is None:
+            status = "selected_initial"
+        elif self._motion["status"] in {"unstable", "low_confidence"}:
+            status = "replanned_frozen_map"
+        elif math.isclose(
+            candidate_curvature,
+            self._selected_path_curvature,
+            abs_tol=1e-9,
+        ):
+            status = "replanned"
+        else:
+            status = "route_changed"
+        self._selected_path_curvature = candidate_curvature
+        if (
+            previous_curvature is None
+            or not math.isclose(
+                candidate_curvature,
+                previous_curvature,
+                abs_tol=1e-9,
+            )
+        ):
+            self._selected_path_since_ns = now_ns
+        self._pending_path_curvature = None
+        self._pending_path_hits = 0
+        self._set_planned_path(candidate, status, now_ns)
+
+    def _planning_obstacle_payload(
+        self,
+        now: float,
+    ) -> List[Dict[str, object]]:
+        """Fuse immediate confirmed returns with motion-relative strong memory."""
+        combined: Dict[Tuple[int, int], Dict[str, object]] = {}
+        for obstacle in [
+            *self._rolling_map_payload(now),
+            *self._near_obstacle_payload(now),
+        ]:
+            forward = float(obstacle["forward_m"])
+            lateral = float(obstacle["lateral_m"])
+            distance = math.hypot(forward, lateral)
+            if (
+                forward <= 0.0
+                or distance > PATH_LOCAL_MAX_RANGE_M
+                or abs(math.degrees(math.atan2(lateral, forward)))
+                > PATH_FOV_AZIMUTH_DEG
+            ):
+                continue
+            key = (
+                round(
+                    float(obstacle["forward_m"])
+                    / NEAR_OCCUPANCY_RESOLUTION_M
+                ),
+                round(
+                    float(obstacle["lateral_m"])
+                    / NEAR_OCCUPANCY_RESOLUTION_M
+                ),
+            )
+            existing = combined.get(key)
+            if existing is None or bool(obstacle.get("reactive")):
+                combined[key] = dict(obstacle)
+        return list(combined.values())
+
+    def _set_planned_path(
+        self,
+        path: Dict[str, object],
+        status: str,
+        now_ns: int,
+    ) -> None:
+        self._path_stability_status = status
+        held_ms = max(0, (now_ns - self._selected_path_since_ns) // 1_000_000)
+        self._planned_path = {
+            **path,
+            "stability_status": status,
+            "selected_for_ms": held_ms,
+            "minimum_hold_ms": 0,
+            "switch_confirm_frames": 0,
+            "pending_switch_frames": self._pending_path_hits,
+            "replan_every_frame": True,
+        }
+
+    @staticmethod
+    def _plan_path(
+        obstacle_tracks: Sequence[Dict[str, object]],
+        curvatures: Sequence[float] = PATH_CURVATURES,
+    ) -> Dict[str, object]:
+        base_clearance = PATH_ROBOT_WIDTH_M / 2.0 + PATH_SAFETY_MARGIN_M
+        near_field_excluded = sum(
+            math.hypot(
+                float(track["forward_m"]),
+                float(track["lateral_m"]),
+            ) < PATH_NEAR_FIELD_EXCLUSION_M
+            for track in obstacle_tracks
+        )
+        observed_obstacles = [
+            {
+                "forward_m": float(track["forward_m"]),
+                "lateral_m": float(track["lateral_m"]),
+                "source": str(track.get("source", "unknown")),
+            }
+            for track in obstacle_tracks
+            if math.hypot(
+                float(track["forward_m"]),
+                float(track["lateral_m"]),
+            ) >= PATH_NEAR_FIELD_EXCLUSION_M
+            and math.hypot(
+                float(track["forward_m"]),
+                float(track["lateral_m"]),
+            ) <= PATH_LOCAL_MAX_RANGE_M
+        ]
+        obstacle_positions = {
+            (float(item["forward_m"]), float(item["lateral_m"]))
+            for item in observed_obstacles
+        }
+        cluster_parents = list(range(len(observed_obstacles)))
+
+        def find_cluster(index: int) -> int:
+            while cluster_parents[index] != index:
+                cluster_parents[index] = cluster_parents[
+                    cluster_parents[index]
+                ]
+                index = cluster_parents[index]
+            return index
+
+        def union_cluster(left_index: int, right_index: int) -> None:
+            left_root = find_cluster(left_index)
+            right_root = find_cluster(right_index)
+            if left_root != right_root:
+                cluster_parents[right_root] = left_root
+
+        wall_segment_count = 0
+        for left_index, left in enumerate(observed_obstacles):
+            left_forward = float(left["forward_m"])
+            left_lateral = float(left["lateral_m"])
+            left_range = math.hypot(left_forward, left_lateral)
+            left_azimuth = math.degrees(
+                math.atan2(left_lateral, left_forward)
+            )
+            for right_index in range(
+                left_index + 1, len(observed_obstacles)
+            ):
+                right = observed_obstacles[right_index]
+                right_forward = float(right["forward_m"])
+                right_lateral = float(right["lateral_m"])
+                right_range = math.hypot(right_forward, right_lateral)
+                right_azimuth = math.degrees(
+                    math.atan2(right_lateral, right_forward)
+                )
+                distance = math.hypot(
+                    right_forward - left_forward,
+                    right_lateral - left_lateral,
+                )
+                link_limit = (
+                    OBSTACLE_CLUSTER_LINK_M
+                    if left["source"] == right["source"]
+                    else OBSTACLE_CLUSTER_CROSS_SOURCE_LINK_M
+                )
+                if (
+                    distance > link_limit
+                    or abs(right_range - left_range)
+                    > OBSTACLE_CLUSTER_MAX_RANGE_DELTA_M
+                    or abs(right_azimuth - left_azimuth)
+                    > OBSTACLE_CLUSTER_MAX_AZIMUTH_DELTA_DEG
+                ):
+                    continue
+                union_cluster(left_index, right_index)
+                wall_segment_count += 1
+                samples = max(
+                    1,
+                    math.ceil(distance / NEAR_OCCUPANCY_RESOLUTION_M),
+                )
+                for sample_index in range(1, samples):
+                    ratio = sample_index / samples
+                    obstacle_positions.add(
+                        (
+                            round(
+                                left_forward
+                                + (right_forward - left_forward) * ratio,
+                                4,
+                            ),
+                            round(
+                                left_lateral
+                                + (right_lateral - left_lateral) * ratio,
+                                4,
+                            ),
+                        )
+                    )
+        cluster_sizes: Dict[int, int] = {}
+        for obstacle_index in range(len(observed_obstacles)):
+            root = find_cluster(obstacle_index)
+            cluster_sizes[root] = cluster_sizes.get(root, 0) + 1
+        object_cluster_count = len(cluster_sizes)
+        largest_object_cluster = max(cluster_sizes.values(), default=0)
+        obstacles = tuple(obstacle_positions)
+        blocked_collision_cells: set[Tuple[int, int]] = set()
+        collision_radius = (
+            base_clearance + PATH_COLLISION_GRID_M / math.sqrt(2.0)
+        )
+        collision_cell_radius = math.ceil(
+            collision_radius / PATH_COLLISION_GRID_M
+        )
+        for obstacle_forward, obstacle_lateral in obstacles:
+            center_forward = round(
+                obstacle_forward / PATH_COLLISION_GRID_M
+            )
+            center_lateral = round(
+                obstacle_lateral / PATH_COLLISION_GRID_M
+            )
+            for forward_offset in range(
+                -collision_cell_radius,
+                collision_cell_radius + 1,
+            ):
+                for lateral_offset in range(
+                    -collision_cell_radius,
+                    collision_cell_radius + 1,
+                ):
+                    cell_forward = (
+                        center_forward + forward_offset
+                    ) * PATH_COLLISION_GRID_M
+                    cell_lateral = (
+                        center_lateral + lateral_offset
+                    ) * PATH_COLLISION_GRID_M
+                    if math.hypot(
+                        cell_forward - obstacle_forward,
+                        cell_lateral - obstacle_lateral,
+                    ) < collision_radius - 1e-9:
+                        blocked_collision_cells.add(
+                            (
+                                center_forward + forward_offset,
+                                center_lateral + lateral_offset,
+                            )
+                        )
+
+        def select_dynamic_goal() -> Tuple[float, float, float, float]:
+            if not observed_obstacles:
+                return PATH_DYNAMIC_GOAL_RANGE_M, 0.0, 0.0, 120.0
+            occupied: List[Tuple[float, float]] = []
+            for obstacle in observed_obstacles:
+                forward = float(obstacle["forward_m"])
+                lateral = float(obstacle["lateral_m"])
+                distance = math.hypot(forward, lateral)
+                if distance <= PATH_NEAR_FIELD_EXCLUSION_M:
+                    continue
+                azimuth = math.degrees(math.atan2(lateral, forward))
+                half_width = math.degrees(
+                    math.asin(min(0.95, collision_radius / distance))
+                )
+                occupied.append(
+                    (
+                        max(-PATH_FOV_AZIMUTH_DEG, azimuth - half_width),
+                        min(PATH_FOV_AZIMUTH_DEG, azimuth + half_width),
+                    )
+                )
+            occupied.sort()
+            merged: List[List[float]] = []
+            for start_angle, end_angle in occupied:
+                if start_angle >= end_angle:
+                    continue
+                if not merged or start_angle > merged[-1][1]:
+                    merged.append([start_angle, end_angle])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end_angle)
+            free_intervals: List[Tuple[float, float]] = []
+            cursor = -PATH_FOV_AZIMUTH_DEG
+            for start_angle, end_angle in merged:
+                if start_angle > cursor:
+                    free_intervals.append((cursor, start_angle))
+                cursor = max(cursor, end_angle)
+            if cursor < PATH_FOV_AZIMUTH_DEG:
+                free_intervals.append((cursor, PATH_FOV_AZIMUTH_DEG))
+            if not free_intervals:
+                return PATH_DYNAMIC_GOAL_RANGE_M, 0.0, 0.0, 0.0
+            best_interval = max(
+                free_intervals,
+                key=lambda interval: (
+                    (interval[1] - interval[0])
+                    - abs((interval[0] + interval[1]) * 0.5) * 0.15,
+                    -abs((interval[0] + interval[1]) * 0.5),
+                ),
+            )
+            goal_angle_deg = (best_interval[0] + best_interval[1]) * 0.5
+            goal_angle_rad = math.radians(goal_angle_deg)
+            return (
+                PATH_DYNAMIC_GOAL_RANGE_M * math.cos(goal_angle_rad),
+                PATH_DYNAMIC_GOAL_RANGE_M * math.sin(goal_angle_rad),
+                goal_angle_deg,
+                best_interval[1] - best_interval[0],
+            )
+
+        (
+            goal_forward_m,
+            goal_lateral_m,
+            goal_angle_deg,
+            goal_corridor_width_deg,
+        ) = select_dynamic_goal()
+        goal_range_m = math.hypot(goal_forward_m, goal_lateral_m)
+        goal_unit_forward = goal_forward_m / max(goal_range_m, 1e-9)
+        goal_unit_lateral = goal_lateral_m / max(goal_range_m, 1e-9)
+        initial_curvatures = tuple(
+            dict.fromkeys(
+                min(
+                    PATH_CURVATURES,
+                    key=lambda primitive: abs(primitive - float(curvature)),
+                )
+                for curvature in curvatures
+            )
+        ) or PATH_CURVATURES
+
+        def heading_index(heading: float) -> int:
+            raw = round(heading / PATH_HEADING_STEP_RAD)
+            return (
+                (raw + PATH_HEADING_BINS // 2) % PATH_HEADING_BINS
+                - PATH_HEADING_BINS // 2
+            )
+
+        def in_search_scene(forward: float, lateral: float) -> bool:
+            if not (
+                0.0 <= forward <= PATH_LOCAL_MAX_RANGE_M
+                and abs(lateral) < PATH_LOCAL_MAX_RANGE_M
+            ):
+                return False
+            distance = math.hypot(forward, lateral)
+            if distance > PATH_LOCAL_MAX_RANGE_M + 1e-9:
+                return False
+            if distance <= 1e-9:
+                return True
+            return abs(math.degrees(math.atan2(lateral, forward))) <= (
+                PATH_FOV_AZIMUTH_DEG
+            )
+
+        def collision_free(
+            start: Tuple[float, float],
+            end: Tuple[float, float],
+        ) -> bool:
+            for sample_index in range(1, 5):
+                ratio = sample_index / 4.0
+                forward = start[0] + (end[0] - start[0]) * ratio
+                lateral = start[1] + (end[1] - start[1]) * ratio
+                if (
+                    round(forward / PATH_COLLISION_GRID_M),
+                    round(lateral / PATH_COLLISION_GRID_M),
+                ) in blocked_collision_cells:
+                    return False
+            return True
+
+        State = Tuple[int, int, int]
+        start: State = (0, 0, 0)
+        poses: Dict[State, Tuple[float, float, float]] = {
+            start: (0.0, 0.0, 0.0)
+        }
+        parents: Dict[State, Tuple[State, float]] = {}
+        costs: Dict[State, float] = {start: 0.0}
+        arc_lengths: Dict[State, float] = {start: 0.0}
+        queue: List[Tuple[float, int, State]] = [
+            (goal_range_m, 0, start)
+        ]
+        closed: set[State] = set()
+        push_sequence = 0
+        expansions = 0
+        best_state = start
+        best_score = 0.0
+        goal_state: Optional[State] = None
+
+        while queue and expansions < PATH_SEARCH_MAX_EXPANSIONS:
+            priority, _, state = heapq.heappop(queue)
+            del priority
+            if state in closed:
+                continue
+            closed.add(state)
+            forward, lateral, heading = poses[state]
+            cost = costs[state]
+            expansions += 1
+            if math.hypot(
+                forward - goal_forward_m,
+                lateral - goal_lateral_m,
+            ) <= PATH_DYNAMIC_GOAL_TOLERANCE_M:
+                goal_state = state
+                break
+            if arc_lengths[state] >= PATH_SEARCH_MAX_ARC_M:
+                continue
+            primitives = initial_curvatures if state == start else PATH_CURVATURES
+            for curvature in primitives:
+                next_heading = heading + curvature * PATH_SEARCH_STEP_M
+                midpoint_heading = (
+                    heading + curvature * PATH_SEARCH_STEP_M * 0.5
+                )
+                next_forward = (
+                    forward + math.cos(midpoint_heading) * PATH_SEARCH_STEP_M
+                )
+                next_lateral = (
+                    lateral + math.sin(midpoint_heading) * PATH_SEARCH_STEP_M
+                )
+                next_forward = (
+                    round(next_forward / PATH_SEARCH_GRID_M)
+                    * PATH_SEARCH_GRID_M
+                )
+                next_lateral = (
+                    round(next_lateral / PATH_SEARCH_GRID_M)
+                    * PATH_SEARCH_GRID_M
+                )
+                next_heading_index = heading_index(next_heading)
+                next_heading = next_heading_index * PATH_HEADING_STEP_RAD
+                if not in_search_scene(next_forward, next_lateral):
+                    continue
+                if not collision_free(
+                    (forward, lateral),
+                    (next_forward, next_lateral),
+                ):
+                    continue
+                next_state: State = (
+                    round(next_forward / PATH_SEARCH_GRID_M),
+                    round(next_lateral / PATH_SEARCH_GRID_M),
+                    next_heading_index,
+                )
+                step_distance = math.hypot(
+                    next_forward - forward,
+                    next_lateral - lateral,
+                )
+                if step_distance < PATH_SEARCH_GRID_M * 0.5:
+                    continue
+                turn_cost = 0.012 if abs(curvature) > 1e-9 else 0.0
+                center_recovery_cost = (
+                    abs(next_lateral - goal_lateral_m) * 0.003
+                )
+                next_cost = (
+                    cost
+                    + step_distance
+                    + turn_cost
+                    + center_recovery_cost
+                )
+                next_arc = arc_lengths[state] + step_distance
+                if next_arc > PATH_SEARCH_MAX_ARC_M + 1e-9:
+                    continue
+                if next_cost >= costs.get(next_state, math.inf) - 1e-9:
+                    continue
+                costs[next_state] = next_cost
+                arc_lengths[next_state] = next_arc
+                poses[next_state] = (
+                    next_forward,
+                    next_lateral,
+                    next_heading,
+                )
+                parents[next_state] = (state, curvature)
+                heuristic = math.hypot(
+                    next_forward - goal_forward_m,
+                    next_lateral - goal_lateral_m,
+                )
+                push_sequence += 1
+                heapq.heappush(
+                    queue,
+                    (next_cost + heuristic, push_sequence, next_state),
+                )
+                progress_along_goal = (
+                    next_forward * goal_unit_forward
+                    + next_lateral * goal_unit_lateral
+                )
+                cross_track_error = abs(
+                    -next_forward * goal_unit_lateral
+                    + next_lateral * goal_unit_forward
+                )
+                progress_score = (
+                    progress_along_goal
+                    - cross_track_error * 0.05
+                    - next_cost * 0.01
+                )
+                if progress_score > best_score:
+                    best_score = progress_score
+                    best_state = next_state
+
+        selected_state = goal_state if goal_state is not None else best_state
+        states = [selected_state]
+        primitive_path: List[float] = []
+        while states[-1] != start:
+            previous, curvature = parents[states[-1]]
+            primitive_path.append(curvature)
+            states.append(previous)
+        states.reverse()
+        primitive_path.reverse()
+        lattice_points = [
+            (poses[state][0], poses[state][1])
+            for state in states
+        ]
+
+        def resample_polyline(
+            raw_points: Sequence[Tuple[float, float]],
+        ) -> List[List[float]]:
+            cumulative = [0.0]
+            for left, right in zip(raw_points, raw_points[1:]):
+                cumulative.append(
+                    cumulative[-1]
+                    + math.hypot(
+                        right[0] - left[0],
+                        right[1] - left[1],
+                    )
+                )
+            sampled_length = math.floor(
+                (cumulative[-1] + 1e-9) / PATH_RESOLUTION_M
+            ) * PATH_RESOLUTION_M
+            sampled: List[List[float]] = [[0.0, 0.0]]
+            segment_index = 0
+            for sample_index in range(
+                1,
+                round(sampled_length / PATH_RESOLUTION_M) + 1,
+            ):
+                target = sample_index * PATH_RESOLUTION_M
+                while (
+                    segment_index + 1 < len(cumulative)
+                    and cumulative[segment_index + 1] < target - 1e-9
+                ):
+                    segment_index += 1
+                if segment_index + 1 >= len(raw_points):
+                    break
+                span = (
+                    cumulative[segment_index + 1]
+                    - cumulative[segment_index]
+                )
+                ratio = 0.0 if span <= 1e-9 else (
+                    (target - cumulative[segment_index]) / span
+                )
+                left = raw_points[segment_index]
+                right = raw_points[segment_index + 1]
+                sampled.append(
+                    [
+                        round(
+                            left[0] + (right[0] - left[0]) * ratio,
+                            4,
+                        ),
+                        round(
+                            left[1] + (right[1] - left[1]) * ratio,
+                            4,
+                        ),
+                    ]
+                )
+            return sampled
+
+        smooth_points: List[Tuple[float, float]] = []
+        if len(lattice_points) >= 3:
+            for index in range(len(lattice_points) - 1):
+                p0 = lattice_points[max(0, index - 1)]
+                p1 = lattice_points[index]
+                p2 = lattice_points[index + 1]
+                p3 = lattice_points[min(len(lattice_points) - 1, index + 2)]
+                for subdivision in range(8):
+                    if index > 0 and subdivision == 0:
+                        continue
+                    t = subdivision / 8.0
+                    t2 = t * t
+                    t3 = t2 * t
+                    smooth_points.append(
+                        (
+                            0.5
+                            * (
+                                2.0 * p1[0]
+                                + (-p0[0] + p2[0]) * t
+                                + (2.0 * p0[0] - 5.0 * p1[0] + 4.0 * p2[0] - p3[0]) * t2
+                                + (-p0[0] + 3.0 * p1[0] - 3.0 * p2[0] + p3[0]) * t3
+                            ),
+                            0.5
+                            * (
+                                2.0 * p1[1]
+                                + (-p0[1] + p2[1]) * t
+                                + (2.0 * p0[1] - 5.0 * p1[1] + 4.0 * p2[1] - p3[1]) * t2
+                                + (-p0[1] + 3.0 * p1[1] - 3.0 * p2[1] + p3[1]) * t3
+                            ),
+                        )
+                    )
+            smooth_points.append(lattice_points[-1])
+        smoothing_valid = bool(smooth_points) and all(
+            in_search_scene(forward, lateral)
+            and (
+                round(forward / PATH_COLLISION_GRID_M),
+                round(lateral / PATH_COLLISION_GRID_M),
+            ) not in blocked_collision_cells
+            for forward, lateral in smooth_points
+        )
+        points = resample_polyline(
+            smooth_points if smoothing_valid else lattice_points
+        )
+
+        length_m = (len(points) - 1) * PATH_RESOLUTION_M
+        initial_curvature = next(
+            (
+                curvature
+                for curvature in primitive_path[
+                    : max(1, round(0.50 / PATH_SEARCH_STEP_M))
+                ]
+                if abs(curvature) > 1e-9
+            ),
+            0.0,
+        )
+        nonzero_turns = [
+            1 if curvature > 0 else -1
+            for curvature in primitive_path
+            if abs(curvature) > 1e-9
+        ]
+        direction_changes = sum(
+            left != right
+            for left, right in zip(nonzero_turns, nonzero_turns[1:])
+        )
+        minimum_clearance = PATH_LOCAL_MAX_RANGE_M
+        if obstacles and points:
+            minimum_clearance = min(
+                math.hypot(
+                    point[0] - obstacle_forward,
+                    point[1] - obstacle_lateral,
+                )
+                - base_clearance
+                for point in points
+                for obstacle_forward, obstacle_lateral in obstacles
+            )
+        completion = min(
+            1.0,
+            max(
+                0.0,
+                (
+                    points[-1][0] * goal_unit_forward
+                    + points[-1][1] * goal_unit_lateral
+                )
+                / max(goal_range_m, 1e-9),
+            ),
+        )
+        if goal_state is not None:
+            completion = 1.0
+        # The configured 3 cm safety margin and conservative collision raster
+        # are already included in base_clearance.
+        clearance_score = min(1.0, max(0.0, minimum_clearance / 0.05))
+        search_headroom = max(
+            0.0,
+            1.0 - expansions / PATH_SEARCH_MAX_EXPANSIONS,
+        )
+        geometry_confidence = (
+            completion * 0.50
+            + clearance_score * 0.25
+            + search_headroom * 0.15
+            + (0.10 if smoothing_valid else 0.04)
+        )
+        headings = [
+            math.atan2(
+                right[1] - left[1],
+                right[0] - left[0],
+            )
+            for left, right in zip(points, points[1:])
+        ]
+        maximum_heading_step = max(
+            (
+                abs(
+                    math.atan2(
+                        math.sin(right - left),
+                        math.cos(right - left),
+                    )
+                )
+                for left, right in zip(headings, headings[1:])
+            ),
+            default=0.0,
+        )
+        return {
+            "status": "clear" if goal_state is not None else "limited",
+            "resolution_m": PATH_RESOLUTION_M,
+            "length_m": round(length_m, 2),
+            "curvature_per_m": round(initial_curvature, 3),
+            "planner_mode": "dynamic_corridor_hybrid_lattice",
+            "search_resolution_m": PATH_SEARCH_GRID_M,
+            "heading_resolution_deg": round(
+                math.degrees(PATH_HEADING_STEP_RAD), 1
+            ),
+            "minimum_turn_radius_m": round(
+                1.0 / max(abs(curvature) for curvature in PATH_CURVATURES),
+                3,
+            ),
+            "goal_reached": goal_state is not None,
+            "search_expansions": expansions,
+            "turn_count": len(nonzero_turns),
+            "direction_changes": direction_changes,
+            "receding_horizon_m": 0.25,
+            "local_max_range_m": PATH_LOCAL_MAX_RANGE_M,
+            "fov_azimuth_deg": PATH_FOV_AZIMUTH_DEG,
+            "smoothed": smoothing_valid,
+            "minimum_clearance_m": round(minimum_clearance, 3),
+            "geometry_confidence": round(geometry_confidence, 3),
+            "maximum_heading_step_deg": round(
+                math.degrees(maximum_heading_step), 2
+            ),
+            "confidence_scope": "local_geometry_not_free_space_proof",
+            "robot_width_m": PATH_ROBOT_WIDTH_M,
+            "safety_margin_m": PATH_SAFETY_MARGIN_M,
+            "minimum_passage_width_m": (
+                PATH_ROBOT_WIDTH_M + PATH_SAFETY_MARGIN_M * 2.0
+            ),
+            "obstacle_wall_link_m": OBSTACLE_CLUSTER_LINK_M,
+            "obstacle_wall_segments": wall_segment_count,
+            "obstacle_object_clusters": object_cluster_count,
+            "largest_object_cluster_cells": largest_object_cluster,
+            "obstacle_cross_source_link_m": (
+                OBSTACLE_CLUSTER_CROSS_SOURCE_LINK_M
+            ),
+            "near_field_exclusion_m": PATH_NEAR_FIELD_EXCLUSION_M,
+            "near_field_excluded": near_field_excluded,
+            "range_uncertainty_lateral_inflation_m": 0.0,
+            "goal_forward_m": round(goal_forward_m, 3),
+            "goal_lateral_m": round(goal_lateral_m, 3),
+            "goal_angle_deg": round(goal_angle_deg, 1),
+            "goal_corridor_width_deg": round(
+                goal_corridor_width_deg, 1
+            ),
+            "goal_selection_mode": "widest_motion_relative_corridor",
+            "persistent_obstacles_used": len(obstacle_tracks),
+            "points": points,
+        }
+
+    def _heatmap_clusters(
+        self,
+        frame: RadarFrame,
+    ) -> Tuple[List[Dict[str, float]], int]:
+        """Return spatial clusters of calibrated heatmap residual cells."""
+        heatmap = frame.heatmap
+        model = self.clutter_model
+        if heatmap is None or model is None:
+            return [], 0
+        span_db = heatmap.ceiling_db - heatmap.floor_db
+        candidates: Dict[
+            Tuple[int, int], Dict[str, float]
+        ] = {}
+        for range_index in range(1, heatmap.range_bins):
+            range_m = range_index * heatmap.range_step_m
+            if range_m > SCENE_MAX_FORWARD_M:
+                break
+            for azimuth_index in range(heatmap.azimuth_bins):
+                flat_index = (
+                    range_index * heatmap.azimuth_bins + azimuth_index
+                )
+                observed_db = (
+                    heatmap.floor_db
+                    + heatmap.data[flat_index] / 255.0 * span_db
+                )
+                residual_db = (
+                    observed_db - model.heatmap_median_db[flat_index]
+                )
+                mad_db = model.heatmap_mad_db[flat_index]
+                enter_threshold_db = max(
+                    HEATMAP_ENTER_MIN_RESIDUAL_DB,
+                    HEATMAP_ENTER_MAD_MULTIPLIER * mad_db,
+                )
+                exit_threshold_db = max(
+                    HEATMAP_EXIT_MIN_RESIDUAL_DB,
+                    HEATMAP_EXIT_MAD_MULTIPLIER * mad_db,
+                )
+                forward_m, lateral_m = self._heatmap_cell_position(
+                    range_m,
+                    azimuth_index,
+                    heatmap.azimuth_bins,
+                )
+                if not self._in_scene(forward_m, lateral_m):
+                    continue
+                entering = residual_db >= enter_threshold_db
+                held = (
+                    residual_db >= exit_threshold_db
+                    and self._near_existing_heatmap_track(
+                        forward_m,
+                        lateral_m,
+                    )
+                )
+                if not entering and not held:
+                    continue
+                candidates[(range_index, azimuth_index)] = {
+                    "forward_m": forward_m,
+                    "lateral_m": lateral_m,
+                    "residual_db": residual_db,
+                    "entering": 1.0 if entering else 0.0,
+                }
+
+        remaining = set(candidates)
+        clusters: List[Dict[str, float]] = []
+        while remaining:
+            seed = remaining.pop()
+            seed_cell = candidates[seed]
+            component = [seed]
+            pending = [seed]
+            while pending:
+                range_index, azimuth_index = pending.pop()
+                for range_offset in (-1, 0, 1):
+                    for azimuth_offset in (-1, 0, 1):
+                        if range_offset == 0 and azimuth_offset == 0:
+                            continue
+                        neighbor = (
+                            range_index + range_offset,
+                            azimuth_index + azimuth_offset,
+                        )
+                        if (
+                            neighbor in remaining
+                            and math.hypot(
+                                candidates[neighbor]["forward_m"]
+                                - seed_cell["forward_m"],
+                                candidates[neighbor]["lateral_m"]
+                                - seed_cell["lateral_m"],
+                            ) <= HEATMAP_MAX_CLUSTER_RADIUS_M
+                        ):
+                            remaining.remove(neighbor)
+                            component.append(neighbor)
+                            pending.append(neighbor)
+            cells = [candidates[index] for index in component]
+            peak_residual_db = max(
+                cell["residual_db"] for cell in cells
+            )
+            if (
+                len(cells) < 2
+                and peak_residual_db < HEATMAP_SINGLE_CELL_PEAK_DB
+            ):
+                continue
+            if not any(cell["entering"] for cell in cells):
+                # Hysteresis may retain an existing cluster, but may not
+                # create a new cluster from exit-threshold cells alone.
+                if not any(
+                    self._near_existing_heatmap_track(
+                        cell["forward_m"],
+                        cell["lateral_m"],
+                    )
+                    for cell in cells
+                ):
+                    continue
+            weights = [max(0.1, cell["residual_db"]) for cell in cells]
+            total_weight = sum(weights)
+            forward_m = sum(
+                cell["forward_m"] * weight
+                for cell, weight in zip(cells, weights)
+            ) / total_weight
+            lateral_m = sum(
+                cell["lateral_m"] * weight
+                for cell, weight in zip(cells, weights)
+            ) / total_weight
+            cluster_spread_m = max(
+                math.hypot(
+                    cell["forward_m"] - forward_m,
+                    cell["lateral_m"] - lateral_m,
+                )
+                for cell in cells
+            )
+            clusters.append(
+                {
+                    "forward_m": forward_m,
+                    "lateral_m": lateral_m,
+                    "range_uncertainty_m": max(
+                        heatmap.range_step_m,
+                        min(
+                            HEATMAP_MAX_RANGE_UNCERTAINTY_M,
+                            cluster_spread_m,
+                        ),
+                    ),
+                    "strength_confidence": max(
+                        0.05,
+                        min(1.0, peak_residual_db / 24.0),
+                    ),
+                    "cell_count": float(len(cells)),
+                    "peak_residual_db": peak_residual_db,
+                }
+            )
+        clusters.sort(
+            key=lambda cluster: (
+                float(cluster["peak_residual_db"]),
+                float(cluster["cell_count"]),
+            ),
+            reverse=True,
+        )
+        return clusters[:HEATMAP_MAX_CLUSTERS_PER_FRAME], len(candidates)
+
+    @staticmethod
+    def _heatmap_cell_position(
+        range_m: float,
+        azimuth_index: int,
+        azimuth_bins: int,
+    ) -> Tuple[float, float]:
+        angle_argument = (
+            2.0 * (azimuth_index - azimuth_bins / 2.0) / azimuth_bins
+        )
+        angle_rad = math.asin(
+            max(-1.0, min(1.0, angle_argument))
+        )
+        angle_rad = math.radians(
+            max(-70.0, min(70.0, math.degrees(angle_rad)))
+        )
+        return (
+            range_m * math.cos(angle_rad),
+            range_m * math.sin(angle_rad),
+        )
+
+    def _near_existing_heatmap_track(
+        self,
+        forward_m: float,
+        lateral_m: float,
+    ) -> bool:
+        return any(
+            track["source"] == "heatmap"
+            and math.hypot(
+                float(track["forward_m"]) - forward_m,
+                float(track["lateral_m"]) - lateral_m,
+            ) <= HEATMAP_TRACK_ASSOCIATION_M
+            for track in self._tracks
+        )
 
     def _binding_status(self, frame: RadarFrame) -> str:
         if self.synthetic:
@@ -461,17 +2393,18 @@ class RadarSceneEstimator:
         confidence: float,
         source: str,
         received_at: float,
+        point_correlated: bool = False,
+        cluster_cells: int = 0,
+        peak_residual_db: float = 0.0,
     ) -> None:
         association_candidates = [
             track
             for track in self._tracks
-            if (
-                source == "point"
-                and not bool(track.get("_updated_by_point"))
-            )
-            or (
-                source == "heatmap"
-                and track["source"] == "heatmap"
+            if track["source"] == source
+            and (
+                not bool(track.get("_updated_by_point"))
+                if source == "point"
+                else not bool(track.get("_updated_by_heatmap"))
             )
         ]
         nearest = min(
@@ -488,51 +2421,168 @@ class RadarSceneEstimator:
                 float(nearest["forward_m"]) - forward_m,
                 float(nearest["lateral_m"]) - lateral_m,
             )
-            <= TRACK_ASSOCIATION_M
+            <= (
+                TRACK_ASSOCIATION_M
+                if source == "point"
+                else HEATMAP_TRACK_ASSOCIATION_M
+            )
         ):
-            if not (
-                source == "heatmap"
-                and bool(nearest.get("_updated_by_point"))
-            ):
+            if source == "point":
                 nearest["forward_m"] = forward_m
                 nearest["lateral_m"] = lateral_m
-                nearest["distance_m"] = math.hypot(
-                    forward_m,
-                    lateral_m,
-                )
                 nearest["range_uncertainty_m"] = range_uncertainty_m
                 nearest["confidence"] = confidence
-                nearest["source"] = source
                 if height_m is not None:
                     nearest["height_m"] = height_m
+            else:
+                smoothing = 0.35
+                nearest["forward_m"] = (
+                    float(nearest["forward_m"]) * (1.0 - smoothing)
+                    + forward_m * smoothing
+                )
+                nearest["lateral_m"] = (
+                    float(nearest["lateral_m"]) * (1.0 - smoothing)
+                    + lateral_m * smoothing
+                )
+                nearest["range_uncertainty_m"] = max(
+                    float(nearest["range_uncertainty_m"]),
+                    range_uncertainty_m,
+                )
+                position_history = nearest["_position_history"]
+                assert isinstance(position_history, list)
+                position_history.append((forward_m, lateral_m))
+                del position_history[:-HEATMAP_HISTORY_FRAMES]
+                heatmap_hits = nearest["_heatmap_hits"]
+                point_hits = nearest["_point_association_hits"]
+                assert isinstance(heatmap_hits, list)
+                assert isinstance(point_hits, list)
+                heatmap_hits[-1] = True
+                point_hits[-1] = point_correlated
+                nearest["cluster_cells"] = cluster_cells
+                nearest["peak_residual_db"] = round(
+                    peak_residual_db,
+                    3,
+                )
+                nearest["_strength_confidence"] = confidence
+                nearest["_updated_by_heatmap"] = True
+                self._update_heatmap_track_state(nearest)
+            nearest["distance_m"] = math.hypot(
+                float(nearest["forward_m"]),
+                float(nearest["lateral_m"]),
+            )
             nearest["_received_at_ns"] = self._seconds_to_ns(received_at)
             if source == "point":
                 hits = nearest["_point_hits"]
                 assert isinstance(hits, list)
                 hits[-1] = True
                 nearest["point_confirmed"] = sum(hits) >= 2
+                nearest["classification"] = (
+                    "confirmed_obstacle"
+                    if nearest["point_confirmed"]
+                    else "point_candidate"
+                )
                 nearest["_updated_by_point"] = True
             return
 
         point_hit = source == "point"
-        self._tracks.append(
-            {
-                "track_id": self._next_track_id,
-                "forward_m": forward_m,
-                "lateral_m": lateral_m,
-                "height_m": height_m,
-                "distance_m": math.hypot(forward_m, lateral_m),
-                "range_uncertainty_m": range_uncertainty_m,
-                "confidence": confidence,
-                "source": source,
-                "point_confirmed": False,
-                "age_ms": 0,
-                "_received_at_ns": self._seconds_to_ns(received_at),
-                "_point_hits": [point_hit],
-                "_updated_by_point": point_hit,
-            }
-        )
+        track: Dict[str, object] = {
+            "track_id": self._next_track_id,
+            "forward_m": forward_m,
+            "lateral_m": lateral_m,
+            "height_m": height_m,
+            "distance_m": math.hypot(forward_m, lateral_m),
+            "range_uncertainty_m": range_uncertainty_m,
+            "confidence": confidence,
+            "source": source,
+            "point_confirmed": False,
+            "classification": (
+                "point_candidate"
+                if source == "point"
+                else "reflection_evidence"
+            ),
+            "age_ms": 0,
+            "_received_at_ns": self._seconds_to_ns(received_at),
+            "_point_hits": [point_hit],
+            "_updated_by_point": point_hit,
+            "_updated_by_heatmap": source == "heatmap",
+        }
+        if source == "heatmap":
+            track.update(
+                {
+                    "heatmap_confirmed": False,
+                    "point_correlated": point_correlated,
+                    "position_stable": False,
+                    "position_jitter_m": None,
+                    "persistence": 1.0 / HEATMAP_HISTORY_FRAMES,
+                    "cluster_cells": cluster_cells,
+                    "peak_residual_db": round(peak_residual_db, 3),
+                    "_heatmap_hits": [True],
+                    "_point_association_hits": [point_correlated],
+                    "_position_history": [(forward_m, lateral_m)],
+                    "_strength_confidence": confidence,
+                }
+            )
+            self._update_heatmap_track_state(track)
+        self._tracks.append(track)
         self._next_track_id += 1
+
+    @staticmethod
+    def _update_heatmap_track_state(track: Dict[str, object]) -> None:
+        heatmap_hits = track["_heatmap_hits"]
+        point_hits = track["_point_association_hits"]
+        position_history = track["_position_history"]
+        assert isinstance(heatmap_hits, list)
+        assert isinstance(point_hits, list)
+        assert isinstance(position_history, list)
+        persistence = sum(bool(hit) for hit in heatmap_hits) / max(
+            HEATMAP_HISTORY_FRAMES,
+            len(heatmap_hits),
+        )
+        center_forward = sum(point[0] for point in position_history) / len(
+            position_history
+        )
+        center_lateral = sum(point[1] for point in position_history) / len(
+            position_history
+        )
+        jitter_m = max(
+            math.hypot(
+                point[0] - center_forward,
+                point[1] - center_lateral,
+            )
+            for point in position_history
+        )
+        repeated = sum(bool(hit) for hit in heatmap_hits) >= HEATMAP_CONFIRM_HITS
+        point_correlated = (
+            sum(bool(hit) for hit in point_hits)
+            >= HEATMAP_POINT_CONFIRM_HITS
+        )
+        position_stable = (
+            len(position_history) >= HEATMAP_CONFIRM_HITS
+            and jitter_m <= HEATMAP_MAX_POSITION_JITTER_M
+        )
+        confirmed = repeated and point_correlated and position_stable
+        strength = float(track.get("_strength_confidence", 0.0))
+        stability_score = max(
+            0.0,
+            1.0 - jitter_m / HEATMAP_MAX_POSITION_JITTER_M,
+        )
+        confidence = (
+            strength * 0.35
+            + persistence * 0.25
+            + stability_score * 0.15
+            + (0.25 if point_correlated else 0.0)
+        )
+        if not point_correlated:
+            confidence = min(confidence, 0.55)
+        track["persistence"] = round(persistence, 3)
+        track["position_jitter_m"] = round(jitter_m, 4)
+        track["position_stable"] = position_stable
+        track["point_correlated"] = point_correlated
+        track["heatmap_confirmed"] = confirmed
+        track["classification"] = (
+            "confirmed_obstacle" if confirmed else "reflection_evidence"
+        )
+        track["confidence"] = round(max(0.05, min(1.0, confidence)), 3)
 
     def _expire_tracks(self, now: float) -> None:
         now_ns = self._seconds_to_ns(now)

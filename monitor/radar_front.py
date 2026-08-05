@@ -51,7 +51,7 @@ from sensors.radar_parent_lease import (  # noqa: E402
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
-UI_BUILD_ID = "20260729-lidar-operator-r10"
+UI_BUILD_ID = "20260802-xyz-pointcloud-r31"
 RADAR_VALID_MIN_RANGE_M = 0.07
 SUPERVISOR_BLOCKED_WARNING = "RADAR RECONNECTING \u00b7 DRIVE STOP"
 
@@ -323,6 +323,17 @@ class RadarFrontState:
                     "radial_velocity_mps",
                     "snr_db",
                 ],
+                "projection_mode": "range_azimuth_2d",
+                "elevation_used": False,
+                "point_cloud_3d_available": True,
+                "point_cloud_3d_range_m": 0.50,
+                "point_cloud_projection_mode": "cartesian_xyz_3d",
+                "elevation_available": True,
+                "point_cloud_3d_fields": [
+                    "forward_m",
+                    "lateral_m",
+                    "height_m",
+                ],
                 "nearest_corridor_m": (
                     None
                     if nearest_corridor is None
@@ -393,8 +404,8 @@ class RadarFrontState:
             "source": "radar",
             "azimuth_layout": "fft-shifted-spatial-frequency",
             "lambda_over_d_x": 2.0,
-            "azimuth_min_deg": -70.0,
-            "azimuth_max_deg": 70.0,
+            "azimuth_min_deg": -60.0,
+            "azimuth_max_deg": 60.0,
             "valid_min_range_m": RADAR_VALID_MIN_RANGE_M,
             "valid_max_range_m": 7.5,
             "layout": "range-major_azimuth-minor",
@@ -503,6 +514,10 @@ class RadarFrontState:
                 "age_ms",
                 "persistence",
             ],
+                "projection_mode": "range_azimuth_2d",
+                "elevation_used": False,
+                "elevation_available": True,
+                "point_cloud_projection_mode": "cartesian_xyz_3d",
             "points": history_points,
             "truncated": truncated,
         }
@@ -650,6 +665,9 @@ class RadarFrontState:
                     "stale_after_ms": round(self.stale_after_s * 1000.0),
                     "fault_after_ms": round(self.fault_after_s * 1000.0),
                     "display_limit_only": True,
+                    "projection_mode": "range_azimuth_2d",
+                    "elevation_used": False,
+                    "point_cloud_3d_available": True,
                 },
                 "frame": frame,
                 "occupancy": occupancy,

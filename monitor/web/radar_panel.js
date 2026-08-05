@@ -1,10 +1,10 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260729-lidar-operator-r10";
-  const MAIN_MAX_RANGE_M = 3.0;
-  const MAIN_HALF_WIDTH_M = 1.5;
-  const CLOSE_MAX_RANGE_M = 0.5;
+  const UI_BUILD_ID = "20260802-xyz-pointcloud-r31";
+  const MAIN_MAX_RANGE_M = 0.5;
+  const MAIN_HALF_WIDTH_M = 0.5;
+  const CLOSE_MAX_RANGE_M = 0.6;
   const DANGER_RANGE_M = 0.1;
   const TRACK_MAX_AGE_MS = 300;
   const NORMAL_COPY =
@@ -81,11 +81,18 @@
       this.root = root;
       this.mainCanvas = root.querySelector("#radar-main-canvas");
       this.collisionCanvas = root.querySelector("#collision-canvas");
+      this.pointCloud3dCanvas = root.querySelector("#pointcloud-3d-canvas");
       if (!this.mainCanvas || !this.collisionCanvas) {
         throw new Error("radar map canvases are required");
       }
       this.mainContext = this.mainCanvas.getContext("2d");
       this.collisionContext = this.collisionCanvas.getContext("2d");
+      this.pointCloud3dContext = this.pointCloud3dCanvas
+        ? this.pointCloud3dCanvas.getContext("2d")
+        : null;
+      this.pointCloud3dYaw = -0.62;
+      this.pointCloud3dPitch = 0.38;
+      this.pointCloud3dDrag = null;
       this.fullscreenButton = document.querySelector("#fullscreen-button");
       this.rawToggle = document.querySelector("#raw-toggle");
       this.options = Object.assign({ endpoint: "/api/radar" }, options || {});
@@ -101,11 +108,46 @@
         this.resizeObserver = new ResizeObserver(() => this.draw());
         this.resizeObserver.observe(this.root);
         this.resizeObserver.observe(this.collisionCanvas);
+        if (this.pointCloud3dCanvas) {
+          this.resizeObserver.observe(this.pointCloud3dCanvas);
+        }
       } else {
         window.addEventListener("resize", () => this.draw());
       }
       if (this.rawToggle) {
         this.rawToggle.addEventListener("change", () => this.draw());
+      }
+      if (this.pointCloud3dCanvas) {
+        this.pointCloud3dCanvas.addEventListener("pointerdown", (event) => {
+          this.pointCloud3dDrag = {
+            x: event.clientX,
+            y: event.clientY,
+            yaw: this.pointCloud3dYaw,
+            pitch: this.pointCloud3dPitch,
+          };
+          if (this.pointCloud3dCanvas.setPointerCapture) {
+            this.pointCloud3dCanvas.setPointerCapture(event.pointerId);
+          }
+        });
+        this.pointCloud3dCanvas.addEventListener("pointermove", (event) => {
+          if (!this.pointCloud3dDrag) return;
+          this.pointCloud3dYaw = this.pointCloud3dDrag.yaw +
+            (event.clientX - this.pointCloud3dDrag.x) * 0.008;
+          this.pointCloud3dPitch = Math.max(
+            -1.15,
+            Math.min(
+              1.15,
+              this.pointCloud3dDrag.pitch +
+                (event.clientY - this.pointCloud3dDrag.y) * 0.008,
+            ),
+          );
+          this.draw();
+        });
+        const finish3dDrag = () => {
+          this.pointCloud3dDrag = null;
+        };
+        this.pointCloud3dCanvas.addEventListener("pointerup", finish3dDrag);
+        this.pointCloud3dCanvas.addEventListener("pointercancel", finish3dDrag);
       }
       this.fullscreenButton.addEventListener("click", async () => {
         if (document.fullscreenElement) {
@@ -205,8 +247,18 @@
     draw() {
       const main = this.resizeCanvas(this.mainCanvas);
       const collision = this.resizeCanvas(this.collisionCanvas);
+      const pointCloud3d = this.pointCloud3dCanvas
+        ? this.resizeCanvas(this.pointCloud3dCanvas)
+        : null;
       this.clearCanvas(main.ctx, main.width, main.height);
       this.clearCanvas(collision.ctx, collision.width, collision.height);
+      if (pointCloud3d) {
+        this.clearCanvas(
+          pointCloud3d.ctx,
+          pointCloud3d.width,
+          pointCloud3d.height,
+        );
+      }
 
       const presentation = this.presentation;
       if (!presentation || presentation.blocked) {
@@ -222,14 +274,21 @@
           collision.height,
           presentation || { blocked: true, reason: "waiting" },
         );
+        if (pointCloud3d) {
+          this.drawBlockingOverlay(
+            pointCloud3d.ctx,
+            pointCloud3d.width,
+            pointCloud3d.height,
+            presentation || { blocked: true, reason: "waiting" },
+          );
+        }
         return;
       }
 
-      const mainTransform = this.makeViewportTransform(
+      const mainTransform = this.makeCircularViewportTransform(
         main.width,
         main.height,
         MAIN_MAX_RANGE_M,
-        MAIN_HALF_WIDTH_M,
         { top: 50, right: 26, bottom: 64, left: 26 },
       );
       const closeTransform = this.makeViewportTransform(
@@ -245,6 +304,14 @@
         closeTransform,
         presentation,
       );
+      if (pointCloud3d) {
+        this.drawPointCloud3d(
+          pointCloud3d.ctx,
+          pointCloud3d.width,
+          pointCloud3d.height,
+          this.snapshot && this.snapshot.frame,
+        );
+      }
     }
 
     clearCanvas(ctx, width, height) {
@@ -279,24 +346,49 @@
       };
     }
 
+    makeCircularViewportTransform(width, height, radiusM, margin) {
+      const mapWidth = Math.max(1, width - margin.left - margin.right);
+      const mapHeight = Math.max(1, height - margin.top - margin.bottom);
+      return {
+        originX: margin.left + mapWidth / 2,
+        originY: margin.top + mapHeight / 2,
+        scale: Math.min(mapWidth, mapHeight) / (radiusM * 2),
+        width,
+        height,
+        forwardMaxM: radiusM,
+        halfWidthM: radiusM,
+        centeredCircle: true,
+      };
+    }
+
     drawLidarTopView(ctx, transform, scene) {
       this.drawMetricGrid(ctx, transform, {
         forwardMaxM: MAIN_MAX_RANGE_M,
         halfWidthM: MAIN_HALF_WIDTH_M,
-        rangeStepM: 0.5,
-        labelUnit: "m",
-        clipShape: "rectangular",
+        rangeStepM: 0.1,
+        labelUnit: "cm",
+        clipShape: "circle",
       });
       ctx.save();
-      this.clipToMapBoundary(ctx, transform, "rectangular");
+      this.clipToMapBoundary(ctx, transform, "circle");
       this.drawEvidenceGrid(ctx, transform, scene, {
-        clipShape: "rectangular",
+        clipShape: "circle",
+      });
+      this.drawTravelTrail(ctx, transform, scene.travelTrail);
+      this.drawAccumulatedObstacles(ctx, transform, scene);
+      this.drawPlannedPath(ctx, transform, scene.plannedPath);
+      this.drawTracks(ctx, transform, scene.referenceTracks, {
+        scene,
+        labelLimit: 0,
+        maxRangeM: MAIN_MAX_RANGE_M,
+        clipShape: "circle",
+        reference: true,
       });
       this.drawTracks(ctx, transform, scene.tracks, {
         scene,
         labelLimit: 5,
         maxRangeM: MAIN_MAX_RANGE_M,
-        clipShape: "rectangular",
+        clipShape: "circle",
       });
       if (this.rawToggle && this.rawToggle.checked) {
         this.drawRawDebugPoints(ctx, transform, this.snapshot && this.snapshot.frame);
@@ -326,6 +418,8 @@
       this.drawEvidenceGrid(ctx, transform, scene, {
         clipShape: "radial",
       });
+      this.drawAccumulatedObstacles(ctx, transform, scene);
+      this.drawPlannedPath(ctx, transform, scene.plannedPath);
       this.drawTracks(ctx, transform, scene.tracks, {
         scene,
         labelLimit: 3,
@@ -335,6 +429,267 @@
       });
       ctx.restore();
       this.drawRobot(ctx, transform);
+    }
+
+    drawPointCloud3d(ctx, width, height, frame) {
+      const rangeM = 0.50;
+      const sourcePoints = frame && Array.isArray(frame.points)
+        ? frame.points
+        : [];
+      const points = sourcePoints
+        .filter((point) => Array.isArray(point) && point.length >= 5)
+        .map((point) => ({
+          forward: Number(point[0]),
+          lateral: Number(point[1]),
+          height: point[2] === null ? Number.NaN : Number(point[2]),
+          snr: Number(point[4]),
+        }))
+        .filter((point) =>
+          Number.isFinite(point.forward) &&
+          Number.isFinite(point.lateral) &&
+          Number.isFinite(point.height) &&
+          Math.hypot(point.forward, point.lateral, point.height) <= rangeM,
+        );
+      const yaw = this.pointCloud3dYaw;
+      const pitch = this.pointCloud3dPitch;
+      const cosineYaw = Math.cos(yaw);
+      const sineYaw = Math.sin(yaw);
+      const cosinePitch = Math.cos(pitch);
+      const sinePitch = Math.sin(pitch);
+      const baseScale = Math.min(width, height) * 0.72 / (rangeM * 2);
+      const centerX = width * 0.50;
+      const centerY = height * 0.62;
+      const project = (lateral, vertical, forward) => {
+        const yawX = cosineYaw * lateral - sineYaw * forward;
+        const yawDepth = sineYaw * lateral + cosineYaw * forward;
+        const viewY = cosinePitch * vertical - sinePitch * yawDepth;
+        const depth = sinePitch * vertical + cosinePitch * yawDepth;
+        const perspective = 1 / Math.max(0.62, 1.18 + depth * 0.7);
+        return {
+          x: centerX + yawX * baseScale * perspective,
+          y: centerY - viewY * baseScale * perspective,
+          depth,
+          perspective,
+        };
+      };
+      const line3d = (left, right, color, widthPx = 1) => {
+        const a = project(left[0], left[1], left[2]);
+        const b = project(right[0], right[1], right[2]);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = widthPx;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      };
+
+      ctx.save();
+      ctx.lineCap = "round";
+      for (let step = -5; step <= 5; step += 1) {
+        const lateral = step * 0.10;
+        line3d(
+          [lateral, 0, 0],
+          [lateral, 0, rangeM],
+          "rgba(73, 168, 255, 0.13)",
+        );
+      }
+      for (let step = 0; step <= 5; step += 1) {
+        const forward = step * 0.10;
+        line3d(
+          [-rangeM, 0, forward],
+          [rangeM, 0, forward],
+          "rgba(73, 168, 255, 0.13)",
+        );
+      }
+      line3d([0, -rangeM, 0], [0, rangeM, 0], "#ffc15b", 1.8);
+      line3d([-rangeM, 0, 0], [rangeM, 0, 0], "#5ce4d0", 1.8);
+      line3d([0, 0, 0], [0, 0, rangeM], "#89cdff", 1.8);
+
+      points
+        .map((point) => ({
+          ...point,
+          projected: project(point.lateral, point.height, point.forward),
+        }))
+        .sort((left, right) => right.projected.depth - left.projected.depth)
+        .forEach((point) => {
+          const normalizedHeight = Math.max(
+            -1,
+            Math.min(1, point.height / rangeM),
+          );
+          const color = normalizedHeight > 0.06
+            ? `rgba(255, 193, 91, ${0.72 + normalizedHeight * 0.24})`
+            : normalizedHeight < -0.06
+              ? `rgba(90, 184, 255, ${0.72 + -normalizedHeight * 0.24})`
+              : "rgba(220, 255, 250, 0.94)";
+          const snrScale = Number.isFinite(point.snr)
+            ? Math.max(0, Math.min(1, point.snr / 30))
+            : 0.5;
+          const radius = (2.7 + snrScale * 4.2) *
+            point.projected.perspective;
+          ctx.fillStyle = color;
+          ctx.shadowColor = color;
+          ctx.shadowBlur = 7;
+          ctx.beginPath();
+          ctx.arc(
+            point.projected.x,
+            point.projected.y,
+            Math.max(2.2, radius),
+            0,
+            Math.PI * 2,
+          );
+          ctx.fill();
+          ctx.shadowBlur = 0;
+        });
+
+      ctx.fillStyle = "rgba(220, 242, 255, 0.84)";
+      ctx.font = "700 9px ui-monospace, SFMono-Regular, Consolas, monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(`XYZ ${points.length} POINTS · DRAG TO ROTATE`, 8, 13);
+      ctx.fillStyle = "#ffc15b";
+      ctx.fillText("Z UP", 8, 27);
+      ctx.fillStyle = "#5ce4d0";
+      ctx.fillText("X LEFT / RIGHT", 8, 40);
+      ctx.fillStyle = "#89cdff";
+      ctx.fillText("Y FORWARD · 50cm", 8, 53);
+      ctx.restore();
+
+      const status = document.querySelector("#pointcloud-3d-status");
+      if (status) {
+        status.textContent = `${points.length} PTS · Z LIVE`;
+      }
+    }
+
+    drawAccumulatedObstacles(ctx, transform, scene) {
+      const obstacles = scene && Array.isArray(scene.rollingMapObstacles)
+        ? scene.rollingMapObstacles
+        : [];
+      const windowMs = Number.isFinite(scene && scene.obstacleMemoryWindowMs)
+        ? scene.obstacleMemoryWindowMs
+        : 5000;
+      ctx.save();
+      for (const obstacle of obstacles) {
+        if (Math.hypot(obstacle.forward_m, obstacle.lateral_m) >
+            transform.forwardMaxM ||
+            (!transform.centeredCircle && obstacle.forward_m < 0)) {
+          continue;
+        }
+        const point = window.HanselRadarScene.projectMapPoint(
+          transform,
+          obstacle.forward_m,
+          obstacle.lateral_m,
+        );
+        const life = Number.isFinite(obstacle.remaining_ms)
+          ? Math.max(0, Math.min(1, obstacle.remaining_ms / windowMs))
+          : 1;
+        const strength = Math.max(0, Math.min(1, obstacle.confidence));
+        const hitTrust = Math.min(1, Math.max(0.35, obstacle.hits / 5));
+        const alpha = Math.max(0.16, life * strength * hitTrust * 0.88);
+        const radius = 5 + strength * 5;
+        ctx.fillStyle = `rgba(255, 126, 54, ${alpha * 0.28})`;
+        ctx.strokeStyle = `rgba(255, 173, 72, ${alpha})`;
+        ctx.lineWidth = 2.2;
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = `rgba(255, 231, 174, ${alpha})`;
+        ctx.fillRect(point.x - 2, point.y - 2, 4, 4);
+      }
+      ctx.restore();
+    }
+
+    drawTravelTrail(ctx, transform, travelTrail) {
+      const points = travelTrail && Array.isArray(travelTrail.points)
+        ? travelTrail.points
+        : [];
+      if (points.length < 2) {
+        return;
+      }
+      const visible = points.filter((point) =>
+        Math.hypot(point[0], point[1]) <= transform.forwardMaxM,
+      );
+      if (visible.length < 2) {
+        return;
+      }
+      ctx.save();
+      ctx.strokeStyle = "rgba(73, 168, 255, 0.92)";
+      ctx.fillStyle = "rgba(137, 205, 255, 0.96)";
+      ctx.lineWidth = 2.4;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      ctx.setLineDash([6, 5]);
+      ctx.beginPath();
+      visible.forEach((coordinates, index) => {
+        const point = window.HanselRadarScene.projectMapPoint(
+          transform,
+          coordinates[0],
+          coordinates[1],
+        );
+        if (index === 0) {
+          ctx.moveTo(point.x, point.y);
+        } else {
+          ctx.lineTo(point.x, point.y);
+        }
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+      const start = window.HanselRadarScene.projectMapPoint(
+        transform,
+        visible[0][0],
+        visible[0][1],
+      );
+      ctx.beginPath();
+      ctx.arc(start.x, start.y, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    drawPlannedPath(ctx, transform, plannedPath) {
+      if (!plannedPath || !Array.isArray(plannedPath.points) ||
+          plannedPath.points.length < 2) {
+        return;
+      }
+      const visiblePoints = plannedPath.points.filter(
+        (point) => point[0] >= 0 && point[0] <= transform.forwardMaxM &&
+          Math.abs(point[1]) <= transform.halfWidthM,
+      );
+      if (visiblePoints.length < 2) {
+        return;
+      }
+      const stroke = (color, width) => {
+        ctx.beginPath();
+        visiblePoints.forEach((coordinates, index) => {
+          const point = window.HanselRadarScene.projectMapPoint(
+            transform,
+            coordinates[0],
+            coordinates[1],
+          );
+          if (index === 0) {
+            ctx.moveTo(point.x, point.y);
+          } else {
+            ctx.lineTo(point.x, point.y);
+          }
+        });
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.stroke();
+      };
+      ctx.save();
+      stroke("rgba(5, 9, 12, 0.82)", 7);
+      stroke("rgba(255, 215, 64, 0.96)", 3.2);
+      const end = visiblePoints[visiblePoints.length - 1];
+      const endpoint = window.HanselRadarScene.projectMapPoint(
+        transform,
+        end[0],
+        end[1],
+      );
+      ctx.fillStyle = "#ffe47a";
+      ctx.beginPath();
+      ctx.arc(endpoint.x, endpoint.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
     }
 
     drawMetricGrid(ctx, transform, options) {
@@ -358,7 +713,12 @@
         rangeM <= forwardMaxM + 0.0001;
         rangeM += rangeStepM
       ) {
-        this.drawRangeGuideArc(ctx, transform, rangeM);
+        this.drawRangeGuideArc(
+          ctx,
+          transform,
+          rangeM,
+          options.clipShape,
+        );
         ctx.fillStyle = "rgba(176, 210, 206, 0.74)";
         ctx.font = "650 9px ui-monospace, SFMono-Regular, Consolas, monospace";
         ctx.textAlign = "left";
@@ -380,14 +740,24 @@
         const x = transform.originX + lateralM * transform.scale;
         ctx.beginPath();
         ctx.moveTo(x, top);
-        ctx.lineTo(x, transform.originY);
+        ctx.lineTo(
+          x,
+          options.clipShape === "circle"
+            ? transform.originY + forwardMaxM * transform.scale
+            : transform.originY,
+        );
         ctx.stroke();
       }
       ctx.setLineDash([]);
       ctx.strokeStyle = "rgba(92, 228, 208, 0.42)";
       ctx.beginPath();
       ctx.moveTo(transform.originX, top);
-      ctx.lineTo(transform.originX, transform.originY);
+      ctx.lineTo(
+        transform.originX,
+        options.clipShape === "circle"
+          ? transform.originY + forwardMaxM * transform.scale
+          : transform.originY,
+      );
       ctx.stroke();
       ctx.fillStyle = "rgba(114, 150, 148, 0.48)";
       ctx.font = "700 9px ui-monospace, SFMono-Regular, Consolas, monospace";
@@ -397,13 +767,13 @@
       this.strokeMapBoundary(ctx, transform, options.clipShape);
     }
 
-    drawRangeGuideArc(ctx, transform, rangeM) {
+    drawRangeGuideArc(ctx, transform, rangeM, clipShape) {
       ctx.beginPath();
       ctx.arc(
         transform.originX,
         transform.originY,
         rangeM * transform.scale,
-        Math.PI,
+        clipShape === "circle" ? 0 : Math.PI,
         Math.PI * 2,
       );
       ctx.stroke();
@@ -415,7 +785,15 @@
       const top =
         transform.originY - transform.forwardMaxM * transform.scale;
       ctx.beginPath();
-      if (clipShape === "radial") {
+      if (clipShape === "circle") {
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          transform.forwardMaxM * transform.scale,
+          0,
+          Math.PI * 2,
+        );
+      } else if (clipShape === "radial") {
         ctx.moveTo(transform.originX, transform.originY);
         ctx.lineTo(
           transform.originX - transform.forwardMaxM * transform.scale,
@@ -449,7 +827,15 @@
       ctx.strokeStyle = "rgba(156, 198, 194, 0.28)";
       ctx.lineWidth = 1;
       ctx.beginPath();
-      if (clipShape === "radial") {
+      if (clipShape === "circle") {
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          transform.forwardMaxM * transform.scale,
+          0,
+          Math.PI * 2,
+        );
+      } else if (clipShape === "radial") {
         ctx.moveTo(
           transform.originX - transform.forwardMaxM * transform.scale,
           transform.originY,
@@ -593,7 +979,8 @@
           return leftDistance - rightDistance;
         });
       freshTracks.forEach((track, index) => {
-        const visualAlpha = this.trackVisualAlpha(track);
+        const visualAlpha = this.trackVisualAlpha(track) *
+          (options.reference ? 0.28 : 1.0);
         if (visualAlpha <= 0) {
           return;
         }
@@ -610,6 +997,7 @@
             track,
             danger,
             visualAlpha,
+            options.reference === true,
           );
         } else {
           this.drawPointMarker(
@@ -701,6 +1089,7 @@
       track,
       danger,
       visualAlpha,
+      reference = false,
     ) {
       const distance = Number.isFinite(track.distance_m)
         ? track.distance_m
@@ -715,7 +1104,7 @@
       );
       const angularHalfWidth = Math.max(
         Math.PI / 90,
-        Math.min(Math.PI / 12, uncertainty / Math.max(distance, 0.05)),
+        Math.min(Math.PI / 36, uncertainty / Math.max(distance, 0.05)),
       );
       const radius = distance * transform.scale;
       const canvasStart = angle - angularHalfWidth - Math.PI / 2;
@@ -724,8 +1113,12 @@
       ctx.globalAlpha = visualAlpha;
       ctx.strokeStyle = danger
         ? "#ff5151"
+        : reference
+          ? "rgba(255, 193, 91, 0.72)"
         : "rgba(92, 228, 208, 0.82)";
-      ctx.lineWidth = Math.max(2, uncertainty * transform.scale);
+      ctx.lineWidth = reference
+        ? 1.5
+        : Math.max(2, Math.min(8, uncertainty * transform.scale));
       ctx.beginPath();
       ctx.arc(
         transform.originX,
@@ -738,6 +1131,8 @@
       ctx.lineWidth = 1;
       ctx.strokeStyle = danger
         ? "rgba(255, 81, 81, 0.8)"
+        : reference
+          ? "rgba(255, 213, 132, 0.62)"
         : "rgba(207, 248, 243, 0.72)";
       for (const radialOffset of [-uncertainty, uncertainty]) {
         const offsetRadius = Math.max(
@@ -775,12 +1170,8 @@
       const distanceText = close
         ? `${Math.round(distance * 100)}cm`
         : `${distance.toFixed(2)}m`;
-      const heightText =
-        track.height_m !== null && Number.isFinite(track.height_m)
-          ? ` · z ${Number(track.height_m).toFixed(2)}m`
-          : "";
       const sourceText = track.source === "point" ? "P" : "H";
-      const text = `${sourceText} ${distanceText}${heightText}`;
+      const text = `${sourceText} ${distanceText}`;
       ctx.save();
       ctx.globalAlpha = visualAlpha;
       ctx.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
@@ -914,6 +1305,10 @@
             ? presentation.hazardCopy
             : NORMAL_COPY;
       }
+      const safetyFooter = document.querySelector("#safety-footer-text");
+      if (safetyFooter) {
+        safetyFooter.textContent = warning.textContent;
+      }
 
       const mode = document.querySelector("#radar-mode");
       mode.textContent = presentation && !presentation.blocked
@@ -1026,22 +1421,60 @@
       const tracks = presentation && !presentation.blocked
         ? presentation.tracks
         : [];
-      const confirmedCount = tracks.filter(
-        (track) =>
-          track.source === "point" && track.point_confirmed === true,
-      ).length;
+      const confirmedCount = tracks.length;
       document.querySelector("#confirmed-track-value").textContent =
         visible ? String(confirmedCount) : "--";
       document.querySelector("#clutter-rejected-value").textContent =
         diagnostics && Number.isFinite(diagnostics.clutter_points_rejected)
           ? String(diagnostics.clutter_points_rejected)
           : "--";
-      document.querySelector("#heatmap-rejected-value").textContent =
-        diagnostics && Number.isFinite(diagnostics.heatmap_cells_rejected)
-          ? String(diagnostics.heatmap_cells_rejected)
-          : visible
-            ? "-- (API 미제공)"
+      const heatmapCandidateElement = document.querySelector(
+        "#heatmap-candidate-value",
+      );
+      if (heatmapCandidateElement) {
+        heatmapCandidateElement.textContent =
+          diagnostics && Number.isFinite(
+            diagnostics.heatmap_candidate_cells,
+          )
+            ? String(diagnostics.heatmap_candidate_cells)
             : "--";
+      }
+      const heatmapClusterElement = document.querySelector(
+        "#heatmap-cluster-value",
+      );
+      if (heatmapClusterElement) {
+        heatmapClusterElement.textContent =
+          diagnostics && Number.isFinite(diagnostics.heatmap_cluster_count)
+            ? String(diagnostics.heatmap_cluster_count)
+            : "--";
+      }
+      const reflectionElement = document.querySelector("#reflection-value");
+      if (reflectionElement) {
+        reflectionElement.textContent =
+          diagnostics && Number.isFinite(
+            diagnostics.heatmap_reflection_evidence,
+          )
+            ? String(diagnostics.heatmap_reflection_evidence)
+            : "--";
+      }
+      const memoryElement = document.querySelector("#obstacle-memory-value");
+      if (memoryElement) {
+        memoryElement.textContent =
+          diagnostics && Number.isFinite(
+            diagnostics.rolling_local_map_cell_count,
+          )
+            ? `${diagnostics.rolling_local_map_cell_count} · IN 50cm`
+            : "--";
+      }
+      const stableCellElement = document.querySelector("#stable-cell-value");
+      if (stableCellElement) {
+        stableCellElement.textContent =
+          diagnostics && Number.isFinite(
+            diagnostics.stable_occupancy_cell_count,
+          )
+            ? `${diagnostics.stable_occupancy_cell_count} · 5cm GRID`
+            : "--";
+      }
       document.querySelector("#grid-status-value").textContent =
         presentation && !presentation.blocked && presentation.grid
           ? `OK · ${presentation.grid.length} bytes`
@@ -1050,6 +1483,36 @@
         presentation && !presentation.blocked && presentation.hazard
           ? presentation.hazard.level
           : "SENSOR_FAULT";
+      const motionElement = document.querySelector("#motion-status-value");
+      if (motionElement) {
+        const motion = presentation && presentation.motionCompensation;
+        motionElement.textContent = motion
+          ? `${String(motion.status).toUpperCase()} · ${motion.matched_points || 0} match`
+          : "--";
+      }
+      const pathElement = document.querySelector("#path-status-value");
+      if (pathElement) {
+        const path = presentation && presentation.plannedPath;
+        pathElement.textContent = path
+          ? `${Math.round(path.length_m * 100)}cm · ${String(
+              path.stability_status || "stable",
+            ).toUpperCase()}`
+          : "--";
+      }
+      const pathConfidenceElement = document.querySelector(
+        "#path-confidence-value",
+      );
+      if (pathConfidenceElement) {
+        const path = presentation && presentation.plannedPath;
+        pathConfidenceElement.textContent =
+          path && Number.isFinite(path.confidence)
+            ? `${Math.round(path.confidence * 100)}% · ${String(
+                path.confidence_level || "unknown",
+              ).toUpperCase()} · GAP ${Math.round(
+                Math.max(0, Number(path.minimum_clearance_m) || 0) * 100,
+              )}cm`
+            : "--";
+      }
       document.querySelector("#axis-warning").hidden =
         Boolean(
           scene &&

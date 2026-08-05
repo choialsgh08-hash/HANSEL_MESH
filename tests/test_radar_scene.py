@@ -1,4 +1,5 @@
 import base64
+import math
 from pathlib import Path
 import unittest
 
@@ -126,6 +127,74 @@ def heatmap_only_frame(
     data = bytearray(RANGE_BINS * AZIMUTH_BINS)
     data[range_index * AZIMUTH_BINS + azimuth_index] = 255
     return radar_frame(
+        heatmap=RadarHeatmap(
+            data=bytes(data),
+            range_bins=RANGE_BINS,
+            azimuth_bins=AZIMUTH_BINS,
+            range_step_m=RANGE_STEP_M,
+            tlv_type=304,
+            motion_mode="major",
+            floor_db=10.0,
+            ceiling_db=110.0,
+        ),
+        frame_number=frame_number,
+    )
+
+
+def clustered_heatmap_frame(
+    range_index: int,
+    *,
+    frame_number: int,
+    with_point: bool,
+    value: int = 255,
+) -> RadarFrame:
+    data = bytearray(RANGE_BINS * AZIMUTH_BINS)
+    for azimuth_index in (8, 9):
+        data[range_index * AZIMUTH_BINS + azimuth_index] = value
+    points = (
+        (
+            RadarPoint(
+                x_m=0.0,
+                y_m=range_index * RANGE_STEP_M,
+                z_m=0.01,
+                radial_velocity_mps=0.0,
+                snr_db=24.0,
+            ),
+        )
+        if with_point
+        else ()
+    )
+    return radar_frame(
+        points,
+        heatmap=RadarHeatmap(
+            data=bytes(data),
+            range_bins=RANGE_BINS,
+            azimuth_bins=AZIMUTH_BINS,
+            range_step_m=RANGE_STEP_M,
+            tlv_type=304,
+            motion_mode="major",
+            floor_db=10.0,
+            ceiling_db=110.0,
+        ),
+        frame_number=frame_number,
+    )
+
+
+def split_heatmap_frame(*, frame_number: int) -> RadarFrame:
+    range_index = 4
+    data = bytearray(RANGE_BINS * AZIMUTH_BINS)
+    for azimuth_index in (6, 9):
+        data[range_index * AZIMUTH_BINS + azimuth_index] = 255
+    return radar_frame(
+        (
+            RadarPoint(
+                x_m=0.0,
+                y_m=range_index * RANGE_STEP_M,
+                z_m=0.01,
+                radial_velocity_mps=0.0,
+                snr_db=24.0,
+            ),
+        ),
         heatmap=RadarHeatmap(
             data=bytes(data),
             range_bins=RANGE_BINS,
@@ -316,8 +385,15 @@ class RadarSceneEstimatorTests(unittest.TestCase):
 
     def test_three_metre_grid_retains_049_and_299_but_rejects_301(self):
         estimator = calibrated_estimator()
-        estimator.ingest(frame_with_forward_ranges(0.49, 2.99, 3.01))
-        scene = estimator.snapshot()
+        estimator.ingest(
+            frame_with_forward_ranges(0.49, 2.99, 3.01),
+            received_at=1.0,
+        )
+        estimator.ingest(
+            frame_with_forward_ranges(0.49, 2.99, 3.01),
+            received_at=1.1,
+        )
+        scene = estimator.snapshot(now=1.1)
         distances = [track["distance_m"] for track in scene["tracks"]]
         self.assertTrue(any(abs(value - 0.49) < 0.01 for value in distances))
         self.assertTrue(any(abs(value - 2.99) < 0.01 for value in distances))
@@ -328,8 +404,9 @@ class RadarSceneEstimatorTests(unittest.TestCase):
 
     def test_exact_three_metres_maps_to_final_forward_row(self):
         estimator = calibrated_estimator()
-        estimator.ingest(frame_with_forward_ranges(3.0))
-        scene = estimator.snapshot()
+        estimator.ingest(frame_with_forward_ranges(3.0), received_at=2.0)
+        estimator.ingest(frame_with_forward_ranges(3.0), received_at=2.1)
+        scene = estimator.snapshot(now=2.1)
         self.assertAlmostEqual(scene["tracks"][0]["forward_m"], 3.0)
         grid = base64.b64decode(scene["grid"]["data_base64"])
         self.assertGreater(grid[59 * 60 + 30], 0)
@@ -375,6 +452,650 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(track["source"], "heatmap")
         self.assertIsNone(track["height_m"])
         self.assertAlmostEqual(track["range_uncertainty_m"], 0.09765625)
+
+    def test_point_elevation_is_excluded_from_azimuth_only_scene(self):
+        estimator = calibrated_estimator()
+        frame = radar_frame(
+            (
+                RadarPoint(
+                    x_m=0.0,
+                    y_m=0.40,
+                    z_m=0.75,
+                    radial_velocity_mps=0.0,
+                    snr_db=20.0,
+                ),
+            )
+        )
+        estimator.ingest(frame, received_at=3.0)
+
+        scene = estimator.snapshot(now=3.0)
+
+        self.assertEqual(scene["projection_mode"], "range_azimuth_2d")
+        self.assertFalse(scene["elevation_used"])
+        self.assertIsNone(scene["tracks"][0]["height_m"])
+
+    def test_radar_scan_matching_compensates_forward_robot_motion(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+
+        def scan(offset: float, frame_number: int) -> RadarFrame:
+            positions = ((0.50, -0.30), (0.82, 0.08), (1.21, 0.41), (1.63, -0.18))
+            return radar_frame(
+                tuple(
+                    RadarPoint(
+                        x_m=lateral,
+                        y_m=forward + offset,
+                        z_m=0.0,
+                        radial_velocity_mps=0.0,
+                        snr_db=20.0,
+                    )
+                    for forward, lateral in positions
+                ),
+                frame_number=frame_number,
+            )
+
+        estimator.ingest(scan(0.0, 1), received_at=1.0)
+        estimator.ingest(scan(-0.05, 2), received_at=1.1)
+        estimator.ingest(scan(-0.10, 3), received_at=1.2)
+        scene = estimator.snapshot(now=1.2)
+
+        motion = scene["motion_compensation"]
+        self.assertEqual(motion["status"], "ok")
+        self.assertTrue(motion["applied"])
+        self.assertEqual(motion["matched_points"], 4)
+        self.assertAlmostEqual(motion["ego_forward_m"], 0.05, delta=0.03)
+        self.assertEqual(len(scene["obstacle_tracks"]), 4)
+
+    def test_radar_scan_matching_preserves_sub_centimeter_motion(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        positions = ((0.30, -0.20), (0.52, 0.12), (0.74, 0.31), (0.91, -0.08))
+
+        def scan(offset: float, frame_number: int) -> RadarFrame:
+            return radar_frame(
+                tuple(
+                    RadarPoint(
+                        x_m=lateral,
+                        y_m=forward + offset,
+                        z_m=0.0,
+                        radial_velocity_mps=0.0,
+                        snr_db=25.0,
+                    )
+                    for forward, lateral in positions
+                ),
+                frame_number=frame_number,
+            )
+
+        estimator.ingest(scan(0.0, 1), received_at=1.0)
+        estimator.ingest(scan(-0.006, 2), received_at=1.125)
+        estimator.ingest(scan(-0.012, 3), received_at=1.250)
+        motion = estimator.snapshot(now=1.250)["motion_compensation"]
+
+        self.assertTrue(motion["applied"])
+        self.assertGreater(motion["ego_forward_m"], 0.0)
+        self.assertAlmostEqual(motion["ego_forward_m"], 0.005, delta=0.003)
+
+    def test_radar_scan_matching_rejects_implausible_frame_jump(self):
+        previous = ((0.30, -0.20), (0.52, 0.12), (0.74, 0.31), (0.91, -0.08))
+        current = tuple((forward - 0.20, lateral) for forward, lateral in previous)
+
+        motion = RadarSceneEstimator._estimate_ego_motion(previous, current)
+
+        self.assertFalse(motion["applied"])
+
+    def test_rolling_map_keeps_half_centimeter_transform(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._rolling_map_cells[(80, 0)] = {
+            "forward_m": 0.40,
+            "lateral_m": 0.0,
+            "distance_m": 0.40,
+            "range_uncertainty_m": 0.0,
+            "confidence": 1.0,
+            "source": "point",
+            "hits": 2,
+            "_last_seen_ns": estimator._seconds_to_ns(1.0),
+        }
+
+        estimator._transform_tracks(-0.005, 0.0, 0.0)
+        cells = estimator._rolling_map_payload(1.1)
+
+        self.assertEqual(len(cells), 1)
+        self.assertAlmostEqual(cells[0]["forward_m"], 0.395, delta=0.0001)
+
+    def test_travel_trail_moves_behind_robot_and_keeps_current_center(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+
+        estimator._transform_tracks(-0.10, 0.0, 0.0)
+        trail = estimator.snapshot(now=1.0)["travel_trail"]
+
+        self.assertEqual(trail["source"], "radar_ego_motion")
+        self.assertEqual(trail["radius_m"], 0.50)
+        self.assertEqual(trail["resolution_m"], 0.01)
+        self.assertEqual(trail["points"], [[-0.1, 0.0], [0.0, 0.0]])
+
+    def test_travel_trail_rotates_and_drops_points_outside_circle(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._travel_trail = [(-0.45, 0.0), (-0.20, 0.0), (0.0, 0.0)]
+
+        estimator._transform_tracks(0.0, 0.0, math.radians(90.0))
+        rotated = estimator._travel_trail_payload()
+
+        self.assertAlmostEqual(rotated[0][0], 0.0, delta=0.0001)
+        self.assertAlmostEqual(rotated[0][1], -0.45, delta=0.0001)
+        estimator._transform_tracks(-0.30, 0.0, 0.0)
+        retained = estimator._travel_trail_payload()
+        self.assertTrue(
+            all(math.hypot(point[0], point[1]) <= 0.50 for point in retained)
+        )
+        self.assertEqual(retained[-1], [0.0, 0.0])
+
+    def test_single_high_confidence_point_reacts_without_waiting_for_map(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator.ingest(
+            radar_frame(
+                (
+                    RadarPoint(
+                        x_m=0.0,
+                        y_m=0.35,
+                        z_m=0.0,
+                        radial_velocity_mps=0.0,
+                        snr_db=30.0,
+                    ),
+                ),
+                frame_number=1,
+            ),
+            received_at=1.0,
+        )
+        scene = estimator.snapshot(now=1.0)
+
+        self.assertEqual(scene["tracks"][0]["classification"], "point_candidate")
+        self.assertEqual(len(scene["near_occupancy"]["cells"]), 1)
+        self.assertNotEqual(scene["planned_path"]["curvature_per_m"], 0.0)
+
+    def test_planned_path_uses_one_centimeter_spacing(self):
+        path = RadarSceneEstimator._plan_path([])
+
+        self.assertEqual(path["status"], "clear")
+        self.assertEqual(path["resolution_m"], 0.01)
+        self.assertEqual(path["length_m"], 0.50)
+        self.assertEqual(len(path["points"]), 51)
+        self.assertEqual(path["points"][1], [0.01, 0.0])
+        self.assertEqual(
+            path["planner_mode"],
+            "dynamic_corridor_hybrid_lattice",
+        )
+
+    def test_planned_path_bends_around_confirmed_obstacle(self):
+        path = RadarSceneEstimator._plan_path(
+            [
+                {
+                    "forward_m": 0.35,
+                    "lateral_m": 0.0,
+                    "range_uncertainty_m": 0.0,
+                }
+            ]
+        )
+
+        self.assertGreater(path["length_m"], 0.0)
+        self.assertNotEqual(path["curvature_per_m"], 0.0)
+        self.assertTrue(any(abs(point[1]) > 0.01 for point in path["points"]))
+        self.assertGreater(abs(path["points"][-1][1]), 0.0)
+
+    def test_three_centimetre_margin_blocks_fifteen_centimeter_corridor(self):
+        walls = []
+        for index in range(20, 251, 5):
+            forward = index / 100.0
+            walls.extend(
+                [
+                    {
+                        "forward_m": forward,
+                        "lateral_m": -0.075,
+                        "range_uncertainty_m": 0.2,
+                    },
+                    {
+                        "forward_m": forward,
+                        "lateral_m": 0.075,
+                        "range_uncertainty_m": 0.2,
+                    },
+                ]
+            )
+
+        path = RadarSceneEstimator._plan_path(walls)
+
+        self.assertEqual(path["minimum_passage_width_m"], 0.21)
+        self.assertEqual(path["range_uncertainty_lateral_inflation_m"], 0.0)
+        self.assertLess(path["length_m"], 3.0)
+
+    def test_planner_has_no_right_goal_bias(self):
+        path = RadarSceneEstimator._plan_path([])
+
+        self.assertEqual(path["goal_lateral_m"], 0.0)
+        self.assertEqual(path["curvature_per_m"], 0.0)
+        self.assertEqual(path["points"][-1][1], 0.0)
+
+    def test_nearby_obstacle_samples_are_linked_as_wall(self):
+        path = RadarSceneEstimator._plan_path(
+            [
+                {
+                    "forward_m": 0.50,
+                    "lateral_m": -0.025,
+                    "source": "point",
+                },
+                {
+                    "forward_m": 0.50,
+                    "lateral_m": 0.025,
+                    "source": "point",
+                },
+            ]
+        )
+
+        self.assertEqual(path["obstacle_wall_link_m"], 0.10)
+        self.assertEqual(path["obstacle_wall_segments"], 1)
+        self.assertEqual(path["obstacle_object_clusters"], 1)
+        self.assertNotEqual(path["curvature_per_m"], 0.0)
+
+    def test_dynamic_goal_selects_right_free_corridor(self):
+        path = RadarSceneEstimator._plan_path(
+            [
+                {
+                    "forward_m": 0.275,
+                    "lateral_m": -0.275,
+                    "source": "point",
+                },
+                {
+                    "forward_m": 0.275,
+                    "lateral_m": -0.375,
+                    "source": "heatmap",
+                },
+                {
+                    "forward_m": 0.45,
+                    "lateral_m": 0.05,
+                    "source": "heatmap",
+                },
+                {
+                    "forward_m": 0.50,
+                    "lateral_m": 0.025,
+                    "source": "point",
+                },
+                {
+                    "forward_m": 0.55,
+                    "lateral_m": 0.05,
+                    "source": "point",
+                },
+            ]
+        )
+
+        self.assertGreater(path["goal_angle_deg"], 20.0)
+        self.assertGreater(path["goal_lateral_m"], 0.20)
+        self.assertGreater(path["points"][-1][1], 0.20)
+        self.assertEqual(
+            path["goal_selection_mode"],
+            "widest_motion_relative_corridor",
+        )
+
+    def test_planner_uses_curved_local_avoidance(self):
+        path = RadarSceneEstimator._plan_path(
+            [{"forward_m": 0.30, "lateral_m": 0.0}]
+        )
+
+        self.assertEqual(path["status"], "clear")
+        self.assertGreater(path["turn_count"], 0)
+        self.assertTrue(any(abs(point[1]) > 0.05 for point in path["points"]))
+        self.assertEqual(path["search_resolution_m"], 0.025)
+        self.assertTrue(path["smoothed"])
+        self.assertGreaterEqual(path["minimum_clearance_m"], 0.0)
+        self.assertGreater(path["geometry_confidence"], 0.5)
+        for left, right in zip(path["points"], path["points"][1:]):
+            self.assertAlmostEqual(
+                math.hypot(right[0] - left[0], right[1] - left[1]),
+                0.01,
+                delta=0.00015,
+            )
+
+    def test_blocked_scene_returns_best_partial_route(self):
+        wall = [
+            {"forward_m": 0.35, "lateral_m": index / 100.0}
+            for index in range(-60, 61, 5)
+        ]
+
+        path = RadarSceneEstimator._plan_path(wall)
+
+        self.assertEqual(path["status"], "limited")
+        self.assertFalse(path["goal_reached"])
+        self.assertGreater(path["length_m"], 0.0)
+        self.assertLess(path["length_m"], 0.35)
+
+    def test_near_field_return_does_not_zero_the_forward_path(self):
+        path = RadarSceneEstimator._plan_path(
+            [
+                {
+                    "forward_m": 0.07,
+                    "lateral_m": 0.04,
+                    "range_uncertainty_m": 0.0,
+                }
+            ]
+        )
+
+        self.assertEqual(path["near_field_excluded"], 1)
+        self.assertEqual(path["near_field_exclusion_m"], 0.12)
+        self.assertEqual(path["length_m"], 0.50)
+
+    def test_only_strong_confirmed_point_is_retained_for_five_seconds(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+
+        def strong_frame(frame_number: int) -> RadarFrame:
+            return radar_frame(
+                (
+                    RadarPoint(
+                        x_m=0.0,
+                        y_m=0.60,
+                        z_m=0.0,
+                        radial_velocity_mps=0.0,
+                        snr_db=30.0,
+                    ),
+                ),
+                frame_number=frame_number,
+            )
+
+        estimator.ingest(strong_frame(1), received_at=1.0)
+        estimator.ingest(strong_frame(2), received_at=1.1)
+
+        retained = estimator.snapshot(now=6.099)
+        expired = estimator.snapshot(now=6.1)
+
+        self.assertEqual(len(retained["accumulated_obstacles"]), 1)
+        self.assertEqual(retained["obstacle_memory_window_ms"], 5000)
+        self.assertEqual(retained["accumulated_obstacles"][0]["remaining_ms"], 1)
+        self.assertEqual(expired["accumulated_obstacles"], [])
+
+    def test_weak_confirmed_point_is_not_accumulated(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator.ingest(point_frame(0.60, frame_number=1), received_at=1.0)
+        estimator.ingest(point_frame(0.60, frame_number=2), received_at=1.1)
+
+        scene = estimator.snapshot(now=1.1)
+
+        self.assertTrue(scene["obstacle_tracks"])
+        self.assertEqual(scene["accumulated_obstacles"], [])
+
+    def test_rolling_map_retains_strong_obstacle_inside_fifty_centimeters(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        for frame_number, received_at in ((1, 1.0), (2, 1.1), (3, 1.2)):
+            estimator.ingest(
+                radar_frame(
+                    (
+                        RadarPoint(
+                            x_m=0.0,
+                            y_m=0.40,
+                            z_m=0.0,
+                            radial_velocity_mps=0.0,
+                            snr_db=30.0,
+                        ),
+                    ),
+                    frame_number=frame_number,
+                ),
+                received_at=received_at,
+            )
+
+        rolling = estimator.snapshot(now=60.0)["rolling_local_map"]
+
+        self.assertEqual(rolling["radius_m"], 0.50)
+        self.assertEqual(rolling["retention"], "until_outside_radius_or_scene_reset")
+        self.assertTrue(rolling["motion_relative"])
+        self.assertEqual(len(rolling["cells"]), 1)
+        self.assertGreater(rolling["cells"][0]["age_ms"], 50_000)
+
+    def test_rolling_map_moves_and_rotates_around_robot_center(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._rolling_map_cells[(16, 0)] = {
+            "forward_m": 0.40,
+            "lateral_m": 0.0,
+            "distance_m": 0.40,
+            "range_uncertainty_m": 0.0,
+            "confidence": 1.0,
+            "source": "point",
+            "hits": 2,
+            "_last_seen_ns": estimator._seconds_to_ns(1.0),
+        }
+
+        estimator._transform_tracks(-0.10, 0.0, math.radians(90.0))
+        cells = estimator._rolling_map_payload(1.1)
+
+        self.assertEqual(len(cells), 1)
+        self.assertAlmostEqual(cells[0]["forward_m"], -0.10, delta=0.001)
+        self.assertAlmostEqual(cells[0]["lateral_m"], 0.40, delta=0.001)
+
+        estimator._transform_tracks(-0.30, 0.0, 0.0)
+        self.assertEqual(estimator._rolling_map_payload(1.2), [])
+
+    def test_near_obstacle_expires_from_path_after_one_second(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        for frame_number, received_at in (
+            (1, 1.0),
+            (2, 1.1),
+            (3, 1.2),
+        ):
+            estimator.ingest(
+                radar_frame(
+                    (
+                        RadarPoint(
+                            x_m=0.0,
+                            y_m=0.35,
+                            z_m=0.0,
+                            radial_velocity_mps=0.0,
+                            snr_db=30.0,
+                        ),
+                    ),
+                    frame_number=frame_number,
+                ),
+                received_at=received_at,
+            )
+
+        self.assertTrue(estimator.snapshot(now=1.2)["near_occupancy"]["cells"])
+        scene = estimator.snapshot(now=3.0)
+
+        self.assertEqual(scene["obstacle_tracks"], [])
+        self.assertEqual(len(scene["accumulated_obstacles"]), 1)
+        self.assertEqual(scene["near_occupancy"]["cells"], [])
+        self.assertTrue(scene["persistent_near_obstacles"])
+        self.assertEqual(
+            scene["persistent_near_obstacle_memory"]["window_ms"],
+            5000,
+        )
+        self.assertTrue(any(base64.b64decode(scene["grid"]["data_base64"])))
+
+    def test_path_replans_without_holding_the_whole_route(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._update_stable_path(1.0)
+        self.assertEqual(estimator._planned_path["curvature_per_m"], 0.0)
+
+        estimator._near_cells[(14, 0)] = {
+            "forward_m": 0.35,
+            "lateral_m": 0.0,
+            "range_uncertainty_m": 0.0,
+            "confidence": 1.0,
+            "source": "point",
+            "hits": 1,
+            "reactive": True,
+            "_last_seen_ns": estimator._seconds_to_ns(2.8),
+        }
+        estimator._update_stable_path(1.2)
+        self.assertNotEqual(estimator._planned_path["curvature_per_m"], 0.0)
+        self.assertEqual(
+            estimator._planned_path["stability_status"],
+            "route_changed",
+        )
+        self.assertIn(
+            estimator._planned_path["confidence_level"],
+            {"low", "medium", "high"},
+        )
+        self.assertGreater(estimator._planned_path["confidence"], 0.0)
+
+    def test_unstable_motion_freezes_selected_path(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._update_stable_path(1.0)
+        estimator._near_cells[(14, 0)] = {
+            "forward_m": 0.35,
+            "lateral_m": 0.0,
+            "range_uncertainty_m": 0.0,
+            "confidence": 1.0,
+            "source": "point",
+            "hits": 1,
+            "reactive": True,
+            "_last_seen_ns": estimator._seconds_to_ns(3.0),
+        }
+        estimator._motion = estimator._empty_motion("unstable")
+
+        estimator._update_stable_path(3.0)
+
+        self.assertNotEqual(estimator._planned_path["curvature_per_m"], 0.0)
+        self.assertEqual(
+            estimator._planned_path["stability_status"],
+            "replanned_frozen_map",
+        )
+        self.assertEqual(estimator._planned_path["pending_switch_frames"], 0)
+
+    def test_unconfirmed_point_track_does_not_enter_occupancy_grid(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(point_frame(0.40), received_at=3.0)
+
+        scene = estimator.snapshot(now=3.0)
+
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertEqual(scene["tracks"][0]["classification"], "point_candidate")
+        self.assertFalse(scene["obstacle_tracks"])
+        self.assertEqual(
+            set(base64.b64decode(scene["grid"]["data_base64"])),
+            {0},
+        )
+
+    def test_adjacent_heatmap_cells_form_one_reflection_cluster(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(
+            clustered_heatmap_frame(
+                4,
+                frame_number=1,
+                with_point=False,
+            ),
+            received_at=4.0,
+        )
+
+        scene = estimator.snapshot(now=4.0)
+
+        self.assertEqual(scene["diagnostics"]["heatmap_candidate_cells"], 2)
+        self.assertEqual(scene["diagnostics"]["heatmap_cluster_count"], 1)
+        self.assertEqual(len(scene["reference_tracks"]), 1)
+        self.assertEqual(
+            scene["reference_tracks"][0]["classification"],
+            "reflection_evidence",
+        )
+        self.assertFalse(scene["obstacle_tracks"])
+
+    def test_repeated_stable_heatmap_without_point_stays_reflection(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 5):
+            estimator.ingest(
+                clustered_heatmap_frame(
+                    4,
+                    frame_number=frame_number,
+                    with_point=False,
+                ),
+                received_at=5.0 + frame_number * 0.1,
+            )
+
+        scene = estimator.snapshot(now=5.4)
+        heatmap_track = next(
+            track for track in scene["tracks"] if track["source"] == "heatmap"
+        )
+
+        self.assertTrue(heatmap_track["position_stable"])
+        self.assertFalse(heatmap_track["point_correlated"])
+        self.assertFalse(heatmap_track["heatmap_confirmed"])
+        self.assertEqual(heatmap_track["classification"], "reflection_evidence")
+        self.assertFalse(scene["obstacle_tracks"])
+
+    def test_heatmap_exit_threshold_holds_existing_cluster_without_flicker(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(
+            clustered_heatmap_frame(
+                4,
+                frame_number=1,
+                with_point=False,
+                value=255,
+            ),
+            received_at=5.5,
+        )
+        first_track_id = estimator.snapshot(now=5.5)["tracks"][0]["track_id"]
+        for frame_number in (2, 3):
+            estimator.ingest(
+                clustered_heatmap_frame(
+                    4,
+                    frame_number=frame_number,
+                    with_point=False,
+                    value=41,
+                ),
+                received_at=5.5 + frame_number * 0.1,
+            )
+
+        scene = estimator.snapshot(now=5.8)
+        heatmap_tracks = [
+            track for track in scene["tracks"] if track["source"] == "heatmap"
+        ]
+
+        self.assertEqual(len(heatmap_tracks), 1)
+        self.assertEqual(heatmap_tracks[0]["track_id"], first_track_id)
+        self.assertEqual(heatmap_tracks[0]["classification"], "reflection_evidence")
+
+    def test_repeated_stable_point_correlated_cluster_becomes_obstacle(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 4):
+            estimator.ingest(
+                clustered_heatmap_frame(
+                    4,
+                    frame_number=frame_number,
+                    with_point=True,
+                ),
+                received_at=6.0 + frame_number * 0.1,
+            )
+
+        scene = estimator.snapshot(now=6.3)
+        heatmap_track = next(
+            track for track in scene["tracks"] if track["source"] == "heatmap"
+        )
+
+        self.assertTrue(heatmap_track["position_stable"])
+        self.assertTrue(heatmap_track["point_correlated"])
+        self.assertTrue(heatmap_track["heatmap_confirmed"])
+        self.assertEqual(heatmap_track["classification"], "confirmed_obstacle")
+        self.assertIn(heatmap_track, scene["obstacle_tracks"])
+        self.assertGreater(
+            max(base64.b64decode(scene["grid"]["data_base64"])),
+            0,
+        )
+
+    def test_one_point_supports_only_its_nearest_heatmap_cluster(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 4):
+            estimator.ingest(
+                split_heatmap_frame(frame_number=frame_number),
+                received_at=7.0 + frame_number * 0.1,
+            )
+
+        scene = estimator.snapshot(now=7.3)
+        heatmap_tracks = [
+            track for track in scene["tracks"] if track["source"] == "heatmap"
+        ]
+
+        self.assertEqual(len(heatmap_tracks), 2)
+        self.assertEqual(
+            sum(track["heatmap_confirmed"] for track in heatmap_tracks),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                track["classification"] == "reflection_evidence"
+                for track in heatmap_tracks
+            ),
+            1,
+        )
 
     def test_hazard_enters_at_10cm_after_two_of_three_and_releases_at_13cm(self):
         estimator = calibrated_estimator()

@@ -349,6 +349,13 @@ class RadarFrontStateTests(unittest.TestCase):
         self.assertEqual(mapped[0], 2.0)
         self.assertEqual(mapped[1], 1.0)
         self.assertEqual(mapped[2], 0.3)
+        self.assertEqual(frame["projection_mode"], "range_azimuth_2d")
+        self.assertFalse(frame["elevation_used"])
+        self.assertTrue(frame["point_cloud_3d_available"])
+        self.assertEqual(
+            frame["point_cloud_projection_mode"],
+            "cartesian_xyz_3d",
+        )
 
     def test_axis_override_supports_reversed_mounting(self):
         axes = RadarAxes(
@@ -921,8 +928,8 @@ class RadarFrontStateTests(unittest.TestCase):
             "fft-shifted-spatial-frequency",
         )
         self.assertEqual(payload["lambda_over_d_x"], 2.0)
-        self.assertEqual(payload["azimuth_min_deg"], -70.0)
-        self.assertEqual(payload["azimuth_max_deg"], 70.0)
+        self.assertEqual(payload["azimuth_min_deg"], -60.0)
+        self.assertEqual(payload["azimuth_max_deg"], 60.0)
         self.assertEqual(payload["valid_min_range_m"], 0.07)
         self.assertEqual(payload["valid_max_range_m"], 7.5)
         self.assertEqual(
@@ -1281,7 +1288,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260729-lidar-operator-r10",
+                "20260802-xyz-pointcloud-r31",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1296,11 +1303,11 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
             self.assertIn(
-                "/radar_scene.js?v=20260729-lidar-operator-r10",
+                "/radar_scene.js?v=20260802-xyz-pointcloud-r31",
                 html,
             )
             self.assertIn(
-                "/radar_panel.js?v=20260729-lidar-operator-r10",
+                "/radar_panel.js?v=20260802-xyz-pointcloud-r31",
                 html,
             )
             self.assertIn(
@@ -1311,7 +1318,19 @@ class RadarFrontHttpTests(unittest.TestCase):
                 '#radar-status[data-status="http_lost"]',
                 html,
             )
-            self.assertIn('id="build-tag">UI R10</span>', html)
+            self.assertIn('id="build-tag">UI R31</span>', html)
+            self.assertIn(
+                'class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>',
+                html,
+            )
+            self.assertIn("1cm PATH", html)
+            self.assertIn("MIN GAP 15cm", html)
+            self.assertIn("1s REACTIVE MAP", html)
+            self.assertIn("50cm ROLLING CIRCLE", html)
+            self.assertIn("RETAIN UNTIL OUTSIDE", html)
+            self.assertIn("±60° TRUSTED FOV", html)
+            self.assertIn("AZIMUTH ONLY", html)
+            self.assertIn("높이 제외, 좌우각만 사용", html)
             self.assertIn(
                 '#collision-inset[data-hazard="SENSOR_FAULT"] {',
                 html,
@@ -1321,7 +1340,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html,
             )
             self.assertIn(
-                'const UI_BUILD_ID = "20260729-lidar-operator-r10";',
+                'const UI_BUILD_ID = "20260802-xyz-pointcloud-r31";',
                 javascript,
             )
             self.assertIn(
@@ -1343,7 +1362,12 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertIn("sensor_fault: [", javascript)
             self.assertIn('id="radar-main-canvas"', html)
             self.assertIn('id="collision-canvas"', html)
-            self.assertIn("0~3m LiDAR형 전방 점유 지도", html)
+            self.assertIn('id="pointcloud-3d-canvas"', html)
+            self.assertIn("3D POINT CLOUD · 0~50cm", html)
+            self.assertIn('id="heatmap-candidate-value"', html)
+            self.assertIn('id="heatmap-cluster-value"', html)
+            self.assertIn('id="reflection-value"', html)
+            self.assertIn("반지름 50cm 원형 롤링 지도", html)
             self.assertIn("0~50cm 충돌 확대", html)
             self.assertIn("UNKNOWN ≠ FREE", html)
             self.assertIn("ROBOT RELATIVE", html)
@@ -1353,10 +1377,12 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertIn("HanselRadarScene.parseRadarScene", javascript)
             self.assertIn("drawLidarTopView", javascript)
             self.assertIn("drawCollisionInset", javascript)
+            self.assertIn("scene.referenceTracks", javascript)
+            self.assertIn("referenceTracks", scene_javascript)
             self.assertIn("drawRangeGuideArc", javascript)
             self.assertIn("clipToMapBoundary", javascript)
             self.assertIn("cellIntersectsRadialLimit", javascript)
-            self.assertIn('clipShape: "rectangular"', javascript)
+            self.assertIn('clipShape: "radial"', javascript)
             self.assertIn('clipShape: "radial"', javascript)
             self.assertIn(
                 "nearestConfirmedPoint("

@@ -111,7 +111,7 @@ class ConfigureTiRadarTest(unittest.TestCase):
         )
         self.assertEqual(profile.after_baud, ("sensorStart 0 0 0 0",))
 
-    def test_stable_near_3d_profile_is_8hz_and_only_changes_frame_period(self):
+    def test_stable_near_3d_profile_is_8hz_with_trusted_near_fov(self):
         root = Path(__file__).resolve().parent.parent / "configs" / "radar"
         stable = MODULE.partition_at_baud(
             MODULE.load_commands(
@@ -125,11 +125,14 @@ class ConfigureTiRadarTest(unittest.TestCase):
         )
 
         expected_stable_commands = tuple(
-            (
-                "frameCfg 2 8 600 16 125 0"
-                if command == "frameCfg 2 8 600 16 100 0"
-                else command
-            )
+            {
+                "frameCfg 2 8 600 16 100 0": (
+                    "frameCfg 2 8 600 16 125 0"
+                ),
+                "aoaFovCfg -70 70 -60 60": (
+                    "aoaFovCfg -60 60 -40 40"
+                ),
+            }.get(command, command)
             for command in experimental.before_baud
         )
 
@@ -137,6 +140,7 @@ class ConfigureTiRadarTest(unittest.TestCase):
         self.assertEqual(stable.before_baud, expected_stable_commands)
         self.assertEqual(stable.after_baud, experimental.after_baud)
         self.assertIn("lowPowerCfg 0", stable.before_baud)
+        self.assertIn("aoaFovCfg -60 60 -40 40", stable.before_baud)
         self.assertIn(
             "sigProcChainCfg 16 8 1 2 8 4 0 0.3 0",
             stable.before_baud,
