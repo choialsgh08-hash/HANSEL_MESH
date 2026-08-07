@@ -1,0 +1,52 @@
+/**:
+  ros__parameters:
+    unit_id: head
+    role: head
+    hardware_backend: nano_serial
+    control_period_s: 0.05
+    publish_divisor: 2
+    command_timeout_s: 0.5
+    max_command_age_s: 0.5
+
+    straight_rpm: 120.0
+    turn_rpm: 102.0
+    full_speed_cps_left: 800.0
+    full_speed_cps_right: 800.0
+    turn_inner_ratio: 0.45
+    turn_outer_ratio: 1.0
+    mild_turn_inner_ratio: 0.75
+    mild_turn_outer_ratio: 1.0
+    spin_ratio: 0.85
+    node_slow_ratio: 0.45
+    left_target_scale: 1.0
+    right_target_scale: 1.0
+
+    left_kp: 0.035
+    left_ki: 0.015
+    left_kd: 0.0
+    right_kp: 0.035
+    right_ki: 0.015
+    right_kd: 0.0
+    pid_integral_limit: 500.0
+    minimum_pwm_percent: 25.0
+    maximum_pwm_percent: 100.0
+    pwm_ramp_percent_per_second: 220.0
+    encoder_counts_per_revolution: 400.0
+
+    head_min_angle_deg: -180.0
+    head_center_angle_deg: 0.0
+    head_max_angle_deg: 180.0
+    head_step_angle_deg: 2.0
+    head_min_pulse_us: 500
+    head_center_pulse_us: 1500
+    head_max_pulse_us: 2500
+    head_servo_hold: false
+
+    detach_duration_s: 0.35
+    detach_press_pulse_us: 1350
+    detach_rest_pulse_us: 800
+
+    nano_serial_port: /dev/ttyUSB0
+    nano_serial_baudrate: 115200
+    nano_serial_timeout_s: 0.02
+    front_follow_drive: true

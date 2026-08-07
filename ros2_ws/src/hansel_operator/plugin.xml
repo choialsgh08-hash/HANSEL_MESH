@@ -1,0 +1,16 @@
+<library path="src">
+  <class
+      name="hansel_operator/HanselPanel"
+      type="hansel_operator.rqt_plugin.HanselPanel"
+      base_class_type="rqt_gui_py::Plugin">
+    <description>HANSEL drive, detach, status, camera, and adapter dashboard.</description>
+    <qtgui>
+      <group>
+        <label>Robot Tools</label>
+      </group>
+      <label>HANSEL Panel</label>
+      <icon type="theme">applications-system</icon>
+      <statustip>Operate and monitor the HANSEL chain.</statustip>
+    </qtgui>
+  </class>
+</library>

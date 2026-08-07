@@ -1,0 +1,2 @@
+"""HANSEL robot description package."""
+

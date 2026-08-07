@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hansel_bringup</name>
+  <version>0.2.0</version>
+  <description>HANSEL launch, chain configuration, DDS boundary, and RViz setup.</description>
+  <maintainer email="hansel@example.com">HANSEL Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>hansel_camera_bridge</exec_depend>
+  <exec_depend>hansel_description</exec_depend>
+  <exec_depend>hansel_network_adapter</exec_depend>
+  <exec_depend>hansel_operator</exec_depend>
+  <exec_depend>hansel_radar_adapter</exec_depend>
+  <exec_depend>hansel_survivor_adapter</exec_depend>
+  <exec_depend>hansel_unit_control</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hansel_camera_bridge</name>
+  <version>0.2.0</version>
+  <description>Operator-side H.264/RTP receive quality monitor for HANSEL.</description>
+  <maintainer email="hansel@example.com">HANSEL Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>hansel_interfaces</depend>
+  <exec_depend>python3-gi</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-base</exec_depend>
+  <exec_depend>gstreamer1.0-plugins-good</exec_depend>
+  <exec_depend>gstreamer1.0-libav</exec_depend>
+
+  <test_depend>ament_pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

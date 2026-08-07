@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="hansel_head">
+  <xacro:property name="body_length" value="0.40"/>
+  <xacro:property name="body_width" value="0.28"/>
+  <xacro:property name="body_height" value="0.12"/>
+
+  <material name="hansel_blue">
+    <color rgba="0.22 0.45 0.67 1.0"/>
+  </material>
+  <material name="sensor_gray">
+    <color rgba="0.35 0.38 0.42 1.0"/>
+  </material>
+
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="${body_length} ${body_width} ${body_height}"/>
+      </geometry>
+      <material name="hansel_blue"/>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${body_length} ${body_width} ${body_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="2.0"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.015" ixy="0" ixz="0" iyy="0.030" iyz="0" izz="0.035"/>
+    </inertial>
+  </link>
+
+  <link name="front_sensor_assembly">
+    <visual>
+      <origin xyz="0.08 0 0"/>
+      <geometry>
+        <box size="0.16 0.22 0.10"/>
+      </geometry>
+      <material name="sensor_gray"/>
+    </visual>
+    <collision>
+      <origin xyz="0.08 0 0"/>
+      <geometry>
+        <box size="0.16 0.22 0.10"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.5"/>
+      <origin xyz="0.08 0 0"/>
+      <inertia ixx="0.003" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.005"/>
+    </inertial>
+  </link>
+
+  <joint name="front_tilt_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_sensor_assembly"/>
+    <origin xyz="0.20 0 0.03" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-3.141593" upper="3.141593" effort="5.0" velocity="3.141593"/>
+  </joint>
+
+  <link name="radar_link"/>
+  <joint name="radar_fixed_joint" type="fixed">
+    <parent link="front_sensor_assembly"/>
+    <child link="radar_link"/>
+    <origin xyz="0.16 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="camera_link"/>
+  <joint name="camera_fixed_joint" type="fixed">
+    <parent link="front_sensor_assembly"/>
+    <child link="camera_link"/>
+    <origin xyz="0.16 0 0.04" rpy="0 0 0"/>
+  </joint>
+</robot>
