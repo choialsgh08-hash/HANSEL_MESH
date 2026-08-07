@@ -1,6 +1,0 @@
-5: bat0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1468 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000
-    link/ether 02:aa:bb:00:00:10 brd ff:ff:ff:ff:ff:ff
-    RX: bytes  packets  errors  dropped overrun mcast
-    10485760   82000    0       15      0       120
-    TX: bytes  packets  errors  dropped carrier collsns
-    5242880    41000    0       7       0       0

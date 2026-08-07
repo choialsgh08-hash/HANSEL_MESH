@@ -1,18 +1,5 @@
-# Legacy monitoring tools
+# Listener utilities
 
-This directory contains the original CSV/RSSI monitoring workflow.  It is kept
-for old field-test data and is not the active dashboard stack.
-
-For new deployments use:
-
-- `monitor/metrics_agent.py` on each Pi
-- `monitor/dashboard.py` on the operator PC
-- `monitor/video_probe.py` for video quality
-
-The legacy programs remain importable and can be run from the repository root:
-
-```bash
-python3 listen/monitor_node.py --help
-python3 listen/monitor_laptop.py --help
-python3 listen/h264_decode_fps.py --help
-```
+`metrics_udp_listener.py` is a standalone diagnostic listener for the same UDP
+JSON snapshots consumed by `hansel_network_adapter`. It is useful before ROS 2
+is started or while debugging routing and firewall issues.

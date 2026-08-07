@@ -1,535 +1,58 @@
 #!/bin/bash
-
-set -e
-
-echo "========================================"
-echo " HANSEL_MESH start script"
-echo "========================================"
-
-if [ "$EUID" -ne 0 ]; then
-    echo "[ERROR] Please run as root:"
-    echo "sudo ./scripts/start_mesh.sh configs/base.env"
-    exit 1
-fi
-
-CONFIG_FILE="$1"
-
-if [ -z "$CONFIG_FILE" ]; then
-    echo "[ERROR] Config file is required."
-    echo "Usage:"
-    echo "sudo ./scripts/start_mesh.sh configs/base.env"
-    echo "sudo ./scripts/start_mesh.sh configs/head.env"
-    echo "sudo ./scripts/start_mesh.sh configs/node1.env"
-    echo "sudo ./scripts/start_mesh.sh configs/node2.env"
-    exit 1
-fi
-
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "[ERROR] Config file not found: $CONFIG_FILE"
-    exit 1
-fi
-
+set -euo pipefail
+CONFIG_FILE="${1:-}"
+[ "$EUID" -eq 0 ] || { echo "[ERROR] Run as root"; exit 1; }
+[ -n "$CONFIG_FILE" ] && [ -f "$CONFIG_FILE" ] || { echo "Usage: $0 configs/<role>.env"; exit 1; }
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
-
+: "${MESH_IF:?}" "${BAT_IF:?}" "${MESH_ID:?}" "${MESH_FREQ:?}" "${IP_ADDR:?}" "${NETMASK_CIDR:?}"
 MESH_MODE="${MESH_MODE:-auto}"
 IBSS_BSSID="${IBSS_BSSID:-02:12:34:56:78:9a}"
-REQUIRE_IBSS_BSSID_MATCH="${REQUIRE_IBSS_BSSID_MATCH:-no}"
 WIFI_POWER_SAVE="${WIFI_POWER_SAVE:-off}"
-BATMAN_HOP_PENALTY="${BATMAN_HOP_PENALTY:-}"
-BATMAN_ORIG_INTERVAL="${BATMAN_ORIG_INTERVAL:-}"
-# A separate rescue AP is expected to use another adapter (the built-in wlan0,
-# since the AR9271 mesh dongle is MESH_IF=wlan1).  Stopping the global
-# hostapd/dnsmasq units would tear that AP down, so global service handling is
-# deliberately opt-in.  Interface-scoped units for MESH_IF are still stopped.
 STOP_GLOBAL_WIFI_SERVICES="${STOP_GLOBAL_WIFI_SERVICES:-no}"
 
-case "$STOP_GLOBAL_WIFI_SERVICES" in
-    yes|no)
-        ;;
-    *)
-        echo "[ERROR] STOP_GLOBAL_WIFI_SERVICES must be yes or no."
-        exit 1
-        ;;
-esac
-
-if [ -z "$NODE_NAME" ] || [ -z "$MESH_IF" ] || [ -z "$BAT_IF" ] || [ -z "$MESH_ID" ] || [ -z "$MESH_FREQ" ] || [ -z "$IP_ADDR" ] || [ -z "$NETMASK_CIDR" ]; then
-    echo "[ERROR] Config file has missing required variables."
-    echo "Required: NODE_NAME, MESH_IF, BAT_IF, MESH_ID, MESH_FREQ, IP_ADDR, NETMASK_CIDR"
-    exit 1
-fi
-
-case "$MESH_MODE" in
-    auto|mesh_point|mesh|80211s|ibss)
-        ;;
-    *)
-        echo "[ERROR] Unsupported MESH_MODE: $MESH_MODE"
-        echo "Allowed: auto, mesh_point, mesh, 80211s, ibss"
-        exit 1
-        ;;
-esac
-
-supports_mesh_point() {
-    iw list 2>/dev/null | grep -qE '^[[:space:]]*\* mesh point$'
-}
-
-supports_ibss() {
-    iw list 2>/dev/null | grep -qE '^[[:space:]]*\* IBSS$'
-}
-
-freq_to_channel() {
-    case "$1" in
-        2412) echo "1" ;;
-        2417) echo "2" ;;
-        2422) echo "3" ;;
-        2427) echo "4" ;;
-        2432) echo "5" ;;
-        2437) echo "6" ;;
-        2442) echo "7" ;;
-        2447) echo "8" ;;
-        2452) echo "9" ;;
-        2457) echo "10" ;;
-        2462) echo "11" ;;
-        2467) echo "12" ;;
-        2472) echo "13" ;;
-        2484) echo "14" ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-show_wireless_state() {
-    iw dev "$MESH_IF" info 2>/dev/null || true
-    iwconfig "$MESH_IF" 2>/dev/null || true
-    iw dev "$MESH_IF" get power_save 2>/dev/null || true
-}
-
-ibss_joined() {
-    iwconfig "$MESH_IF" 2>/dev/null | grep -q "ESSID:\"$MESH_ID\"" || return 1
-    iwconfig "$MESH_IF" 2>/dev/null | grep -q "ESSID:off/any" && return 1
-
-    if [ "$REQUIRE_IBSS_BSSID_MATCH" = "yes" ]; then
-        iwconfig "$MESH_IF" 2>/dev/null | grep -qi "Cell: $IBSS_BSSID" || return 1
-    fi
-}
-
-reset_mesh_interface() {
-    ip link set "$MESH_IF" down 2>/dev/null || true
-    iw dev "$MESH_IF" mesh leave 2>/dev/null || true
-    iw dev "$MESH_IF" ibss leave 2>/dev/null || true
-    ip addr flush dev "$MESH_IF" || true
-    iw dev "$MESH_IF" set type managed 2>/dev/null || true
-    ip link set "$MESH_IF" down 2>/dev/null || true
-}
-
-start_mesh_point() {
-    echo "[INFO] Trying 802.11s mesh point mode..."
-    reset_mesh_interface
-    iw dev "$MESH_IF" set type mesh || return 1
-    ip link set "$MESH_IF" up || return 1
-    iw dev "$MESH_IF" mesh join "$MESH_ID" freq "$MESH_FREQ" || return 1
-}
-
-start_ibss() {
-    echo "[INFO] Trying IBSS mode..."
-    reset_mesh_interface
-
-    if iw dev "$MESH_IF" set type ibss; then
-        ip link set "$MESH_IF" up || return 1
-        if iw dev "$MESH_IF" ibss join "$MESH_ID" "$MESH_FREQ" fixed-freq "$IBSS_BSSID"; then
-            sleep 1
-            ip link set "$MESH_IF" up || return 1
-            if ibss_joined; then
-                show_wireless_state
-                return 0
-            fi
-            echo "[WARN] iw IBSS command ran, but interface did not join the expected ESSID."
-            show_wireless_state
-        fi
-    fi
-
-    echo "[WARN] iw IBSS setup failed; trying wireless-tools ad-hoc fallback..."
-    if ! command -v iwconfig >/dev/null 2>&1; then
-        echo "[ERROR] iwconfig is not installed."
-        return 1
-    fi
-
-    CHANNEL="$(freq_to_channel "$MESH_FREQ")" || {
-        echo "[ERROR] Cannot convert MESH_FREQ=$MESH_FREQ to a 2.4 GHz channel."
-        return 1
-    }
-
-    reset_mesh_interface
-    iwconfig "$MESH_IF" mode ad-hoc || return 1
-    iwconfig "$MESH_IF" essid "$MESH_ID" ap "$IBSS_BSSID" channel "$CHANNEL" || return 1
-    ip link set "$MESH_IF" up || return 1
-    sleep 1
-
-    if ! ibss_joined; then
-        echo "[ERROR] ad-hoc fallback did not join the expected ESSID."
-        show_wireless_state
-        return 1
-    fi
-
-    show_wireless_state
-}
-
-set_wifi_power_save() {
-    case "$WIFI_POWER_SAVE" in
-        off|on)
-            echo "[INFO] Setting Wi-Fi power_save $WIFI_POWER_SAVE on $MESH_IF..."
-            iw dev "$MESH_IF" set power_save "$WIFI_POWER_SAVE" 2>/dev/null || {
-                echo "[WARN] Could not set Wi-Fi power_save $WIFI_POWER_SAVE."
-            }
-            ;;
-        keep|"")
-            echo "[INFO] Keeping current Wi-Fi power_save setting."
-            ;;
-        *)
-            echo "[WARN] Unknown WIFI_POWER_SAVE=$WIFI_POWER_SAVE; keeping current setting."
-            ;;
-    esac
-}
-
-apply_batman_tuning() {
-    if [ -n "$BATMAN_HOP_PENALTY" ]; then
-        if [ -w "/sys/class/net/$BAT_IF/mesh/hop_penalty" ]; then
-            echo "[INFO] Setting BATMAN hop_penalty=$BATMAN_HOP_PENALTY..."
-            printf "%s" "$BATMAN_HOP_PENALTY" > "/sys/class/net/$BAT_IF/mesh/hop_penalty"
-        else
-            echo "[WARN] Cannot write BATMAN hop_penalty for $BAT_IF."
-        fi
-    fi
-
-    if [ -n "$BATMAN_ORIG_INTERVAL" ]; then
-        if [ -w "/sys/class/net/$BAT_IF/mesh/orig_interval" ]; then
-            echo "[INFO] Setting BATMAN orig_interval=$BATMAN_ORIG_INTERVAL ms..."
-            printf "%s" "$BATMAN_ORIG_INTERVAL" > "/sys/class/net/$BAT_IF/mesh/orig_interval"
-        else
-            echo "[WARN] Cannot write BATMAN orig_interval for $BAT_IF."
-        fi
-    fi
-}
-
-echo "[INFO] Node name : $NODE_NAME"
-echo "[INFO] Mesh IF   : $MESH_IF"
-echo "[INFO] BAT IF    : $BAT_IF"
-echo "[INFO] Mesh ID   : $MESH_ID"
-echo "[INFO] Mesh freq : $MESH_FREQ"
-echo "[INFO] Mesh mode : $MESH_MODE"
-echo "[INFO] IBSS BSSID: $IBSS_BSSID"
-echo "[INFO] Require BSSID match: $REQUIRE_IBSS_BSSID_MATCH"
-echo "[INFO] Wi-Fi power save: $WIFI_POWER_SAVE"
-echo "[INFO] BATMAN hop penalty: ${BATMAN_HOP_PENALTY:-kernel default}"
-echo "[INFO] BATMAN orig interval: ${BATMAN_ORIG_INTERVAL:-kernel default}"
-echo "[INFO] Stop global Wi-Fi services: $STOP_GLOBAL_WIFI_SERVICES"
-echo "[INFO] IP addr   : $IP_ADDR/$NETMASK_CIDR"
-
-if ! ip link show "$MESH_IF" >/dev/null 2>&1; then
-    echo "[ERROR] Interface not found: $MESH_IF"
-    echo "Check available interfaces:"
-    echo "ip link"
-    exit 1
-fi
-
-MESH_STARTED="no"
-HOSTAPD_WAS_ACTIVE="no"
-DNSMASQ_WAS_ACTIVE="no"
-WPA_SUPPLICANT_WAS_ACTIVE="no"
-NETWORK_MANAGER_WAS_ACTIVE="no"
-DHCPCD_WAS_ACTIVE="no"
-HOSTAPD_IF_WAS_ACTIVE="no"
-DNSMASQ_IF_WAS_ACTIVE="no"
-WPA_SUPPLICANT_AT_IF_WAS_ACTIVE="no"
-WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE="no"
-WPA_INTERFACE_REMOVED="no"
-GLOBAL_WIFI_SERVICES_STOPPED="no"
-
-remember_wifi_service_state() {
-    if systemctl is-active --quiet hostapd 2>/dev/null; then
-        HOSTAPD_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet dnsmasq 2>/dev/null; then
-        DNSMASQ_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet wpa_supplicant 2>/dev/null; then
-        WPA_SUPPLICANT_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet NetworkManager 2>/dev/null; then
-        NETWORK_MANAGER_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet dhcpcd 2>/dev/null; then
-        DHCPCD_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet "hostapd@$MESH_IF.service" 2>/dev/null; then
-        HOSTAPD_IF_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet "dnsmasq@$MESH_IF.service" 2>/dev/null; then
-        DNSMASQ_IF_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet "wpa_supplicant@$MESH_IF.service" 2>/dev/null; then
-        WPA_SUPPLICANT_AT_IF_WAS_ACTIVE="yes"
-    fi
-    if systemctl is-active --quiet "wpa_supplicant-$MESH_IF.service" 2>/dev/null; then
-        WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE="yes"
-    fi
-}
-
-release_mesh_interface_from_managers() {
-    remember_wifi_service_state
-
-    if command -v nmcli >/dev/null 2>&1; then
-        # Do this before asking a global supplicant to release MESH_IF, or
-        # NetworkManager may immediately add it again.
-        nmcli dev set "$MESH_IF" managed no 2>/dev/null || true
-    fi
-
-    # These instance names are used by common Debian/Raspberry Pi OS setups.
-    # A missing instance is harmless.  Crucially, they target MESH_IF only.
-    systemctl stop "hostapd@$MESH_IF.service" 2>/dev/null || true
-    systemctl stop "dnsmasq@$MESH_IF.service" 2>/dev/null || true
-    systemctl stop "wpa_supplicant@$MESH_IF.service" 2>/dev/null || true
-    systemctl stop "wpa_supplicant-$MESH_IF.service" 2>/dev/null || true
-
-    # A single global wpa_supplicant may still own MESH_IF even after the
-    # interface-scoped units above have stopped.  Remove only MESH_IF through
-    # its global control API; never terminate the daemon merely to free MESH_IF,
-    # because it may also serve another adapter (for example a wlan0 rescue AP).
-    if command -v wpa_cli >/dev/null 2>&1; then
-        for WPA_GLOBAL_SOCKET in \
-            /run/wpa_supplicant/global \
-            /var/run/wpa_supplicant/global
-        do
-            if [ -S "$WPA_GLOBAL_SOCKET" ] && \
-                wpa_cli -g "$WPA_GLOBAL_SOCKET" \
-                    interface_remove "$MESH_IF" 2>/dev/null | grep -q '^OK'
-            then
-                WPA_INTERFACE_REMOVED="yes"
-                echo "[INFO] Released $MESH_IF from global wpa_supplicant control."
-                break
-            fi
-        done
-    fi
-
-    if [ "$WPA_INTERFACE_REMOVED" = "no" ] && command -v busctl >/dev/null 2>&1; then
-        WPA_OBJECT="$(
-            busctl call \
-                fi.w1.wpa_supplicant1 \
-                /fi/w1/wpa_supplicant1 \
-                fi.w1.wpa_supplicant1 \
-                GetInterface s "$MESH_IF" 2>/dev/null |
-                sed -n 's/^o[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p'
-        )"
-        if [ -n "$WPA_OBJECT" ] && busctl call \
-            fi.w1.wpa_supplicant1 \
-            /fi/w1/wpa_supplicant1 \
-            fi.w1.wpa_supplicant1 \
-            RemoveInterface o "$WPA_OBJECT" >/dev/null 2>&1
-        then
-            WPA_INTERFACE_REMOVED="yes"
-            echo "[INFO] Released $MESH_IF from wpa_supplicant over D-Bus."
-        fi
-    fi
-
-    if [ "$STOP_GLOBAL_WIFI_SERVICES" = "yes" ]; then
-        echo "[WARN] Explicit opt-in enabled: stopping global hostapd/dnsmasq/wpa_supplicant."
-        GLOBAL_WIFI_SERVICES_STOPPED="yes"
-        systemctl stop hostapd 2>/dev/null || true
-        systemctl stop dnsmasq 2>/dev/null || true
-        systemctl stop wpa_supplicant 2>/dev/null || true
-    else
-        echo "[INFO] Preserving global hostapd/dnsmasq services (for example a rescue AP on the built-in wlan0)."
-        if command -v wpa_cli >/dev/null 2>&1 && \
-            wpa_cli -i "$MESH_IF" ping 2>/dev/null | grep -q '^PONG$'
-        then
-            echo "[ERROR] Global wpa_supplicant still owns $MESH_IF."
-            echo "        Configure its global control/D-Bus interface, or use"
-            echo "        STOP_GLOBAL_WIFI_SERVICES=yes only when no other Wi-Fi"
-            echo "        service depends on the global daemon."
-            return 1
-        fi
-        if iw dev "$MESH_IF" info 2>/dev/null | grep -qE '^[[:space:]]*type AP$'; then
-            echo "[WARN] $MESH_IF is currently an AP. Stop the service bound to this interface,"
-            echo "       or set STOP_GLOBAL_WIFI_SERVICES=yes only when no separate AP must survive."
-        fi
-    fi
-}
-
-restore_wifi_on_error() {
-    EXIT_CODE="$?"
-    if [ "$EXIT_CODE" -eq 0 ] || [ "$MESH_STARTED" = "yes" ]; then
-        return
-    fi
-
-    echo "[ERROR] Mesh start failed. Restoring $MESH_IF to managed Wi-Fi mode..."
-    if ip link show "$BAT_IF" >/dev/null 2>&1; then
-        ip link set "$BAT_IF" down 2>/dev/null || true
-        ip link delete "$BAT_IF" type batadv 2>/dev/null || true
-    fi
-
-    if ip link show "$MESH_IF" >/dev/null 2>&1; then
-        ip link set "$MESH_IF" down 2>/dev/null || true
-        iw dev "$MESH_IF" mesh leave 2>/dev/null || true
-        iw dev "$MESH_IF" ibss leave 2>/dev/null || true
-        ip addr flush dev "$MESH_IF" 2>/dev/null || true
-        iw dev "$MESH_IF" set type managed 2>/dev/null || true
-        ip link set "$MESH_IF" up 2>/dev/null || true
-    fi
-
-    if command -v nmcli >/dev/null 2>&1; then
-        nmcli dev set "$MESH_IF" managed yes 2>/dev/null || true
-        nmcli radio wifi on 2>/dev/null || true
-    fi
-
-    # Restore every interface-scoped service which this invocation stopped.
-    [ "$HOSTAPD_IF_WAS_ACTIVE" = "yes" ] && \
-        systemctl start "hostapd@$MESH_IF.service" 2>/dev/null || true
-    [ "$DNSMASQ_IF_WAS_ACTIVE" = "yes" ] && \
-        systemctl start "dnsmasq@$MESH_IF.service" 2>/dev/null || true
-    [ "$WPA_SUPPLICANT_AT_IF_WAS_ACTIVE" = "yes" ] && \
-        systemctl start "wpa_supplicant@$MESH_IF.service" 2>/dev/null || true
-    [ "$WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE" = "yes" ] && \
-        systemctl start "wpa_supplicant-$MESH_IF.service" 2>/dev/null || true
-
-    # Restart only global services that this invocation explicitly stopped.
-    if [ "$GLOBAL_WIFI_SERVICES_STOPPED" = "yes" ]; then
-        [ "$HOSTAPD_WAS_ACTIVE" = "yes" ] && systemctl start hostapd 2>/dev/null || true
-        [ "$DNSMASQ_WAS_ACTIVE" = "yes" ] && systemctl start dnsmasq 2>/dev/null || true
-        [ "$WPA_SUPPLICANT_WAS_ACTIVE" = "yes" ] && systemctl start wpa_supplicant 2>/dev/null || true
-    fi
-
-    # A global daemon interface removed through wpa_cli/D-Bus must be
-    # recreated by the manager which owned it. This branch runs only while
-    # recovering a failed mesh start; a brief client-network restart is safer
-    # than leaving MESH_IF permanently unmanaged.
-    if [ "$WPA_INTERFACE_REMOVED" = "yes" ] && \
-        [ "$WPA_SUPPLICANT_AT_IF_WAS_ACTIVE" = "no" ] && \
-        [ "$WPA_SUPPLICANT_DASH_IF_WAS_ACTIVE" = "no" ]
-    then
-        if [ "$NETWORK_MANAGER_WAS_ACTIVE" = "yes" ]; then
-            nmcli dev set "$MESH_IF" managed yes 2>/dev/null || true
-        elif [ "$DHCPCD_WAS_ACTIVE" = "yes" ]; then
-            systemctl restart dhcpcd 2>/dev/null || true
-        elif [ "$WPA_SUPPLICANT_WAS_ACTIVE" = "yes" ]; then
-            systemctl restart wpa_supplicant 2>/dev/null || true
-        else
-            echo "[WARN] Could not identify the manager that must reclaim $MESH_IF."
-        fi
-    fi
-}
-
-trap restore_wifi_on_error EXIT
-
-HAS_MESH_POINT="no"
-HAS_IBSS="no"
-
-if supports_mesh_point; then
-    HAS_MESH_POINT="yes"
-fi
-
-if supports_ibss; then
-    HAS_IBSS="yes"
-fi
-
-echo "[INFO] Supported mesh point : $HAS_MESH_POINT"
-echo "[INFO] Supported IBSS       : $HAS_IBSS"
-
-if [ "$HAS_MESH_POINT" = "no" ] && [ "$HAS_IBSS" = "no" ]; then
-    echo "[ERROR] This Wi-Fi adapter supports neither mesh point nor IBSS."
-    echo "Check with: iw list | grep -A 40 'Supported interface modes'"
-    exit 1
-fi
-
-echo "[1/12] Unblocking Wi-Fi..."
-rfkill unblock wifi || true
-
-echo "[2/12] Loading batman-adv..."
 modprobe batman-adv
-
-echo "[3/12] Releasing Wi-Fi from AP/client managers if possible..."
-release_mesh_interface_from_managers
-
-echo "[4/12] Cleaning old BATMAN interface..."
-if ip link show "$BAT_IF" >/dev/null 2>&1; then
-    ip link set "$BAT_IF" down || true
-    ip link delete "$BAT_IF" type batadv || true
+rfkill unblock wifi || true
+command -v nmcli >/dev/null && nmcli dev set "$MESH_IF" managed no 2>/dev/null || true
+if [ "$STOP_GLOBAL_WIFI_SERVICES" = yes ]; then
+  systemctl stop wpa_supplicant@"$MESH_IF".service 2>/dev/null || true
 fi
+ip link set "$MESH_IF" down || true
+iw dev "$MESH_IF" mesh leave 2>/dev/null || true
+iw dev "$MESH_IF" ibss leave 2>/dev/null || true
+ip addr flush dev "$MESH_IF" || true
 
-ACTIVE_MODE=""
-
-echo "[5/12] Selecting wireless mesh mode..."
-case "$MESH_MODE" in
-    auto)
-        if [ "$HAS_MESH_POINT" = "yes" ]; then
-            if start_mesh_point; then
-                ACTIVE_MODE="mesh_point"
-            elif [ "$HAS_IBSS" = "yes" ]; then
-                echo "[WARN] mesh point join failed; falling back to IBSS."
-                start_ibss
-                ACTIVE_MODE="ibss"
-            else
-                echo "[ERROR] mesh point join failed and IBSS is not supported."
-                exit 1
-            fi
-        elif [ "$HAS_IBSS" = "yes" ]; then
-            start_ibss
-            ACTIVE_MODE="ibss"
-        fi
-        ;;
-    mesh_point|mesh|80211s)
-        if [ "$HAS_MESH_POINT" != "yes" ]; then
-            echo "[ERROR] Requested mesh point mode, but this adapter does not support it."
-            exit 1
-        fi
-        start_mesh_point
-        ACTIVE_MODE="mesh_point"
-        ;;
-    ibss)
-        if [ "$HAS_IBSS" != "yes" ]; then
-            echo "[ERROR] Requested IBSS mode, but this adapter does not support it."
-            exit 1
-        fi
-        start_ibss
-        ACTIVE_MODE="ibss"
-        ;;
+supports_mesh=no; supports_ibss=no
+iw list 2>/dev/null | grep -q 'mesh point' && supports_mesh=yes || true
+iw list 2>/dev/null | grep -q 'IBSS' && supports_ibss=yes || true
+mode="$MESH_MODE"
+if [ "$mode" = auto ]; then
+  if [ "$supports_mesh" = yes ]; then mode=mesh; elif [ "$supports_ibss" = yes ]; then mode=ibss; else echo "[ERROR] Neither mesh point nor IBSS supported"; exit 1; fi
+fi
+case "$mode" in
+  mesh)
+    iw dev "$MESH_IF" set type mp
+    ip link set "$MESH_IF" up
+    iw dev "$MESH_IF" mesh join "$MESH_ID" freq "$MESH_FREQ"
+    ;;
+  ibss)
+    iw dev "$MESH_IF" set type ibss
+    ip link set "$MESH_IF" up
+    iw dev "$MESH_IF" ibss join "$MESH_ID" "$MESH_FREQ" fixed-freq "$IBSS_BSSID"
+    ;;
+  *) echo "[ERROR] MESH_MODE must be auto, mesh, or ibss"; exit 1 ;;
 esac
+[ "$WIFI_POWER_SAVE" != off ] || iw dev "$MESH_IF" set power_save off 2>/dev/null || true
 
-echo "[6/12] Wireless mode active: $ACTIVE_MODE"
-ip link set "$MESH_IF" up || true
-set_wifi_power_save
-show_wireless_state
-
-echo "[7/12] Creating BATMAN interface..."
+if ip link show "$BAT_IF" >/dev/null 2>&1; then
+  ip link set "$BAT_IF" down || true
+  ip link delete "$BAT_IF" type batadv 2>/dev/null || true
+fi
 ip link add name "$BAT_IF" type batadv
-
-echo "[8/12] Adding mesh interface to BATMAN..."
 batctl -m "$BAT_IF" if add "$MESH_IF"
-
-echo "[9/12] Assigning IP to BATMAN interface..."
-ip link set up dev "$BAT_IF"
+[ -z "${BATMAN_HOP_PENALTY:-}" ] || batctl -m "$BAT_IF" hop_penalty "$BATMAN_HOP_PENALTY"
+[ -z "${BATMAN_ORIG_INTERVAL:-}" ] || batctl -m "$BAT_IF" orig_interval "$BATMAN_ORIG_INTERVAL"
+ip link set "$BAT_IF" up
 ip addr flush dev "$BAT_IF"
 ip addr add "$IP_ADDR/$NETMASK_CIDR" dev "$BAT_IF"
-
-echo "[10/12] Applying BATMAN tuning..."
-apply_batman_tuning
-
-echo "[11/12] Verifying BATMAN interface..."
-ip addr show "$BAT_IF"
-
-echo "[12/12] BATMAN mesh settings..."
-for setting in hop_penalty orig_interval; do
-    if [ -r "/sys/class/net/$BAT_IF/mesh/$setting" ]; then
-        printf "%s=" "$setting"
-        cat "/sys/class/net/$BAT_IF/mesh/$setting"
-    fi
-done
-MESH_STARTED="yes"
-
-echo "========================================"
-echo " Mesh started successfully."
-echo "========================================"
-echo "Active wireless mode: $ACTIVE_MODE"
-echo "Check neighbors:"
-echo "sudo batctl -m $BAT_IF n"
-echo "sudo batctl -m $BAT_IF o"
+echo "[OK] $NODE_NAME mesh ready: $BAT_IF=$IP_ADDR/$NETMASK_CIDR mode=$mode via $MESH_IF"

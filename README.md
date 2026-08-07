@@ -1,88 +1,131 @@
-# HANSEL_MESH
+# HANSEL_MESH ROS 2 integration
 
-HANSEL_GRETEL 다유닛 로봇을 위한 BATMAN-adv 기반 Wi-Fi Mesh 릴레이 통신 프로젝트입니다.
+This repository keeps the operational directory layout close to the original
+`HANSEL_MESH` project while isolating the ROS 2 packages in `ros2_ws/`.
 
-- 계층 구조/토폴로지: [Architecture](docs/architecture.md)
-- AR9271 동글 도착 후 실행 절차: [Dongle Arrival Runbook](docs/dongle_arrival_runbook.md)
-
-## 목표 구조
+## Directory layout
 
 ```text
-구조자 PC
-   |
-Base Pi
-   |
-Relay Node Pi
-   |
-Head Pi / Robot
+HANSEL_MESH_ROS2/
+├── common/       shared contracts and architecture notes
+├── configs/      role-specific BATMAN-adv and metrics environment files
+├── controller/   operator laptop entry points and keyboard control
+├── docs/         deployment, wiring, validation and architecture documents
+├── listen/       standalone inspection/listener utilities
+├── monitor/      HANSEL_MESH-compatible metrics_agent.py
+├── robot/        unit-side launch helpers and Arduino Nano firmware
+├── scripts/      BATMAN-adv setup, installation and project helper scripts
+├── sensors/      Radar adapter entry points and sensor integration notes
+├── services/     systemd service templates
+├── tests/        repository-level Python contract and control tests
+├── tools/        local smoke-test utilities
+└── ros2_ws/
+    └── src/      ROS 2 packages
 ```
 
-| Hostname | 역할                     | Config            | bat0 IP       |
-| -------- | ------------------------ | ----------------- | ------------- |
-| base     | 구조자 쪽 기준 노드       | configs/base.env  | 192.168.50.1  |
-| head     | 로봇 헤드 / 카메라 / 제어 | configs/head.env  | 192.168.50.10 |
-| node1    | 릴레이 유닛 1            | configs/node1.env | 192.168.50.11 |
-| node2    | 릴레이 유닛 2            | configs/node2.env | 192.168.50.12 |
+The upstream repository keeps operational code at the root in directories such
+as `controller/`, `robot/`, `monitor/`, `sensors/`, `configs/`, `scripts/` and
+`services/`. This project follows the same separation, while ROS-specific
+packages remain under the standard colcon workspace path `ros2_ws/src/`.
 
-`node3`는 예비 Pi가 생겼을 때 추가할 optional 릴레이입니다.
-조종 클라이언트의 기본 active 목록도 `head,node1,node2`이다. node3를 실제로
-연결한 시험에서는 `--active-targets head,node1,node2,node3`를 추가한다.
-
-## 기본 실행 순서
+## Build the ROS 2 workspace
 
 ```bash
-chmod +x scripts/*.sh
-sudo ./scripts/install_mesh.sh
-sudo ./scripts/start_role_network.sh base
+cd ~/HANSEL_MESH_ROS2
+./scripts/build_ros2.sh
+source ros2_ws/install/setup.bash
 ```
 
-장치별로 `base`만 `head`, `node1`, `node2`로 바꿔서 실행합니다.
-
-## 자동 실행
+Manual equivalent:
 
 ```bash
-sudo ./scripts/enable_mesh_autostart.sh base
-sudo systemctl start hansel-mesh@base
+source /opt/ros/jazzy/setup.bash
+cd ~/HANSEL_MESH_ROS2/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --symlink-install
+source install/setup.bash
 ```
 
-다른 장치는 `base`를 `head`, `node1`, `node2`로 바꿔서 사용합니다. 자세한 절차는 [Mesh Autostart Runbook](docs/mesh_autostart_runbook.md)을 따른다.
-
-## 상태 확인
+## One-PC test
 
 ```bash
-sudo ./scripts/check_mesh.sh
-ping 192.168.50.1
-sudo batctl n
-sudo batctl o
+cd ~/HANSEL_MESH_ROS2
+./scripts/test_workspace.sh
+
+source /opt/ros/jazzy/setup.bash
+source ros2_ws/install/setup.bash
+ros2 launch hansel_bringup dummy_system.launch.py \
+  use_rviz:=false use_rqt:=true \
+  use_camera_receiver:=false use_adapter_stubs:=false
 ```
 
-## 카메라 + 조종
-
-각 노드는 AR9271 동글(`wlan1`)을 Mesh 전용으로 쓰고, 내장 `wlan0`는 조난자 핸드폰 AP 등 향후 용도로 남깁니다. AR9271 동글 도착 전까지는 이 config로 Mesh가 뜨지 않으며, 그 전에 카메라 영상과 조종 명령 경로를 먼저 준비합니다.
-
-실행 순서는 [Camera And Control Quickstart](docs/camera_control_quickstart.md)를 따른다.
-
-다음 현장 테스트 시작 순서는 [Next Field Test Checklist](docs/next_field_test_checklist.md)를 따른다.
-
-실제 GPIO 모터/엔코더 제어는 [Motor Control Quickstart](docs/motor_control_quickstart.md)를 따른다.
-
-내일 구동 + 카메라 테스트 전체 순서는 [Tomorrow Drive + Camera Runbook](docs/tomorrow_drive_camera_runbook.md)을 따른다.
-
-팀원 설명용 코드/원리 문서는 [HANSEL_MESH Code And Network Explainer](docs/hansel_mesh_code_explainer.md)를 따른다.
-
-## 전방 레이더 화면
-
-레이더가 없어도 합성 붕괴현장 점군으로 화면을 먼저 확인할 수 있다.
+In another terminal:
 
 ```bash
-python3 monitor/radar_front.py --demo
+cd ~/HANSEL_MESH_ROS2
+./controller/run_keyboard_control.sh
 ```
 
-실제 IWRL6432 UART 캡처와 화면 연결 절차는
-[IWRL6432 Front Radar View](docs/radar_front_view.md)를 따른다.
+## Raspberry Pi network setup
 
-## 통신 원칙
+The network setup now lives at the same root-level paths used by the upstream
+project:
 
-Base Pi가 명령 내용을 해석해 각 유닛으로 다시 보내는 dispatcher 구조가 아니라, 모든 유닛이 BATMAN-adv 릴레이 노드로 동작합니다.
+```bash
+cd ~/HANSEL_MESH_ROS2
+sudo ./scripts/install_network_bundle.sh head
+```
 
-데이터는 `bat0` 위에서 end-to-end로 흐르고, 중간 node는 BATMAN-adv next-hop으로 프레임을 포워딩합니다.
+Replace `head` with `base`, `node1`, `node2` or `node3`. The installer copies
+`configs/`, `scripts/`, `services/` and `monitor/` to the runtime directory and
+enables the role-specific systemd services.
+
+## Unit execution
+
+```bash
+cd ~/HANSEL_MESH_ROS2
+./robot/run_unit.sh head /dev/hansel_nano
+```
+
+For a rear unit:
+
+```bash
+./robot/run_unit.sh node1 /dev/hansel_nano
+```
+
+## Hardware firmware
+
+Flash this file to every Arduino Nano:
+
+```text
+robot/firmware/hansel_nano_bridge/hansel_nano_bridge.ino
+```
+
+Read `docs/WIRING_AND_NANO.md` before powering the motors or expanding the
+servo range.
+
+## Responsibility map
+
+- `controller/`: keyboard-first operator input and operator stack wrappers.
+- `robot/`: unit controller startup and Nano firmware.
+- `monitor/`: BATMAN-adv metrics collection and UDP reporting.
+- `sensors/`: mission-log-based Radar integration.
+- `ros2_ws/src/hansel_operator`: ROS routing, detach coordination and RQT.
+- `ros2_ws/src/hansel_unit_control`: CPS target mapping, PID, safety and serial hardware bridge.
+- `ros2_ws/src/hansel_network_adapter`: UDP metrics to ROS topics.
+- `ros2_ws/src/hansel_radar_adapter`: mission JSONL to PointCloud2/OccupancyGrid.
+
+See `docs/DIRECTORY_LAYOUT.md` for a detailed file-to-device deployment map.
+
+## Correct single-PC keyboard test
+
+After building `ros2_ws`, run:
+
+```bash
+./controller/run_single_pc_test.sh
+```
+
+This preserves an interactive terminal for keyboard input and also publishes a
+dummy camera image to the RQT video panel. RQT has only four editable values:
+Straight RPM, Turn RPM, Head Up limit and Head Down limit. Up/Down can each be
+set to 180 degrees, yielding a logical servo range of -180 through +180 degrees.

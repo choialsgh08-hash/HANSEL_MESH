@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
-"""Per-node mesh metrics agent.
+"""HANSEL_MESH-compatible per-node BATMAN-adv metrics agent.
 
-Runs on each Pi. Collects link-layer metrics this node can directly observe
-(RSSI / bitrate per neighbor via `iw station dump`, BATMAN TQ via `batctl o`,
-neighbor last-seen via `batctl n`) plus end-to-end RTT (ping) to known nodes,
-maps MAC -> node name via the bat0 ARP table, and emits one JSON snapshot.
-
-Designed to be testable WITHOUT hardware: pass --sample <dir> to parse captured
-command output (station.txt, batctl_o.txt, batctl_n.txt, ip_neigh.txt) instead
-of running the real commands. This lets you validate parsing on any machine.
-
-Typical use on a Pi when dashboard.py runs on the operator laptop:
-    python3 monitor/metrics_agent.py --self node1 --loop --interval 5 \
-        --send 192.168.60.2:7100
+Produces the same top-level UDP JSON contract consumed by
+hansel_network_adapter: node, mesh_if, bat_if, ts, links, end_to_end, bat0.
 """
-
-from __future__ import annotations  # 3.9(Bullseye) 호환: str | None 같은 표기 지원
+from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,9 +14,8 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-
-# Known mesh nodes: name -> bat0 IP. Matches configs/*.env.
 NODES = {
     "base": "192.168.50.1",
     "head": "192.168.50.10",
@@ -35,201 +23,7 @@ NODES = {
     "node2": "192.168.50.12",
     "node3": "192.168.50.13",
 }
-
 MAC_RE = r"[0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5}"
-
-
-# --------------------------------------------------------------------------- #
-# Parsers (pure functions: text in -> dict out, no side effects)              #
-# --------------------------------------------------------------------------- #
-
-def parse_station_dump(text: str) -> dict:
-    """Parse `iw dev <if> station dump`.
-
-    Returns {mac: {signal_dbm, signal_avg_dbm, tx_mbit, rx_mbit, inactive_ms,
-    tx_retries, tx_failed, expected_mbps}}. tx_retries/tx_failed rising and
-    expected_mbps falling are early signs of a link about to drop.
-    """
-    stations: dict = {}
-    current = None
-    for line in text.splitlines():
-        m = re.match(rf"\s*Station\s+({MAC_RE})", line)
-        if m:
-            current = m.group(1).lower()
-            stations[current] = {}
-            continue
-        if current is None:
-            continue
-        line = line.strip()
-        if line.startswith("signal avg:"):
-            v = _first_int(line)
-            if v is not None:
-                stations[current]["signal_avg_dbm"] = v
-        elif line.startswith("signal:"):
-            v = _first_int(line)
-            if v is not None:
-                stations[current]["signal_dbm"] = v
-        elif line.startswith("tx bitrate:"):
-            v = _first_float(line)
-            if v is not None:
-                stations[current]["tx_mbit"] = v
-        elif line.startswith("rx bitrate:"):
-            v = _first_float(line)
-            if v is not None:
-                stations[current]["rx_mbit"] = v
-        elif line.startswith("inactive time:"):
-            v = _first_int(line)
-            if v is not None:
-                stations[current]["inactive_ms"] = v
-        elif line.startswith("tx retries:"):
-            v = _first_int(line)
-            if v is not None:
-                stations[current]["tx_retries"] = v
-        elif line.startswith("tx failed:"):
-            v = _first_int(line)
-            if v is not None:
-                stations[current]["tx_failed"] = v
-        elif line.startswith("expected throughput:"):
-            v = _first_float(line)
-            if v is not None:
-                stations[current]["expected_mbps"] = v
-    return stations
-
-
-def parse_batctl_o(text: str) -> dict:
-    """Parse `batctl o` (originators). Returns {mac: {tq, last_seen_s, nexthop}}.
-
-    Only the selected best path (line marked with '*') is kept per originator.
-    """
-    originators: dict = {}
-    # Example: " * 02:11:.. 0.520s (245) 02:11:.. [ wlan0]"
-    line_re = re.compile(
-        rf"^\s*\*\s+({MAC_RE})\s+([\d.]+)s\s+\((\d+)\)\s+({MAC_RE})"
-    )
-    for line in text.splitlines():
-        m = line_re.match(line)
-        if not m:
-            continue
-        mac = m.group(1).lower()
-        originators[mac] = {
-            "last_seen_s": float(m.group(2)),
-            "tq": int(m.group(3)),
-            "nexthop": m.group(4).lower(),
-        }
-    return originators
-
-
-def parse_batctl_n(text: str) -> dict:
-    """Parse `batctl n` (direct neighbors). Returns {mac: last_seen_s}."""
-    neighbors: dict = {}
-    line_re = re.compile(rf"^\s*\S+\s+({MAC_RE})\s+([\d.]+)s")
-    for line in text.splitlines():
-        if "Neighbor" in line and "last-seen" in line:
-            continue  # header
-        m = line_re.match(line)
-        if m:
-            neighbors[m.group(1).lower()] = float(m.group(2))
-    return neighbors
-
-
-def parse_ip_neigh(text: str) -> dict:
-    """Parse `ip neigh show dev bat0`. Returns {mac: ip}."""
-    mac_to_ip: dict = {}
-    line_re = re.compile(rf"^(\d+\.\d+\.\d+\.\d+)\s+lladdr\s+({MAC_RE})")
-    for line in text.splitlines():
-        m = line_re.match(line.strip())
-        if m:
-            mac_to_ip[m.group(2).lower()] = m.group(1)
-    return mac_to_ip
-
-
-def parse_ping(text: str) -> dict:
-    """Parse Linux `ping -c N` output. Returns {rtt_avg_ms, loss_pct}."""
-    result: dict = {}
-    loss = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", text)
-    if loss:
-        result["loss_pct"] = float(loss.group(1))
-    rtt = re.search(r"=\s*[\d.]+/([\d.]+)/[\d.]+/[\d.]+\s*ms", text)
-    if rtt:
-        result["rtt_avg_ms"] = float(rtt.group(1))
-    return result
-
-
-def parse_bat_stats(text: str) -> dict:
-    """Parse `ip -s link show dev bat0`. Returns rx/tx bytes/packets/dropped.
-
-    The number line directly under the "RX:"/"TX:" header holds:
-    RX: bytes packets errors dropped overrun mcast
-    TX: bytes packets errors dropped carrier collsns
-    """
-    stats: dict = {}
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        header = line.strip()
-        if header.startswith("RX:") and i + 1 < len(lines):
-            nums = lines[i + 1].split()
-            if len(nums) >= 4 and all(n.lstrip("-").isdigit() for n in nums[:4]):
-                stats["rx_bytes"] = int(nums[0])
-                stats["rx_packets"] = int(nums[1])
-                stats["rx_dropped"] = int(nums[3])
-        elif header.startswith("TX:") and i + 1 < len(lines):
-            nums = lines[i + 1].split()
-            if len(nums) >= 4 and all(n.lstrip("-").isdigit() for n in nums[:4]):
-                stats["tx_bytes"] = int(nums[0])
-                stats["tx_packets"] = int(nums[1])
-                stats["tx_dropped"] = int(nums[3])
-    return stats
-
-
-def _links_by_mac(snapshot: dict) -> dict:
-    return {link["mac"]: link for link in snapshot.get("links", []) if "mac" in link}
-
-
-def detect_events(prev: dict, curr: dict) -> list:
-    """Diff two consecutive snapshots into reconnect/route-change events.
-
-    Pure function (no I/O) so it is unit-testable with fixtures. Returns a list
-    of event dicts, each with a "type" the dashboard can show as a banner:
-      route_changed   - a peer's selected next hop changed (path switched)
-      neighbor_lost   - a direct neighbor disappeared (link dropped)
-      neighbor_gained - a direct neighbor (re)appeared (link came back)
-    """
-    events: list = []
-    prev_links = _links_by_mac(prev)
-    curr_links = _links_by_mac(curr)
-
-    for mac, cl in curr_links.items():
-        pl = prev_links.get(mac)
-        if not pl:
-            continue
-        old_hop = pl.get("nexthop")
-        new_hop = cl.get("nexthop")
-        if old_hop and new_hop and old_hop != new_hop:
-            events.append({
-                "type": "route_changed",
-                "peer": cl.get("peer", mac),
-                "mac": mac,
-                "from": old_hop,
-                "to": new_hop,
-            })
-
-    prev_direct = {m for m, l in prev_links.items() if l.get("direct")}
-    curr_direct = {m for m, l in curr_links.items() if l.get("direct")}
-    for mac in sorted(prev_direct - curr_direct):
-        link = prev_links[mac]
-        events.append({
-            "type": "neighbor_lost",
-            "peer": link.get("peer", mac),
-            "mac": mac,
-        })
-    for mac in sorted(curr_direct - prev_direct):
-        link = curr_links[mac]
-        events.append({
-            "type": "neighbor_gained",
-            "peer": link.get("peer", mac),
-            "mac": mac,
-        })
-    return events
 
 
 def _first_int(line: str):
@@ -242,72 +36,136 @@ def _first_float(line: str):
     return float(m.group()) if m else None
 
 
-# --------------------------------------------------------------------------- #
-# Command runners (real hardware)                                             #
-# --------------------------------------------------------------------------- #
+def parse_station_dump(text: str) -> dict:
+    stations: dict = {}
+    current = None
+    for line in text.splitlines():
+        match = re.match(rf"\s*Station\s+({MAC_RE})", line)
+        if match:
+            current = match.group(1).lower()
+            stations[current] = {}
+            continue
+        if current is None:
+            continue
+        line = line.strip()
+        mapping = {
+            "signal avg:": ("signal_avg_dbm", _first_int),
+            "signal:": ("signal_dbm", _first_int),
+            "tx bitrate:": ("tx_mbit", _first_float),
+            "rx bitrate:": ("rx_mbit", _first_float),
+            "inactive time:": ("inactive_ms", _first_int),
+            "tx retries:": ("tx_retries", _first_int),
+            "tx failed:": ("tx_failed", _first_int),
+            "expected throughput:": ("expected_mbps", _first_float),
+        }
+        for prefix, (key, parser) in mapping.items():
+            if line.startswith(prefix):
+                value = parser(line)
+                if value is not None:
+                    stations[current][key] = value
+                break
+    return stations
 
-def _run(cmd: list) -> str:
+
+def parse_batctl_o(text: str) -> dict:
+    result = {}
+    pattern = re.compile(rf"^\s*\*\s+({MAC_RE})\s+([\d.]+)s\s+\((\d+)\)\s+({MAC_RE})")
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            result[match.group(1).lower()] = {
+                "last_seen_s": float(match.group(2)),
+                "tq": int(match.group(3)),
+                "nexthop": match.group(4).lower(),
+            }
+    return result
+
+
+def parse_batctl_n(text: str) -> dict:
+    result = {}
+    pattern = re.compile(rf"^\s*\S+\s+({MAC_RE})\s+([\d.]+)s")
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            result[match.group(1).lower()] = float(match.group(2))
+    return result
+
+
+def parse_ip_neigh(text: str) -> dict:
+    result = {}
+    pattern = re.compile(rf"^(\d+\.\d+\.\d+\.\d+)\s+.*lladdr\s+({MAC_RE})")
+    for line in text.splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            result[match.group(2).lower()] = match.group(1)
+    return result
+
+
+def parse_ping(text: str) -> dict:
+    result = {}
+    loss = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", text)
+    if loss:
+        result["loss_pct"] = float(loss.group(1))
+    rtt = re.search(r"=\s*[\d.]+/([\d.]+)/[\d.]+/[\d.]+\s*ms", text)
+    if rtt:
+        result["rtt_avg_ms"] = float(rtt.group(1))
+    return result
+
+
+def parse_bat_stats(text: str) -> dict:
+    stats = {}
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        header = line.strip()
+        if header.startswith("RX:") and index + 1 < len(lines):
+            nums = lines[index + 1].split()
+            if len(nums) >= 4 and all(x.isdigit() for x in nums[:4]):
+                stats.update(rx_bytes=int(nums[0]), rx_packets=int(nums[1]), rx_dropped=int(nums[3]))
+        elif header.startswith("TX:") and index + 1 < len(lines):
+            nums = lines[index + 1].split()
+            if len(nums) >= 4 and all(x.isdigit() for x in nums[:4]):
+                stats.update(tx_bytes=int(nums[0]), tx_packets=int(nums[1]), tx_dropped=int(nums[3]))
+    return stats
+
+
+def _run(command: list[str]) -> str:
     try:
-        out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10
-        )
-        return out.stdout + out.stderr
-    except (subprocess.SubprocessError, FileNotFoundError) as exc:
-        print(f"[warn] command failed: {' '.join(cmd)} ({exc})", file=sys.stderr)
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+        return completed.stdout + completed.stderr
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[warn] command failed: {' '.join(command)} ({exc})", file=sys.stderr)
         return ""
 
 
-def ip_to_node(ip: str) -> str:
-    for name, node_ip in NODES.items():
-        if node_ip == ip:
+def _node_for_ip(ip: str | None) -> str:
+    if ip is None:
+        return ""
+    for name, value in NODES.items():
+        if value == ip:
             return name
     return ip
 
 
-# --------------------------------------------------------------------------- #
-# Snapshot assembly                                                           #
-# --------------------------------------------------------------------------- #
-
-def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
-                   ping_targets: dict, timestamp: float,
-                   bat_if: str = "bat0") -> dict:
-    """Combine parsed command outputs into one snapshot dict.
-
-    links_text: {"station": ..., "batctl_o": ..., "batctl_n": ..., "ip_neigh": ...}
-    ping_targets: {node_name: ping_output_text}
-    """
-    stations = parse_station_dump(links_text.get("station", ""))
-    originators = parse_batctl_o(links_text.get("batctl_o", ""))
-    neighbors = parse_batctl_n(links_text.get("batctl_n", ""))
-    mac_to_ip = parse_ip_neigh(links_text.get("ip_neigh", ""))
-    bat_stats = parse_bat_stats(links_text.get("bat_stats", ""))
-
-    # Union of all MACs we have any data for.
-    macs = set(stations) | set(originators) | set(neighbors)
+def build_snapshot(self_name: str, mesh_if: str, bat_if: str, texts: dict, pings: dict, timestamp: float) -> dict:
+    stations = parse_station_dump(texts.get("station", ""))
+    originators = parse_batctl_o(texts.get("batctl_o", ""))
+    neighbors = parse_batctl_n(texts.get("batctl_n", ""))
+    mac_to_ip = parse_ip_neigh(texts.get("ip_neigh", ""))
     links = []
-    for mac in sorted(macs):
+    for mac in sorted(set(stations) | set(originators) | set(neighbors)):
         ip = mac_to_ip.get(mac)
-        entry = {
-            "mac": mac,
-            "peer": ip_to_node(ip) if ip else mac,
-            "ip": ip,
-        }
+        entry = {"mac": mac, "peer": _node_for_ip(ip) or mac, "ip": ip}
         entry.update(stations.get(mac, {}))
         if mac in originators:
-            entry["tq"] = originators[mac]["tq"]
-            entry["last_seen_s"] = originators[mac]["last_seen_s"]
-            entry["nexthop"] = originators[mac]["nexthop"]
+            entry.update(originators[mac])
         if mac in neighbors:
-            entry["neighbor_last_seen_s"] = neighbors[mac]
-            entry["direct"] = True
+            entry.update(neighbor_last_seen_s=neighbors[mac], direct=True)
         links.append(entry)
-
     e2e = {}
-    for name, text in ping_targets.items():
-        stats = parse_ping(text)
-        if stats:
-            e2e[name] = stats
-
+    for name, output in pings.items():
+        parsed = parse_ping(output)
+        if parsed:
+            e2e[name] = parsed
     return {
         "node": self_name,
         "mesh_if": mesh_if,
@@ -315,167 +173,83 @@ def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
         "ts": round(timestamp, 3),
         "links": links,
         "end_to_end": e2e,
-        "bat0": bat_stats,
+        "bat0": parse_bat_stats(texts.get("bat_stats", "")),
     }
 
 
-def collect_real(self_name: str, mesh_if: str, bat_if: str, ping_list: list,
-                 timestamp: float) -> dict:
-    link_commands = {
+def collect_real(self_name: str, mesh_if: str, bat_if: str, ping_names: list[str]) -> dict:
+    commands = {
         "station": ["iw", "dev", mesh_if, "station", "dump"],
         "batctl_o": ["batctl", "-m", bat_if, "o"],
         "batctl_n": ["batctl", "-m", bat_if, "n"],
         "ip_neigh": ["ip", "neigh", "show", "dev", bat_if],
         "bat_stats": ["ip", "-s", "link", "show", "dev", bat_if],
     }
-    ping_commands = {}
-    for name in ping_list:
-        ip = NODES.get(name)
-        if ip:
-            ping_commands[name] = ["ping", "-c", "3", "-W", "1", ip]
-
-    # Sequential three-packet pings to five nodes can make a nominal five
-    # second agent report only every ~15 seconds. The dashboard marks nodes
-    # offline after 12 seconds, so collect independent commands concurrently.
-    links_text = {}
-    ping_targets = {}
-    jobs = {}
-    worker_count = min(8, len(link_commands) + len(ping_commands))
-    with ThreadPoolExecutor(max_workers=max(1, worker_count)) as executor:
-        for name, command in link_commands.items():
-            jobs[executor.submit(_run, command)] = ("link", name)
-        for name, command in ping_commands.items():
-            jobs[executor.submit(_run, command)] = ("ping", name)
-        for future in as_completed(jobs):
-            kind, name = jobs[future]
-            output = future.result()
-            if kind == "link":
-                links_text[name] = output
+    texts = {}
+    pings = {}
+    with ThreadPoolExecutor(max_workers=max(4, len(commands) + len(ping_names))) as executor:
+        future_map = {executor.submit(_run, cmd): ("text", key) for key, cmd in commands.items()}
+        for name in ping_names:
+            ip = NODES.get(name, name)
+            future_map[executor.submit(_run, ["ping", "-c", "2", "-W", "1", ip])] = ("ping", name)
+        for future in as_completed(future_map):
+            kind, key = future_map[future]
+            if kind == "text":
+                texts[key] = future.result()
             else:
-                ping_targets[name] = output
-
-    return build_snapshot(
-        self_name,
-        mesh_if,
-        links_text,
-        ping_targets,
-        timestamp,
-        bat_if=bat_if,
-    )
+                pings[key] = future.result()
+    return build_snapshot(self_name, mesh_if, bat_if, texts, pings, time.time())
 
 
-def collect_sample(sample_dir: str, self_name: str, mesh_if: str,
-                   bat_if: str,
-                   timestamp: float) -> dict:
-    """Read captured command output from a directory (no hardware needed)."""
-    import os
-
-    def read(name):
-        path = os.path.join(sample_dir, name)
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as fh:
-                return fh.read()
-        return ""
-
-    links_text = {
-        "station": read("station.txt"),
-        "batctl_o": read("batctl_o.txt"),
-        "batctl_n": read("batctl_n.txt"),
-        "ip_neigh": read("ip_neigh.txt"),
-        "bat_stats": read("ip_link_stats.txt"),
+def collect_sample(self_name: str, mesh_if: str, bat_if: str, sample_dir: Path, ping_names: list[str]) -> dict:
+    names = {
+        "station": "station.txt",
+        "batctl_o": "batctl_o.txt",
+        "batctl_n": "batctl_n.txt",
+        "ip_neigh": "ip_neigh.txt",
+        "bat_stats": "bat_stats.txt",
     }
-    ping_targets = {}
-    for name in NODES:
-        text = read(f"ping_{name}.txt")
-        if text:
-            ping_targets[name] = text
-    return build_snapshot(
-        self_name,
-        mesh_if,
-        links_text,
-        ping_targets,
-        timestamp,
-        bat_if=bat_if,
-    )
+    texts = {key: (sample_dir / filename).read_text(errors="replace") if (sample_dir / filename).exists() else "" for key, filename in names.items()}
+    pings = {}
+    for name in ping_names:
+        path = sample_dir / f"ping_{name}.txt"
+        if path.exists():
+            pings[name] = path.read_text(errors="replace")
+    return build_snapshot(self_name, mesh_if, bat_if, texts, pings, time.time())
 
 
-# --------------------------------------------------------------------------- #
-# Output                                                                      #
-# --------------------------------------------------------------------------- #
-
-def emit(snapshot: dict, send_to: str | None) -> None:
-    payload = json.dumps(snapshot)
-    print(payload, flush=True)
-    if send_to:
-        host, _, port = send_to.partition(":")
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            try:
-                sock.sendto(payload.encode("utf-8"), (host, int(port)))
-            except OSError as exc:
-                print(f"[warn] send failed to {send_to}: {exc}", file=sys.stderr)
-        finally:
-            sock.close()
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Collect mesh link + RTT metrics.")
-    p.add_argument("--self", dest="self_name", default="unknown",
-                   help="this node's name (base/head/node1/...)")
-    p.add_argument("--mesh-if", default="wlan1", help="wireless interface")
-    p.add_argument("--bat-if", default="bat0", help="BATMAN interface")
-    p.add_argument("--ping", nargs="*", default=[],
-                   help="node names to ping for RTT (e.g. --ping head base)")
-    p.add_argument("--send", default=None,
-                   help="forward JSON to collector as UDP host:port")
-    p.add_argument("--loop", action="store_true", help="run continuously")
-    p.add_argument("--interval", type=float, default=5.0,
-                   help="seconds between samples in --loop mode")
-    p.add_argument("--sample", default=None,
-                   help="parse captured output from this dir instead of hardware")
-    return p.parse_args()
+def send_udp(snapshot: dict, destination: str) -> None:
+    host, port_text = destination.rsplit(":", 1)
+    payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(payload, (host, int(port_text)))
 
 
 def main() -> int:
-    args = parse_args()
-    # Date.now equivalent: time.time() is fine at runtime (not a workflow).
-    base_ts = time.time()
-
-    prev_snap = {"prev": None}
-
-    def one(ts):
-        if args.sample:
-            snap = collect_sample(
-                args.sample,
-                args.self_name,
-                args.mesh_if,
-                args.bat_if,
-                ts,
-            )
-        else:
-            snap = collect_real(
-                args.self_name,
-                args.mesh_if,
-                args.bat_if,
-                args.ping,
-                ts,
-            )
-        if prev_snap["prev"] is not None:
-            events = detect_events(prev_snap["prev"], snap)
-            if events:
-                snap["events"] = events
-        prev_snap["prev"] = snap
-        emit(snap, args.send)
-
-    if not args.loop:
-        one(base_ts)
-        return 0
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--self", dest="self_name", required=True, choices=sorted(NODES))
+    parser.add_argument("--mesh-if", default="wlan1")
+    parser.add_argument("--bat-if", default="bat0")
+    parser.add_argument("--ping", nargs="*", default=list(NODES))
+    parser.add_argument("--send", default="")
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval", type=float, default=5.0)
+    parser.add_argument("--sample", type=Path)
+    args = parser.parse_args()
+    if args.interval <= 0:
+        parser.error("--interval must be positive")
     while True:
-        cycle_started = time.monotonic()
-        one(time.time())
-        elapsed = time.monotonic() - cycle_started
-        time.sleep(max(0.0, args.interval - elapsed))
+        if args.sample:
+            snapshot = collect_sample(args.self_name, args.mesh_if, args.bat_if, args.sample, args.ping)
+        else:
+            snapshot = collect_real(args.self_name, args.mesh_if, args.bat_if, args.ping)
+        print(json.dumps(snapshot, ensure_ascii=False), flush=True)
+        if args.send:
+            send_udp(snapshot, args.send)
+        if not args.loop:
+            break
+        time.sleep(args.interval)
+    return 0
 
 
 if __name__ == "__main__":
