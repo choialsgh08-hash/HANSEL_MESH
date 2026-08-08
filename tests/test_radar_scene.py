@@ -1166,6 +1166,19 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(scene["planned_path"]["length_m"], 0.0)
         self.assertEqual(scene["planned_path"]["points"], [[0.0, 0.0]])
 
+    def test_confirmed_origin_obstacle_fails_closed(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        point = RadarPoint(0.0, 0.0, 0.0, 0.0, 30.0)
+        estimator.ingest(radar_frame((point,), frame_number=1), received_at=1.000)
+        estimator.ingest(radar_frame((point,), frame_number=2), received_at=1.125)
+
+        scene = estimator.snapshot(now=1.125)
+
+        self.assertTrue(scene["near_occupancy"]["cells"])
+        self.assertEqual(scene["planned_path"]["status"], "blocked_near_field")
+        self.assertEqual(scene["planned_path"]["length_m"], 0.0)
+        self.assertEqual(scene["planned_path"]["points"], [[0.0, 0.0]])
+
     def test_repeated_eleven_centimeter_stop_does_not_count_switch_each_frame(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
         point = RadarPoint(0.0, 0.11, 0.0, 0.0, 30.0)
@@ -1177,6 +1190,54 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         scene = estimator.snapshot(now=1.625)
         self.assertEqual(scene["planned_path"]["status"], "blocked_near_field")
         self.assertEqual(scene["diagnostics"]["path_switch_accepted_count"], 1)
+
+    def test_planner_never_returns_a_path_its_collision_check_rejects(self):
+        obstacle = {
+            "forward_m": 0.20,
+            "lateral_m": -0.10,
+            "range_uncertainty_m": 0.002,
+            "lateral_uncertainty_m": 0.002,
+            "support_radius_m": 0.05 / math.sqrt(2),
+            "evidence_kind": "probability",
+            "source": "point",
+        }
+
+        path = RadarSceneEstimator._plan_path([obstacle])
+
+        self.assertIn(path["status"], {"clear", "limited"})
+        self.assertEqual(
+            RadarSceneEstimator._path_collision_segments(path, [obstacle]),
+            [],
+        )
+
+    def test_repeated_non_near_blocked_route_counts_one_switch(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator.ingest(radar_frame((), frame_number=1), received_at=1.0)
+        accepted_counts = []
+        for frame_number in range(2, 6):
+            when = 1.0 + (frame_number - 1) * 0.125
+            estimator._probability_grid.add_hit(
+                0.20,
+                -0.10,
+                confidence=1.0,
+                source="point",
+                range_uncertainty_m=0.002,
+                lateral_uncertainty_m=0.002,
+                now=when,
+            )
+            estimator.ingest(
+                radar_frame((), frame_number=frame_number),
+                received_at=when,
+            )
+            scene = estimator.snapshot(now=when)
+            self.assertNotEqual(
+                scene["planned_path"]["status"], "blocked_near_field",
+            )
+            accepted_counts.append(
+                scene["diagnostics"]["path_switch_accepted_count"]
+            )
+
+        self.assertEqual(accepted_counts, [1, 1, 1, 1])
 
     def test_snapshot_after_init_or_reset_never_plans_without_ingest(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)

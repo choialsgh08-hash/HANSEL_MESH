@@ -1430,7 +1430,7 @@ class RadarSceneEstimator:
                 if (
                     not math.isfinite(forward)
                     or not math.isfinite(lateral)
-                    or forward <= 0.0
+                    or forward < 0.0
                     or distance > PATH_LOCAL_MAX_RANGE_M
                     or abs(math.degrees(math.atan2(lateral, forward)))
                     > PATH_FOV_AZIMUTH_DEG
@@ -1639,6 +1639,18 @@ class RadarSceneEstimator:
         )
 
     @staticmethod
+    def _inside_collision_disk(
+        forward_m: float,
+        lateral_m: float,
+        obstacle: Dict[str, object],
+        collision_radius_m: float,
+    ) -> bool:
+        return math.hypot(
+            forward_m - float(obstacle["forward_m"]),
+            lateral_m - float(obstacle["lateral_m"]),
+        ) <= collision_radius_m
+
+    @staticmethod
     def _path_collision_segments(
         path: Dict[str, object],
         obstacles: Sequence[Dict[str, object]],
@@ -1653,10 +1665,12 @@ class RadarSceneEstimator:
                 _, effective_radius = (
                     RadarSceneEstimator._obstacle_collision_radii(obstacle)
                 )
-                if math.hypot(
-                    float(point[0]) - float(obstacle["forward_m"]),
-                    float(point[1]) - float(obstacle["lateral_m"]),
-                ) <= effective_radius:
+                if RadarSceneEstimator._inside_collision_disk(
+                    float(point[0]),
+                    float(point[1]),
+                    obstacle,
+                    effective_radius,
+                ):
                     reason = (
                         "near_field_overlap"
                         if math.hypot(
@@ -1793,10 +1807,12 @@ class RadarSceneEstimator:
                     cell_lateral = (
                         center_lateral + lateral_offset
                     ) * PATH_COLLISION_GRID_M
-                    if math.hypot(
-                        cell_forward - obstacle_forward,
-                        cell_lateral - obstacle_lateral,
-                    ) < collision_radius - 1e-9:
+                    if RadarSceneEstimator._inside_collision_disk(
+                        cell_forward,
+                        cell_lateral,
+                        obstacle,
+                        collision_radius,
+                    ):
                         blocked_collision_cells.add(
                             (
                                 center_forward + forward_offset,
@@ -2165,6 +2181,20 @@ class RadarSceneEstimator:
             primitive_path = []
             goal_state = None
             smoothing_valid = False
+        else:
+            postcondition_collisions = (
+                RadarSceneEstimator._path_collision_segments(
+                    {"points": points},
+                    obstacles,
+                )
+            )
+            if postcondition_collisions:
+                first_blocked_index = int(
+                    postcondition_collisions[0]["start_index"]
+                )
+                points = points[:first_blocked_index] or [[0.0, 0.0]]
+                goal_state = None
+                smoothing_valid = False
 
         length_m = (len(points) - 1) * PATH_RESOLUTION_M
         initial_curvature = next(
