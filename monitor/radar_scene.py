@@ -11,6 +11,21 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from common.radar_geometry import RadarAxes
 from common.sensor_contract import RadarFrame
 from sensors.radar_calibration import RadarClutterModel
+from monitor.radar_tracking import (
+    DEFAULT_RANGE_STEP_M,
+    POINT_HAZARD_CONFIRM_HITS,
+    POINT_HAZARD_WINDOW_FRAMES,
+    POINT_HISTORY_FRAMES,
+    POINT_MIN_QUALITY,
+    POINT_POSITION_RESIDUAL_LIMIT_M,
+    POINT_STRONG_QUALITY,
+    height_band,
+    lateral_uncertainty_m,
+    point_association_gate,
+    point_quality_score,
+    resolve_range_step_m,
+    robust_point_estimate,
+)
 
 
 SCENE_SCHEMA_VERSION = 1
@@ -139,6 +154,9 @@ class RadarHazardEvaluator:
                 calibration_status,
             )
 
+        def hazard_distance(track: Dict[str, object]) -> float:
+            return float(track.get("hazard_distance_m", track["distance_m"]))
+
         fresh_tracks = [
             track
             for track in tracks
@@ -157,11 +175,11 @@ class RadarHazardEvaluator:
             latched = by_id.get(self._danger_track_id)
             if (
                 latched is not None
-                and float(latched["distance_m"]) < DANGER_EXIT_M
+                and hazard_distance(latched) < DANGER_EXIT_M
             ):
                 return self._result(
                     "DANGER",
-                    float(latched["distance_m"]),
+                    hazard_distance(latched),
                     "confirmed_point_inside_threshold",
                 )
             self._danger_track_id = None
@@ -174,22 +192,22 @@ class RadarHazardEvaluator:
         entering = [
             track
             for track in confirmed
-            if float(track["distance_m"]) <= DANGER_ENTER_M
+            if hazard_distance(track) <= DANGER_ENTER_M
         ]
         if entering:
             nearest = min(
                 entering,
-                key=lambda track: float(track["distance_m"]),
+                key=hazard_distance,
             )
             self._danger_track_id = int(nearest["track_id"])
             return self._result(
                 "DANGER",
-                float(nearest["distance_m"]),
+                hazard_distance(nearest),
                 "confirmed_point_inside_threshold",
             )
         if confirmed:
             nearest_m = min(
-                float(track["distance_m"]) for track in confirmed
+                hazard_distance(track) for track in confirmed
             )
             return self._result(
                 "NORMAL",
@@ -247,6 +265,7 @@ class RadarSceneEstimator:
             self._calibration_status = "ok"
         self._scene_point_count = 0
         self._clutter_points_rejected = 0
+        self._quality_gate_rejected_count = 0
         self._heatmap_cells_accepted = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
@@ -283,6 +302,7 @@ class RadarSceneEstimator:
         self._hazard_evaluator.reset()
         self._scene_point_count = 0
         self._clutter_points_rejected = 0
+        self._quality_gate_rejected_count = 0
         self._heatmap_cells_accepted = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
@@ -330,7 +350,26 @@ class RadarSceneEstimator:
             self._clear_evidence(self._calibration_status)
             return
         self._expire_tracks(now)
-        accepted_points: List[Tuple[object, float, float]] = []
+        heatmap_range_step_m = (
+            frame.heatmap.range_step_m if frame.heatmap is not None else None
+        )
+        calibration_profile_matches = bool(
+            self.clutter_model is not None
+            and frame.profile_id == self.clutter_model.profile_id
+        )
+        calibrated_range_step_m = (
+            self.clutter_model.range_step_m
+            if self.clutter_model is not None
+            else None
+        )
+        range_step_m = resolve_range_step_m(
+            heatmap_range_step_m=heatmap_range_step_m,
+            calibrated_range_step_m=calibrated_range_step_m,
+            calibration_profile_matches=calibration_profile_matches,
+            frame_profile_id=frame.profile_id,
+            synthetic=self.synthetic,
+        )
+        accepted_points: List[Tuple[object, float, float, float, float]] = []
         rejected = 0
         for point in frame.points:
             forward_m, lateral_m = self.axes.map_point(point)
@@ -347,11 +386,17 @@ class RadarSceneEstimator:
             ):
                 rejected += 1
                 continue
-            accepted_points.append((point, forward_m, lateral_m))
+            quality_score = point_quality_score(point.snr_db, point.noise_db)
+            if range_step_m is None or quality_score < POINT_MIN_QUALITY:
+                self._quality_gate_rejected_count += 1
+                continue
+            accepted_points.append(
+                (point, forward_m, lateral_m, range_step_m, quality_score)
+            )
 
         current_point_positions = [
             (forward_m, lateral_m)
-            for _, forward_m, lateral_m in accepted_points
+            for _, forward_m, lateral_m, _, _ in accepted_points
         ]
         self._motion = self._stabilize_motion(
             self._estimate_ego_motion(
@@ -367,16 +412,30 @@ class RadarSceneEstimator:
             )
         self._previous_point_positions = current_point_positions
 
-        elapsed_frame_windows = min(
-            3,
+        point_elapsed_frame_windows = min(
+            POINT_HISTORY_FRAMES,
+            frame.dropped_frames_since_previous + 1,
+        )
+        heatmap_elapsed_frame_windows = min(
+            HEATMAP_HISTORY_FRAMES,
             frame.dropped_frames_since_previous + 1,
         )
         for track in self._tracks:
             hits = track["_point_hits"]
             assert isinstance(hits, list)
-            hits.extend([False] * elapsed_frame_windows)
-            del hits[:-3]
-            track["point_confirmed"] = sum(hits) >= 2
+            hits.extend([False] * point_elapsed_frame_windows)
+            del hits[:-POINT_HAZARD_WINDOW_FRAMES]
+            track["point_confirmed"] = (
+                sum(hits[-POINT_HAZARD_WINDOW_FRAMES:])
+                >= POINT_HAZARD_CONFIRM_HITS
+            )
+            strong_hits = track.get("_point_strong_hits")
+            if isinstance(strong_hits, list):
+                strong_hits.extend([False] * point_elapsed_frame_windows)
+                del strong_hits[:-POINT_HISTORY_FRAMES]
+                track["map_confirmed"] = (
+                    sum(strong_hits[-POINT_HISTORY_FRAMES:]) >= 3
+                )
             track["_updated_by_point"] = False
             if track["source"] == "point":
                 track["classification"] = (
@@ -386,30 +445,33 @@ class RadarSceneEstimator:
                 )
             heatmap_hits = track.get("_heatmap_hits")
             if isinstance(heatmap_hits, list):
-                heatmap_hits.extend([False] * elapsed_frame_windows)
+                heatmap_hits.extend([False] * heatmap_elapsed_frame_windows)
                 del heatmap_hits[:-HEATMAP_HISTORY_FRAMES]
             point_association_hits = track.get("_point_association_hits")
             if isinstance(point_association_hits, list):
                 point_association_hits.extend(
-                    [False] * elapsed_frame_windows
+                    [False] * heatmap_elapsed_frame_windows
                 )
                 del point_association_hits[:-HEATMAP_HISTORY_FRAMES]
             track["_updated_by_heatmap"] = False
         point_count = 0
         accepted_point_positions: List[Tuple[float, float]] = []
 
-        for point, forward_m, lateral_m in accepted_points:
+        for point, forward_m, lateral_m, point_range_step_m, quality_score in accepted_points:
             self._upsert_track(
                 forward_m=forward_m,
                 lateral_m=lateral_m,
-                # The operator map is deliberately azimuth-only.  Keep the
-                # measured z above for calibrated clutter rejection, but do
-                # not let elevation enter tracking, occupancy, or the API.
-                height_m=None,
-                range_uncertainty_m=0.0,
-                confidence=self._point_confidence(point.snr_db),
+                height_m=point.z_m,
+                range_uncertainty_m=point_range_step_m / 2.0,
+                lateral_uncertainty_m=lateral_uncertainty_m(
+                    math.hypot(forward_m, lateral_m)
+                ),
+                confidence=quality_score,
                 source="point",
                 received_at=now,
+                snr_db=point.snr_db,
+                noise_db=point.noise_db,
+                quality_score=quality_score,
             )
             accepted_point_positions.append((forward_m, lateral_m))
             point_count += 1
@@ -460,6 +522,9 @@ class RadarSceneEstimator:
                     confidence=float(cluster["strength_confidence"]),
                     source="heatmap",
                     received_at=now,
+                    lateral_uncertainty_m=lateral_uncertainty_m(
+                        math.hypot(forward_m, lateral_m)
+                    ),
                     point_correlated=point_correlated,
                     cluster_cells=int(cluster["cell_count"]),
                     peak_residual_db=float(cluster["peak_residual_db"]),
@@ -685,6 +750,9 @@ class RadarSceneEstimator:
             "diagnostics": {
                 "scene_point_count": self._scene_point_count,
                 "clutter_points_rejected": self._clutter_points_rejected,
+                "quality_gate_rejected_count": (
+                    self._quality_gate_rejected_count
+                ),
                 "heatmap_cells_accepted": self._heatmap_cells_accepted,
                 "heatmap_candidate_cells": self._heatmap_candidate_cells,
                 "heatmap_cluster_count": self._heatmap_cluster_count,
@@ -2393,6 +2461,10 @@ class RadarSceneEstimator:
         confidence: float,
         source: str,
         received_at: float,
+        lateral_uncertainty_m: float = 0.05,
+        snr_db: Optional[float] = None,
+        noise_db: Optional[float] = None,
+        quality_score: Optional[float] = None,
         point_correlated: bool = False,
         cluster_cells: int = 0,
         peak_residual_db: float = 0.0,
@@ -2407,6 +2479,17 @@ class RadarSceneEstimator:
                 else not bool(track.get("_updated_by_heatmap"))
             )
         ]
+        if source == "point":
+            association_candidates = [
+                track for track in association_candidates
+                if point_association_gate(
+                    float(track["forward_m"]),
+                    float(track["lateral_m"]),
+                    forward_m,
+                    lateral_m,
+                    range_uncertainty_m * 2.0,
+                )
+            ]
         nearest = min(
             association_candidates,
             key=lambda track: math.hypot(
@@ -2415,25 +2498,37 @@ class RadarSceneEstimator:
             ),
             default=None,
         )
-        if (
-            nearest is not None
-            and math.hypot(
+        if nearest is not None and (
+            source == "point" or math.hypot(
                 float(nearest["forward_m"]) - forward_m,
                 float(nearest["lateral_m"]) - lateral_m,
-            )
-            <= (
-                TRACK_ASSOCIATION_M
-                if source == "point"
-                else HEATMAP_TRACK_ASSOCIATION_M
-            )
+            ) <= HEATMAP_TRACK_ASSOCIATION_M
         ):
             if source == "point":
-                nearest["forward_m"] = forward_m
-                nearest["lateral_m"] = lateral_m
+                samples = nearest["_point_samples"]
+                assert isinstance(samples, list)
+                samples.append((forward_m, lateral_m, height_m))
+                del samples[:-POINT_HISTORY_FRAMES]
+                estimate = robust_point_estimate(
+                    samples,
+                    residual_limit_m=POINT_POSITION_RESIDUAL_LIMIT_M,
+                )
+                nearest["position_jitter_m"] = round(
+                    estimate.position_jitter_m, 4
+                )
+                nearest["outlier_rejections"] = estimate.rejected_count
+                if not estimate.latest_inlier:
+                    return
+                nearest["forward_m"] = estimate.forward_m
+                nearest["lateral_m"] = estimate.lateral_m
+                nearest["height_m"] = estimate.height_m
+                nearest["height_band"] = height_band(estimate.height_m)
                 nearest["range_uncertainty_m"] = range_uncertainty_m
+                nearest["lateral_uncertainty_m"] = lateral_uncertainty_m
                 nearest["confidence"] = confidence
-                if height_m is not None:
-                    nearest["height_m"] = height_m
+                nearest["snr_db"] = snr_db
+                nearest["noise_db"] = noise_db
+                nearest["quality_score"] = quality_score
             else:
                 smoothing = 0.35
                 nearest["forward_m"] = (
@@ -2470,12 +2565,28 @@ class RadarSceneEstimator:
                 float(nearest["forward_m"]),
                 float(nearest["lateral_m"]),
             )
+            if source == "point":
+                nearest["hazard_distance_m"] = math.hypot(
+                    forward_m, lateral_m
+                )
             nearest["_received_at_ns"] = self._seconds_to_ns(received_at)
             if source == "point":
                 hits = nearest["_point_hits"]
                 assert isinstance(hits, list)
                 hits[-1] = True
-                nearest["point_confirmed"] = sum(hits) >= 2
+                strong_hits = nearest["_point_strong_hits"]
+                assert isinstance(strong_hits, list)
+                strong_hits[-1] = bool(
+                    quality_score is not None
+                    and quality_score >= POINT_STRONG_QUALITY
+                )
+                nearest["point_confirmed"] = (
+                    sum(hits[-POINT_HAZARD_WINDOW_FRAMES:])
+                    >= POINT_HAZARD_CONFIRM_HITS
+                )
+                nearest["map_confirmed"] = (
+                    sum(strong_hits[-POINT_HISTORY_FRAMES:]) >= 3
+                )
                 nearest["classification"] = (
                     "confirmed_obstacle"
                     if nearest["point_confirmed"]
@@ -2485,14 +2596,43 @@ class RadarSceneEstimator:
             return
 
         point_hit = source == "point"
+        estimate = (
+            robust_point_estimate(
+                [(forward_m, lateral_m, height_m)],
+                residual_limit_m=POINT_POSITION_RESIDUAL_LIMIT_M,
+            )
+            if point_hit
+            else None
+        )
         track: Dict[str, object] = {
             "track_id": self._next_track_id,
             "forward_m": forward_m,
             "lateral_m": lateral_m,
-            "height_m": height_m,
+            "height_m": estimate.height_m if estimate is not None else height_m,
+            "height_band": (
+                height_band(estimate.height_m)
+                if estimate is not None
+                else "unknown"
+            ),
+            "height_reference": (
+                "sensor_relative_uncalibrated"
+                if point_hit
+                else "unavailable"
+            ),
             "distance_m": math.hypot(forward_m, lateral_m),
+            "hazard_distance_m": math.hypot(forward_m, lateral_m),
             "range_uncertainty_m": range_uncertainty_m,
+            "lateral_uncertainty_m": lateral_uncertainty_m,
             "confidence": confidence,
+            "snr_db": snr_db,
+            "noise_db": noise_db,
+            "quality_score": quality_score,
+            "position_jitter_m": (
+                round(estimate.position_jitter_m, 4)
+                if estimate is not None
+                else None
+            ),
+            "outlier_rejections": 0,
             "source": source,
             "point_confirmed": False,
             "classification": (
@@ -2503,6 +2643,17 @@ class RadarSceneEstimator:
             "age_ms": 0,
             "_received_at_ns": self._seconds_to_ns(received_at),
             "_point_hits": [point_hit],
+            "_point_strong_hits": [
+                bool(
+                    point_hit
+                    and quality_score is not None
+                    and quality_score >= POINT_STRONG_QUALITY
+                )
+            ],
+            "_point_samples": (
+                [(forward_m, lateral_m, height_m)] if point_hit else []
+            ),
+            "map_confirmed": False,
             "_updated_by_point": point_hit,
             "_updated_by_heatmap": source == "heatmap",
         }

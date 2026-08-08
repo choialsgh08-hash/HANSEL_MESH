@@ -213,6 +213,7 @@ def point_frame(
     forward_m: float,
     *,
     frame_number: int = 1,
+    snr_db: float = 20.0,
 ) -> RadarFrame:
     return radar_frame(
         (
@@ -221,7 +222,7 @@ def point_frame(
                 y_m=forward_m,
                 z_m=0.01,
                 radial_velocity_mps=0.0,
-                snr_db=20.0,
+                snr_db=snr_db,
             ),
         ),
         frame_number=frame_number,
@@ -452,8 +453,9 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(track["source"], "heatmap")
         self.assertIsNone(track["height_m"])
         self.assertAlmostEqual(track["range_uncertainty_m"], 0.09765625)
+        self.assertGreaterEqual(track["lateral_uncertainty_m"], 0.05)
 
-    def test_point_elevation_is_excluded_from_azimuth_only_scene(self):
+    def test_point_elevation_is_preserved_but_not_used_for_2d_projection(self):
         estimator = calibrated_estimator()
         frame = radar_frame(
             (
@@ -472,7 +474,88 @@ class RadarSceneEstimatorTests(unittest.TestCase):
 
         self.assertEqual(scene["projection_mode"], "range_azimuth_2d")
         self.assertFalse(scene["elevation_used"])
-        self.assertIsNone(scene["tracks"][0]["height_m"])
+        self.assertEqual(scene["tracks"][0]["height_m"], 0.75)
+        self.assertEqual(scene["tracks"][0]["height_band"], "above_sensor")
+        self.assertEqual(
+            scene["tracks"][0]["height_reference"],
+            "sensor_relative_uncalibrated",
+        )
+
+    def test_point_map_confirmation_is_three_of_five_while_hazard_remains_two_of_three(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(point_frame(0.09, frame_number=1, snr_db=24.0), received_at=1.000)
+        estimator.ingest(point_frame(0.09, frame_number=2, snr_db=24.0), received_at=1.125)
+        track = estimator.snapshot(now=1.125)["tracks"][0]
+        self.assertTrue(track["point_confirmed"])
+        self.assertFalse(track["map_confirmed"])
+        self.assertEqual(estimator.snapshot(now=1.125)["hazard"]["level"], "DANGER")
+        estimator.ingest(point_frame(0.09, frame_number=3, snr_db=24.0), received_at=1.250)
+        self.assertTrue(estimator.snapshot(now=1.250)["tracks"][0]["map_confirmed"])
+
+    def test_weak_hits_confirm_hazard_history_but_not_strong_map_history(self):
+        estimator = calibrated_estimator()
+        for frame_number, snr_db in ((1, 15.0), (2, 15.0), (3, 24.0)):
+            estimator.ingest(
+                point_frame(0.30, frame_number=frame_number, snr_db=snr_db),
+                received_at=1.0 + frame_number * 0.125,
+            )
+        track = estimator.snapshot(now=1.375)["tracks"][0]
+        self.assertTrue(track["point_confirmed"])
+        self.assertFalse(track["map_confirmed"])
+        for frame_number in (4, 5):
+            estimator.ingest(
+                point_frame(0.30, frame_number=frame_number, snr_db=24.0),
+                received_at=1.0 + frame_number * 0.125,
+            )
+        self.assertTrue(estimator.snapshot(now=1.625)["tracks"][0]["map_confirmed"])
+
+    def test_filtered_point_preserves_measured_height_and_band(self):
+        estimator = calibrated_estimator()
+        point = RadarPoint(0.0, 0.40, 0.12, 0.0, 24.0, 81.0)
+        estimator.ingest(radar_frame((point,)), received_at=3.0)
+        track = estimator.snapshot(now=3.0)["tracks"][0]
+        self.assertEqual(track["height_m"], 0.12)
+        self.assertEqual(track["height_band"], "above_sensor")
+        self.assertEqual(track["height_reference"], "sensor_relative_uncalibrated")
+        self.assertEqual((track["snr_db"], track["noise_db"]), (24.0, 81.0))
+
+    def test_one_frame_position_spike_does_not_move_filtered_track(self):
+        estimator = calibrated_estimator()
+        for index, forward in enumerate((0.40, 0.41, 0.39, 0.40), 1):
+            estimator.ingest(point_frame(forward, frame_number=index), received_at=1.0 + index * 0.1)
+        received_before_outlier = estimator._tracks[0]["_received_at_ns"]
+        estimator.ingest(radar_frame((
+            RadarPoint(0.13, 0.45, 0.40, 0.0, 24.0),
+        ), frame_number=5), received_at=1.5)
+        track = estimator.snapshot(now=1.5)["tracks"][0]
+        self.assertAlmostEqual(track["forward_m"], 0.40, delta=0.02)
+        self.assertGreaterEqual(track["outlier_rejections"], 1)
+        self.assertEqual(estimator._tracks[0]["_received_at_ns"], received_before_outlier)
+        self.assertFalse(estimator._tracks[0]["_updated_by_point"])
+        self.assertGreater(track["age_ms"], 0)
+
+    def test_four_dropped_windows_clear_five_frame_map_confirmation(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 4):
+            estimator.ingest(point_frame(0.30, frame_number=frame_number, snr_db=24.0), received_at=1.0 + frame_number * 0.125)
+        estimator.ingest(radar_frame((), frame_number=8, dropped_frames_since_previous=4), received_at=1.5)
+        track = estimator.snapshot(now=1.5)["tracks"][0]
+        self.assertFalse(track["map_confirmed"])
+        self.assertFalse(track["point_confirmed"])
+
+    def test_trusted_scene_without_verified_range_step_rejects_point(self):
+        class TrustedWithoutRangeStep(RadarSceneEstimator):
+            def _binding_status(self, frame):
+                return "ok"
+
+        estimator = TrustedWithoutRangeStep(RadarAxes(), require_calibration=False, synthetic=False)
+        estimator.ingest(radar_frame(
+            (RadarPoint(0.0, 0.30, 0.0, 0.0, 24.0),),
+            frame_number=1, profile_id="unknown-profile",
+        ), received_at=1.0)
+        scene = estimator.snapshot(now=1.0)
+        self.assertEqual(scene["tracks"], [])
+        self.assertEqual(scene["diagnostics"]["quality_gate_rejected_count"], 1)
 
     def test_radar_scan_matching_compensates_forward_robot_motion(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
