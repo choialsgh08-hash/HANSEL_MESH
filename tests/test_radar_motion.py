@@ -79,6 +79,30 @@ class RadarMotionEstimatorTests(unittest.TestCase):
                 self.assertEqual(result["status"], "invalid_input")
                 self.assertFalse(result["applied"])
 
+    def test_sparse_mapping_correspondence_is_invalid_input(self):
+        try:
+            result = RadarMotionEstimator().update(
+                (({}, (0.23, -0.16)),),
+                1,
+            )
+        except KeyError as error:
+            self.fail(f"malformed correspondence raised KeyError: {error}")
+        self.assertEqual(result["status"], "invalid_input")
+        self.assertFalse(result["applied"])
+
+    def test_sparse_points_require_exactly_two_coordinates(self):
+        invalid_cases = (
+            (((0.25,), (0.23, -0.16)),),
+            (((0.25, -0.16, 0.0), (0.23, -0.16)),),
+            (((0.25, -0.16), (0.23,)),),
+            (((0.25, -0.16), (0.23, -0.16, 0.0)),),
+        )
+        for correspondences in invalid_cases:
+            with self.subTest(correspondences=correspondences):
+                result = RadarMotionEstimator().update(correspondences, 1)
+                self.assertEqual(result["status"], "invalid_input")
+                self.assertFalse(result["applied"])
+
     def test_unrepresentable_coordinates_are_invalid_input(self):
         pairs = translated_pairs(5)
         pairs[0] = ((10 ** 1000, pairs[0][0][1]), pairs[0][1])

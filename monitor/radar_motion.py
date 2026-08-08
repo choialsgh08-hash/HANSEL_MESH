@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence as SequenceABC
 import math
 from typing import List, Optional, Sequence, Tuple
 
@@ -43,6 +44,14 @@ def _empty_motion(status: str) -> dict:
     }
 
 
+def _is_exact_pair(value) -> bool:
+    return (
+        isinstance(value, SequenceABC)
+        and not isinstance(value, (str, bytes, bytearray))
+        and len(value) == 2
+    )
+
+
 class RadarMotionEstimator:
     def __init__(self, stabilization_frames=2):
         self.stabilization_frames = stabilization_frames
@@ -73,17 +82,24 @@ class RadarMotionEstimator:
             return _empty_motion("invalid_input")
 
         validated: List[Correspondence] = []
-        try:
-            for old, new in pairs:
+        for pair in pairs:
+            if not _is_exact_pair(pair):
+                self.reset()
+                return _empty_motion("invalid_input")
+            old, new = pair
+            if not _is_exact_pair(old) or not _is_exact_pair(new):
+                self.reset()
+                return _empty_motion("invalid_input")
+            try:
                 old_point = (float(old[0]), float(old[1]))
                 new_point = (float(new[0]), float(new[1]))
-                if not all(math.isfinite(value) for value in (*old_point, *new_point)):
-                    self.reset()
-                    return _empty_motion("invalid_input")
-                validated.append((old_point, new_point))
-        except (IndexError, OverflowError, TypeError, ValueError):
-            self.reset()
-            return _empty_motion("invalid_input")
+            except (OverflowError, TypeError, ValueError):
+                self.reset()
+                return _empty_motion("invalid_input")
+            if not all(math.isfinite(value) for value in (*old_point, *new_point)):
+                self.reset()
+                return _empty_motion("invalid_input")
+            validated.append((old_point, new_point))
 
         if len(validated) < MOTION_MIN_MATCHES:
             self.reset()
