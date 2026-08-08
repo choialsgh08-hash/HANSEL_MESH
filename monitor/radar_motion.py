@@ -71,9 +71,6 @@ class RadarMotionEstimator:
         if len(pairs) > eligible_anchor_count:
             self.reset()
             return _empty_motion("invalid_input")
-        if len(pairs) < MOTION_MIN_MATCHES:
-            self.reset()
-            return _empty_motion("insufficient_points")
 
         validated: List[Correspondence] = []
         try:
@@ -87,6 +84,10 @@ class RadarMotionEstimator:
         except (IndexError, OverflowError, TypeError, ValueError):
             self.reset()
             return _empty_motion("invalid_input")
+
+        if len(validated) < MOTION_MIN_MATCHES:
+            self.reset()
+            return _empty_motion("insufficient_points")
 
         matched_points = len(validated)
         match_ratio = matched_points / eligible_anchor_count

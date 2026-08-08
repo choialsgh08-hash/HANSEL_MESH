@@ -68,6 +68,17 @@ class RadarMotionEstimatorTests(unittest.TestCase):
             "insufficient_points",
         )
 
+    def test_sparse_invalid_correspondences_are_invalid_input(self):
+        invalid_cases = (
+            (((0.25, -0.16), (float("nan"), -0.16)),),
+            ((None, None),),
+        )
+        for correspondences in invalid_cases:
+            with self.subTest(correspondences=correspondences):
+                result = RadarMotionEstimator().update(correspondences, 1)
+                self.assertEqual(result["status"], "invalid_input")
+                self.assertFalse(result["applied"])
+
     def test_unrepresentable_coordinates_are_invalid_input(self):
         pairs = translated_pairs(5)
         pairs[0] = ((10 ** 1000, pairs[0][0][1]), pairs[0][1])
