@@ -205,10 +205,17 @@ class RadarMotionEstimator:
             result["status"] = "high_rmse"
             self.reset()
             return result
-        if (
-            math.hypot(*translation) > MOTION_MAX_TRANSLATION_M
-            or abs(yaw_deg) > MOTION_MAX_YAW_DEG
-        ):
+        translation_m = math.hypot(*translation)
+        translation_exceeds_limit = (
+            translation_m > MOTION_MAX_TRANSLATION_M
+            and not math.isclose(
+                translation_m,
+                MOTION_MAX_TRANSLATION_M,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
+        if translation_exceeds_limit or abs(yaw_deg) > MOTION_MAX_YAW_DEG:
             result["status"] = "implausible_motion"
             self.reset()
             return result

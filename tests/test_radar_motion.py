@@ -52,6 +52,23 @@ class RadarMotionEstimatorTests(unittest.TestCase):
         self.assertFalse(translation["applied"])
         self.assertFalse(yaw["applied"])
 
+    def test_exact_translation_limit_is_allowed_but_material_excess_is_rejected(self):
+        for delta_forward in (-0.08, 0.08):
+            with self.subTest(delta_forward=delta_forward):
+                result = RadarMotionEstimator(stabilization_frames=1).update(
+                    translated_pairs(5, delta_forward),
+                    5,
+                )
+                self.assertEqual(result["status"], "ok")
+                self.assertTrue(result["applied"])
+
+        excess = RadarMotionEstimator(stabilization_frames=1).update(
+            translated_pairs(5, 0.0800000001),
+            5,
+        )
+        self.assertEqual(excess["status"], "implausible_motion")
+        self.assertFalse(excess["applied"])
+
     def test_invalid_values_and_anchor_counts_are_guarded(self):
         pairs = translated_pairs(5)
         pairs[0] = (pairs[0][0], (float("nan"), pairs[0][1][1]))
