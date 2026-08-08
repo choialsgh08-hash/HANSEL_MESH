@@ -235,3 +235,172 @@ timestamp·좌표계를 맞추고 radar-to-base 외부 보정을 적용해 이�
 그 다음에만 여러 프레임을 세계 좌표에 누적하는 rolling occupancy map,
 Doppler odometry, radar scan-to-submap 정합과 SLAM을 추가할 수 있다. 유닛 분리
 위치는 그때의 pose와 불확실성을 함께 저장해야 한다.
+
+## 10. Stabilized probability and path view
+
+The normal operator view renders the filtered probability map. `RAW DEBUG · 표시 전용`
+shows unfiltered evidence only for diagnosis; it is never the planner input. Point hazards
+retain the 2-of-3 confirmation used by the 10 cm danger gate, while probability-map
+admission deliberately requires 3 hits in 5 frames. The map uses 5 cm cells, an occupied
+probability threshold of 0.75, a 1 second decay half-life, and a hard 2.5 second TTL.
+
+The local path reserves the 15 cm robot width plus 3 cm on each side. An ordinary route
+candidate must remain preferable for three frames before it replaces the selected route.
+A newly confirmed collision with the selected route switches immediately. The display is
+a front-facing 2.5D aid: height is `sensor_relative_uncalibrated`, so it must not be
+interpreted as verified floor clearance. Its pose mode is `robot_relative_short_memory`.
+This is neither SLAM nor Doppler odometry; old evidence is decayed locally and no globally
+consistent pose or free-space map is inferred.
+
+## 11. Replay analyzer
+
+Analyze a canonical recording without changing it:
+
+```powershell
+python -B -m scripts.analyze_radar_scene `
+  --input missions\radar-board-live.jsonl `
+  --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
+  --max-p95-ms 125 `
+  --max-frame-ms 125
+```
+
+`--synthetic` is only for fixtures and conflicts with a clutter calibration. It must never
+be used to bypass a real-log profile or calibration mismatch. `--max-frames` must be a
+positive integer. The program prints exactly one finite, sorted JSON object and does not
+write a report or alter an input/configuration file.
+
+The core report fields are:
+
+- Input accounting: `records_seen`, `frames_processed`,
+  `non_radar_records_skipped`, `incomplete_frames_skipped`, and
+  `producer_reported_drops_total`.
+- Filter stages: `raw_points_total`, `self_clutter_rejected_total`,
+  `quality_gate_rejected_total`, `heatmap_reflections_total`,
+  `tentative_point_tracks_max`, `confirmed_point_tracks_max`, and
+  `confirmed_heatmap_tracks_max`.
+- Map state: `probability_cells_max/final`, `occupied_cells_max/final`,
+  `probability_decayed_total`, `probability_ttl_expired_total`, and the three
+  `*_in_self_clutter_zone_max` checks. Reset deltas are keyed by `scene_epoch`.
+- Path and hazard: `planned_path_points_max`, final status/stability/curvature,
+  `path_switches`, `path_switches_per_min`, `blocked_path_replans`,
+  `blocked_near_field_frames`, `blocked_near_field_longest_ms`, and `danger_frames`.
+  A path switch is counted only from that frame's `switch_accepted` event.
+- Binding and performance: `calibration_status_counts`, `motion_status_counts`,
+  `duration_s`, `processing_ms_mean`, nearest-rank `processing_ms_p95`, and
+  `processing_ms_max`.
+- Bounds: `state_bounds_passed` and `state_bound_failures`. At most 317 active 5 cm
+  cells, no more occupied than active cells, and at most 121 path samples are accepted.
+- `bench` is null without annotations. With a validated sidecar it contains the bound
+  hashes, recording identity/kind, provenance, duration, drops, path-switch metrics,
+  latency, aggregate pass/fail state, failures, and per-window results.
+
+## 12. Sixty-second hardware bench gate
+
+Capture each of these five mounted-board recordings for at least 60.0 seconds using the
+same profile, calibration, board, cable, power source, final mount, orientation, and
+physical location:
+
+1. `empty_mounted`: an empty scene on the assembled robot.
+2. `frontal_targets`: metal targets at 0.30 m, 0.50 m, and 1.00 m, plus one/two-frame
+   ghost, removal, transient-path, and two-frame confirmed-collision events.
+3. `angled_targets`: metal at -30 and +30 degrees, both at 0.50 m.
+4. `materials`: metal and wood at 0.50 m in the same recording.
+5. `approach_retreat`: a slow wall approach through 10 cm and retreat through 13 cm.
+
+Record raw false points/frame, confirmed false obstacles/frame, paired raw and filtered
+2D position standard deviation, target detection rate, ghost persistence, path
+switches/min, p95/worst processing latency, and producer-reported frame drops. False
+rates, detection rate, path switches/min, and drops are report-only: no arbitrary
+acceptance threshold has been approved for them.
+
+Each JSONL has a sibling `*.radar-bench.json` with no duplicate or extra keys:
+
+```json
+{
+  "schema_version": 1,
+  "log_file": "front-targets.jsonl",
+  "log_sha256": "64 lowercase hex characters",
+  "profile_id": "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1",
+  "calibration_id": "radar-clutter-...",
+  "provenance": {
+    "board_serial": "manual serial",
+    "robot_mount_id": "head-final-mount-v1",
+    "mount_orientation": "forward level, connector down",
+    "usb_cable_adapter": "manual cable and adapter",
+    "power_state": "manual power source",
+    "physical_location": "bench identifier",
+    "ambient_temperature_c": 24.5,
+    "created_utc": "2026-08-07T08:00:00Z",
+    "operator": "operator name"
+  },
+  "stream": {
+    "mission_id": "captured mission",
+    "unit_id": "head",
+    "boot_id": "captured boot",
+    "producer_id": "captured producer",
+    "stream_id": "radar/front"
+  },
+  "recording": {
+    "id": "front-targets-20260807",
+    "kind": "frontal_targets",
+    "start_seq": 100,
+    "end_seq": 620
+  },
+  "windows": [
+    {
+      "id": "front-030",
+      "kind": "fixed_target",
+      "start_seq": 120,
+      "end_seq": 180,
+      "coverage_key": "front_030_metal"
+    }
+  ]
+}
+```
+
+Window kinds are `empty`, `fixed_target`, `ghost`, `removal`, `transient_path`,
+`confirmed_collision`, and `approach_retreat`. Event targets contain only finite
+`forward_m` and `lateral_m`. Ghosts use one or two consecutive `evidence_seqs`;
+collisions use exactly two and set `confirmation_seq` to the second; removal supplies
+`last_present_seq`; transient path supplies `event_seq`. Complete sequence numbers and
+monotonic timestamps must be strictly increasing, and later event frames must report no
+drops. The full `(mission_id, unit_id, boot_id, producer_id, stream_id)` domain, first and
+last complete frames, filename, SHA-256, profile, calibration, and minimum duration are
+validated before analysis.
+
+Per-window output always has `id`, `kind`, `frames_evaluated`, `duration_s`, `passed`,
+and `failures`. Empty adds raw/confirmed false rates and the longest confirmed
+route-blocked run. Fixed targets add coverage, raw/filtered/paired sample counts,
+detection rate, and paired population scatter. Ghost adds evidence sequences and map
+entries. Removal adds last-present/first-clear sequence and persistence. Transient path
+adds event sequence, accepted switches, and route-identity change. Collision adds
+confirmation/response sequence and frame delay. Approach/retreat adds danger entry and
+normal release sequences and distances.
+
+Run the binding and acceptance gate with:
+
+```powershell
+python -B -m scripts.analyze_radar_scene `
+  --input C:\radar-bench\20260807\front-targets.jsonl `
+  --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
+  --annotations C:\radar-bench\20260807\front-targets.radar-bench.json `
+  --require-bench-pass `
+  --max-p95-ms 125 `
+  --max-frame-ms 125
+```
+
+Acceptance requires at least 30 paired samples, strictly lower filtered scatter, no
+one/two-frame ghost map admission, target state clear on the first complete observation
+at or after the 2.5 second removal deadline, no transient route change, collision
+confirmation and response on evidence frame two, 10 cm danger entry, 13 cm release, no
+empty confirmed route-blocked run over 2.5 seconds, and p95/worst latency no greater than
+125 ms. Equality at all stated boundaries passes.
+
+Before trusting a bench result, check profile ID, calibration ID, board serial, robot and
+mount ID, mount orientation, USB cable/adapter, power state, physical location, ambient
+temperature, UTC creation time, and operator. Profile/calibration IDs, axes, heatmap
+geometry, and range step are runtime-validated. Board, mount, cable, power, location,
+temperature, and operator are manual attestations and are not automatically verified.
+
+**Physical bench status: PENDING HARDWARE.** Automated replay completion is not an
+empirical claim of real-world noise reduction.
