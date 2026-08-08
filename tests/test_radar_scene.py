@@ -534,6 +534,31 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertFalse(estimator._tracks[0]["_updated_by_point"])
         self.assertGreater(track["age_ms"], 0)
 
+    def test_motion_transform_moves_point_history_before_aligned_observation(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 5):
+            estimator.ingest(
+                point_frame(0.40, frame_number=frame_number),
+                received_at=1.0 + frame_number * 0.1,
+            )
+        estimator._transform_tracks(0.10, 0.0, 0.0)
+        estimator.ingest(
+            point_frame(0.50, frame_number=5), received_at=1.5,
+        )
+        track = estimator.snapshot(now=1.5)["tracks"][0]
+        self.assertAlmostEqual(track["forward_m"], 0.50, places=3)
+
+    def test_motion_transform_releases_danger_during_missed_window(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(point_frame(0.09, frame_number=1), received_at=2.0)
+        estimator.ingest(point_frame(0.09, frame_number=2), received_at=2.1)
+        self.assertEqual(estimator.snapshot(now=2.1)["hazard"]["level"], "DANGER")
+        estimator._transform_tracks(0.10, 0.0, 0.0)
+        estimator.ingest(empty_frame(frame_number=3), received_at=2.2)
+        hazard = estimator.snapshot(now=2.2)["hazard"]
+        self.assertEqual(hazard["level"], "NORMAL")
+        self.assertAlmostEqual(hazard["nearest_confirmed_m"], 0.19)
+
     def test_four_dropped_windows_clear_five_frame_map_confirmation(self):
         estimator = calibrated_estimator()
         for frame_number in range(1, 4):

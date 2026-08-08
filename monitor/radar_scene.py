@@ -1004,11 +1004,29 @@ class RadarSceneEstimator:
             track["forward_m"] = forward
             track["lateral_m"] = lateral
             track["distance_m"] = math.hypot(forward, lateral)
+            if track.get("_hazard_forward_m") is not None:
+                hazard_forward, hazard_lateral = transform(
+                    (
+                        float(track["_hazard_forward_m"]),
+                        float(track["_hazard_lateral_m"]),
+                    )
+                )
+                track["_hazard_forward_m"] = hazard_forward
+                track["_hazard_lateral_m"] = hazard_lateral
+                track["hazard_distance_m"] = math.hypot(
+                    hazard_forward, hazard_lateral
+                )
             history = track.get("_position_history")
             if isinstance(history, list):
                 track["_position_history"] = [
                     transform((float(point[0]), float(point[1])))
                     for point in history
+                ]
+            point_samples = track.get("_point_samples")
+            if isinstance(point_samples, list):
+                track["_point_samples"] = [
+                    (*transform((float(point[0]), float(point[1]))), point[2])
+                    for point in point_samples
                 ]
             retained.append(track)
         self._tracks = retained
@@ -2569,6 +2587,8 @@ class RadarSceneEstimator:
                 nearest["hazard_distance_m"] = math.hypot(
                     forward_m, lateral_m
                 )
+                nearest["_hazard_forward_m"] = forward_m
+                nearest["_hazard_lateral_m"] = lateral_m
             nearest["_received_at_ns"] = self._seconds_to_ns(received_at)
             if source == "point":
                 hits = nearest["_point_hits"]
@@ -2653,6 +2673,8 @@ class RadarSceneEstimator:
             "_point_samples": (
                 [(forward_m, lateral_m, height_m)] if point_hit else []
             ),
+            "_hazard_forward_m": forward_m if point_hit else None,
+            "_hazard_lateral_m": lateral_m if point_hit else None,
             "map_confirmed": False,
             "_updated_by_point": point_hit,
             "_updated_by_heatmap": source == "heatmap",
