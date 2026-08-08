@@ -1322,7 +1322,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260802-xyz-pointcloud-r31",
+                "20260807-probability-25d-r32",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1337,11 +1337,11 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
             self.assertIn(
-                "/radar_scene.js?v=20260802-xyz-pointcloud-r31",
+                "/radar_scene.js?v=20260807-probability-25d-r32",
                 html,
             )
             self.assertIn(
-                "/radar_panel.js?v=20260802-xyz-pointcloud-r31",
+                "/radar_panel.js?v=20260807-probability-25d-r32",
                 html,
             )
             self.assertIn(
@@ -1352,19 +1352,17 @@ class RadarFrontHttpTests(unittest.TestCase):
                 '#radar-status[data-status="http_lost"]',
                 html,
             )
-            self.assertIn('id="build-tag">UI R31</span>', html)
+            self.assertIn('id="build-tag">UI R32</span>', html)
             self.assertIn(
                 'class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>',
                 html,
             )
             self.assertIn("1cm PATH", html)
-            self.assertIn("MIN GAP 15cm", html)
-            self.assertIn("1s REACTIVE MAP", html)
-            self.assertIn("50cm ROLLING CIRCLE", html)
-            self.assertIn("RETAIN UNTIL OUTSIDE", html)
+            self.assertIn("ROBOT 15cm · MARGIN 3cm", html)
+            self.assertIn("5cm PROBABILITY", html)
+            self.assertIn("1s DECAY · 2.5s TTL", html)
             self.assertIn("±60° TRUSTED FOV", html)
-            self.assertIn("AZIMUTH ONLY", html)
-            self.assertIn("높이 제외, 좌우각만 사용", html)
+            self.assertNotIn("AZIMUTH ONLY", html)
             self.assertIn(
                 '#collision-inset[data-hazard="SENSOR_FAULT"] {',
                 html,
@@ -1374,7 +1372,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html,
             )
             self.assertIn(
-                'const UI_BUILD_ID = "20260802-xyz-pointcloud-r31";',
+                'const UI_BUILD_ID = "20260807-probability-25d-r32";',
                 javascript,
             )
             self.assertIn(
@@ -1397,20 +1395,45 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertIn('id="radar-main-canvas"', html)
             self.assertIn('id="collision-canvas"', html)
             self.assertIn('id="pointcloud-3d-canvas"', html)
-            self.assertIn("3D POINT CLOUD · 0~50cm", html)
+            self.assertIn("2.5D FILTERED TRACKS · 0~50cm", html)
+            for height_label in ("BELOW", "SENSOR LEVEL", "ABOVE", "Z UNKNOWN"):
+                self.assertIn(height_label, html)
             self.assertIn('id="heatmap-candidate-value"', html)
             self.assertIn('id="heatmap-cluster-value"', html)
             self.assertIn('id="reflection-value"', html)
+            for diagnostic_id in (
+                "quality-rejected-value",
+                "probability-active-value",
+                "probability-occupied-value",
+                "probability-decayed-value",
+                "probability-expired-value",
+                "path-pending-value",
+                "path-accepted-value",
+            ):
+                self.assertIn(f'id="{diagnostic_id}"', html)
             self.assertIn("반지름 50cm 원형 롤링 지도", html)
             self.assertIn("0~50cm 충돌 확대", html)
             self.assertIn("UNKNOWN ≠ FREE", html)
-            self.assertIn("ROBOT RELATIVE", html)
+            self.assertIn("ROBOT RELATIVE · SHORT MEMORY", html)
+            self.assertIn("RAW DEBUG · 표시 전용", html)
+            self.assertIn("RAW DEBUG는 map/path/hazard에 영향을 주지 않습니다", html)
+            raw_toggle_start = html.index('<input id="raw-toggle"')
+            raw_toggle_tag = html[
+                raw_toggle_start : html.index(">", raw_toggle_start) + 1
+            ]
+            self.assertNotIn("checked", raw_toggle_tag)
+            collision_start = html.index('<section id="collision-inset"')
+            collision_tag = html[
+                collision_start : html.index(">", collision_start) + 1
+            ]
+            self.assertNotIn("hidden", collision_tag)
             self.assertIn("/radar_scene.js", html)
             self.assertIn("fullscreen-button", html)
             self.assertIn("HanselRadarPanel", javascript)
             self.assertIn("HanselRadarScene.parseRadarScene", javascript)
             self.assertIn("drawLidarTopView", javascript)
             self.assertIn("drawCollisionInset", javascript)
+            self.assertIn("drawPointCloud25d", javascript)
             self.assertIn("scene.referenceTracks", javascript)
             self.assertIn("referenceTracks", scene_javascript)
             self.assertIn("drawRangeGuideArc", javascript)

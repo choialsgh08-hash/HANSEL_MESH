@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260802-xyz-pointcloud-r31";
+  const UI_BUILD_ID = "20260807-probability-25d-r32";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.6;
@@ -262,24 +262,37 @@
 
       const presentation = this.presentation;
       if (!presentation || presentation.blocked) {
+        const blockedPresentation = presentation || {
+          blocked: true,
+          reason: "waiting",
+        };
+        this.updateDiagnostics(blockedPresentation);
+        const pointCloudStatus = document.querySelector("#pointcloud-3d-status");
+        if (pointCloudStatus) {
+          pointCloudStatus.textContent = "SENSOR FAULT";
+        }
+        const poseLabel = document.querySelector("#pose-mode-value");
+        if (poseLabel) {
+          poseLabel.textContent = "--";
+        }
         this.drawBlockingOverlay(
           main.ctx,
           main.width,
           main.height,
-          presentation || { blocked: true, reason: "waiting" },
+          blockedPresentation,
         );
         this.drawBlockingOverlay(
           collision.ctx,
           collision.width,
           collision.height,
-          presentation || { blocked: true, reason: "waiting" },
+          blockedPresentation,
         );
         if (pointCloud3d) {
           this.drawBlockingOverlay(
             pointCloud3d.ctx,
             pointCloud3d.width,
             pointCloud3d.height,
-            presentation || { blocked: true, reason: "waiting" },
+            blockedPresentation,
           );
         }
         return;
@@ -298,18 +311,33 @@
         CLOSE_MAX_RANGE_M,
         { top: 16, right: 15, bottom: 28, left: 15 },
       );
-      this.drawLidarTopView(main.ctx, mainTransform, presentation);
+      const showRaw = Boolean(this.rawToggle && this.rawToggle.checked);
+      let rawPoints = [];
+      if (showRaw) {
+        const frame = this.snapshot && this.snapshot.frame;
+        const candidateRawPoints = frame ? frame.points : null;
+        rawPoints = Array.isArray(candidateRawPoints) ? candidateRawPoints : [];
+      }
+      this.drawLidarTopView(
+        main.ctx,
+        mainTransform,
+        presentation,
+        rawPoints,
+        showRaw,
+      );
       this.drawCollisionInset(
         collision.ctx,
         closeTransform,
         presentation,
       );
       if (pointCloud3d) {
-        this.drawPointCloud3d(
+        this.drawPointCloud25d(
           pointCloud3d.ctx,
           pointCloud3d.width,
           pointCloud3d.height,
-          this.snapshot && this.snapshot.frame,
+          presentation.filteredTracks,
+          rawPoints,
+          showRaw,
         );
       }
     }
@@ -361,7 +389,7 @@
       };
     }
 
-    drawLidarTopView(ctx, transform, scene) {
+    drawLidarTopView(ctx, transform, scene, rawPoints = [], showRaw = false) {
       this.drawMetricGrid(ctx, transform, {
         forwardMaxM: MAIN_MAX_RANGE_M,
         halfWidthM: MAIN_HALF_WIDTH_M,
@@ -371,12 +399,25 @@
       });
       ctx.save();
       this.clipToMapBoundary(ctx, transform, "circle");
-      this.drawEvidenceGrid(ctx, transform, scene, {
-        clipShape: "circle",
-      });
+      if (scene.probabilisticLocalMap === null) {
+        this.drawEvidenceGrid(ctx, transform, scene, {
+          clipShape: "circle",
+        });
+        this.drawAccumulatedObstacles(ctx, transform, scene);
+      } else {
+        this.drawProbabilisticLocalMap(
+          ctx,
+          transform,
+          scene.probabilisticLocalMap,
+          { clipShape: "circle" },
+        );
+      }
       this.drawTravelTrail(ctx, transform, scene.travelTrail);
-      this.drawAccumulatedObstacles(ctx, transform, scene);
       this.drawPlannedPath(ctx, transform, scene.plannedPath);
+      for (const track of Array.isArray(scene.filteredTracks)
+        ? scene.filteredTracks : []) {
+        this.drawUncertaintyOutline(ctx, transform, track);
+      }
       this.drawTracks(ctx, transform, scene.referenceTracks, {
         scene,
         labelLimit: 0,
@@ -390,10 +431,11 @@
         maxRangeM: MAIN_MAX_RANGE_M,
         clipShape: "circle",
       });
-      if (this.rawToggle && this.rawToggle.checked) {
-        this.drawRawDebugPoints(ctx, transform, this.snapshot && this.snapshot.frame);
+      if (showRaw) {
+        this.drawRawDebugPoints(ctx, transform, rawPoints);
       }
       ctx.restore();
+      this.drawRobotFootprint(ctx, transform);
       this.drawRobot(ctx, transform);
       ctx.fillStyle = "rgba(225, 246, 243, 0.72)";
       ctx.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
@@ -415,11 +457,24 @@
       });
       ctx.save();
       this.clipToMapBoundary(ctx, transform, "radial");
-      this.drawEvidenceGrid(ctx, transform, scene, {
-        clipShape: "radial",
-      });
-      this.drawAccumulatedObstacles(ctx, transform, scene);
+      if (scene.probabilisticLocalMap === null) {
+        this.drawEvidenceGrid(ctx, transform, scene, {
+          clipShape: "radial",
+        });
+        this.drawAccumulatedObstacles(ctx, transform, scene);
+      } else {
+        this.drawProbabilisticLocalMap(
+          ctx,
+          transform,
+          scene.probabilisticLocalMap,
+          { clipShape: "radial" },
+        );
+      }
       this.drawPlannedPath(ctx, transform, scene.plannedPath);
+      for (const track of Array.isArray(scene.filteredTracks)
+        ? scene.filteredTracks : []) {
+        this.drawUncertaintyOutline(ctx, transform, track);
+      }
       this.drawTracks(ctx, transform, scene.tracks, {
         scene,
         labelLimit: 3,
@@ -428,28 +483,139 @@
         clipShape: "radial",
       });
       ctx.restore();
+      this.drawRobotFootprint(ctx, transform);
       this.drawRobot(ctx, transform);
     }
 
-    drawPointCloud3d(ctx, width, height, frame) {
-      const rangeM = 0.50;
-      const sourcePoints = frame && Array.isArray(frame.points)
-        ? frame.points
+    drawProbabilisticLocalMap(ctx, transform, localMap, options) {
+      const resolution = Number(localMap && localMap.resolutionM);
+      const cells = localMap && Array.isArray(localMap.cells)
+        ? localMap.cells
         : [];
-      const points = sourcePoints
-        .filter((point) => Array.isArray(point) && point.length >= 5)
-        .map((point) => ({
-          forward: Number(point[0]),
-          lateral: Number(point[1]),
-          height: point[2] === null ? Number.NaN : Number(point[2]),
-          snr: Number(point[4]),
-        }))
-        .filter((point) =>
-          Number.isFinite(point.forward) &&
-          Number.isFinite(point.lateral) &&
-          Number.isFinite(point.height) &&
-          Math.hypot(point.forward, point.lateral, point.height) <= rangeM,
+      if (!Number.isFinite(resolution) || resolution <= 0) {
+        ctx.globalAlpha = 1;
+        return;
+      }
+      const size = resolution * transform.scale;
+      for (const cell of cells) {
+        const forward = Number(cell && cell.forward_m);
+        const lateral = Number(cell && cell.lateral_m);
+        const probability = Number(cell && cell.probability);
+        if (!Number.isFinite(forward) || !Number.isFinite(lateral) ||
+            !Number.isFinite(probability)) {
+          continue;
+        }
+        if (options && options.clipShape === "radial" &&
+            Math.hypot(forward, lateral) > transform.forwardMaxM + resolution) {
+          continue;
+        }
+        const certainty = Math.max(0, Math.min(1,
+          (probability - 0.5) / (0.97 - 0.5)));
+        ctx.globalAlpha = certainty * 0.70;
+        const color = cell.occupied ? [255, 126, 54] : [92, 228, 208];
+        ctx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+        const center = window.HanselRadarScene.projectMapPoint(
+          transform,
+          forward,
+          lateral,
         );
+        ctx.fillRect(center.x - size / 2, center.y - size / 2, size, size);
+      }
+      ctx.globalAlpha = 1;
+      for (const cell of cells) {
+        this.drawUncertaintyOutline(ctx, transform, cell);
+      }
+    }
+
+    drawUncertaintyOutline(ctx, transform, evidence) {
+      const forward = Number(evidence && evidence.forward_m);
+      const lateral = Number(evidence && evidence.lateral_m);
+      const rangeUncertainty = Number(evidence && evidence.range_uncertainty_m);
+      const lateralUncertainty = Number(
+        evidence && evidence.lateral_uncertainty_m,
+      );
+      if (!Number.isFinite(forward) || !Number.isFinite(lateral) ||
+          !Number.isFinite(rangeUncertainty) || rangeUncertainty < 0 ||
+          !Number.isFinite(lateralUncertainty) || lateralUncertainty < 0) {
+        return;
+      }
+      const point = window.HanselRadarScene.projectMapPoint(
+        transform,
+        forward,
+        lateral,
+      );
+      ctx.save();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(223, 252, 255, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.ellipse(
+        point.x,
+        point.y,
+        lateralUncertainty * transform.scale,
+        rangeUncertainty * transform.scale,
+        Math.atan2(lateral, forward),
+        0,
+        Math.PI * 2,
+      );
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    drawRobotFootprint(ctx, transform) {
+      ctx.save();
+      ctx.shadowBlur = 0;
+      for (const [radiusM, color, dash] of [
+        [0.105, "rgba(255, 184, 77, 0.42)", [4, 4]],
+        [0.075, "rgba(223, 252, 255, 0.66)", []],
+      ]) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.setLineDash(dash);
+        ctx.beginPath();
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          radiusM * transform.scale,
+          0,
+          Math.PI * 2,
+        );
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      ctx.restore();
+    }
+
+    drawPointCloud25d(ctx, width, height, filteredTracks, rawPoints, showRaw) {
+      const rangeM = 0.50;
+      const azimuthLimit = Math.PI / 3;
+      const tracks = (Array.isArray(filteredTracks) ? filteredTracks : [])
+        .filter((track) => {
+          const forward = Number(track && track.forward_m);
+          const lateral = Number(track && track.lateral_m);
+          const distance = Number.isFinite(track && track.distance_m)
+            ? track.distance_m
+            : Math.hypot(forward, lateral);
+          return Number.isFinite(forward) && forward > 0 &&
+            Number.isFinite(lateral) && Number.isFinite(distance) &&
+            distance >= 0 && distance <= rangeM &&
+            Math.abs(Math.atan2(lateral, forward)) <= azimuthLimit;
+        })
+        .sort((left, right) => left.distance_m - right.distance_m);
+      const debugPoints = showRaw === true
+        ? (Array.isArray(rawPoints) ? rawPoints : [])
+          .filter((point) => Array.isArray(point) && point.length >= 2)
+          .map((point) => ({
+            forward: Number(point[0]),
+            lateral: Number(point[1]),
+            height: point[2] === null ? 0 : Number(point[2]),
+          }))
+          .filter((point) => Number.isFinite(point.forward) &&
+            point.forward > 0 && Number.isFinite(point.lateral) &&
+            Number.isFinite(point.height) &&
+            Math.hypot(point.forward, point.lateral) <= rangeM &&
+            Math.abs(Math.atan2(point.lateral, point.forward)) <= azimuthLimit)
+        : [];
       const yaw = this.pointCloud3dYaw;
       const pitch = this.pointCloud3dPitch;
       const cosineYaw = Math.cos(yaw);
@@ -483,79 +649,134 @@
         ctx.stroke();
       };
 
-      ctx.save();
-      ctx.lineCap = "round";
-      for (let step = -5; step <= 5; step += 1) {
-        const lateral = step * 0.10;
-        line3d(
-          [lateral, 0, 0],
-          [lateral, 0, rangeM],
-          "rgba(73, 168, 255, 0.13)",
-        );
-      }
-      for (let step = 0; step <= 5; step += 1) {
-        const forward = step * 0.10;
-        line3d(
-          [-rangeM, 0, forward],
-          [rangeM, 0, forward],
-          "rgba(73, 168, 255, 0.13)",
-        );
-      }
-      line3d([0, -rangeM, 0], [0, rangeM, 0], "#ffc15b", 1.8);
-      line3d([-rangeM, 0, 0], [rangeM, 0, 0], "#5ce4d0", 1.8);
-      line3d([0, 0, 0], [0, 0, rangeM], "#89cdff", 1.8);
-
-      points
-        .map((point) => ({
-          ...point,
-          projected: project(point.lateral, point.height, point.forward),
-        }))
-        .sort((left, right) => right.projected.depth - left.projected.depth)
-        .forEach((point) => {
-          const normalizedHeight = Math.max(
-            -1,
-            Math.min(1, point.height / rangeM),
-          );
-          const color = normalizedHeight > 0.06
-            ? `rgba(255, 193, 91, ${0.72 + normalizedHeight * 0.24})`
-            : normalizedHeight < -0.06
-              ? `rgba(90, 184, 255, ${0.72 + -normalizedHeight * 0.24})`
-              : "rgba(220, 255, 250, 0.94)";
-          const snrScale = Number.isFinite(point.snr)
-            ? Math.max(0, Math.min(1, point.snr / 30))
-            : 0.5;
-          const radius = (2.7 + snrScale * 4.2) *
-            point.projected.perspective;
-          ctx.fillStyle = color;
-          ctx.shadowColor = color;
-          ctx.shadowBlur = 7;
-          ctx.beginPath();
-          ctx.arc(
-            point.projected.x,
-            point.projected.y,
-            Math.max(2.2, radius),
+      const drawShell = (distance) => {
+        ctx.strokeStyle = "rgba(73, 168, 255, 0.20)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let step = 0; step <= 24; step += 1) {
+          const azimuth = -azimuthLimit + (azimuthLimit * 2 * step) / 24;
+          const projected = project(
+            Math.sin(azimuth) * distance,
             0,
-            Math.PI * 2,
+            Math.cos(azimuth) * distance,
           );
-          ctx.fill();
-          ctx.shadowBlur = 0;
-        });
+          if (step === 0) ctx.moveTo(projected.x, projected.y);
+          else ctx.lineTo(projected.x, projected.y);
+        }
+        ctx.stroke();
+        const labelPoint = project(0, 0, distance);
+        ctx.fillStyle = "rgba(137, 205, 255, 0.74)";
+        ctx.fillText(`${Math.round(distance * 100)}cm`, labelPoint.x + 4, labelPoint.y);
+      };
 
-      ctx.fillStyle = "rgba(220, 242, 255, 0.84)";
+      ctx.save();
+      ctx.shadowBlur = 0;
+      ctx.lineCap = "round";
       ctx.font = "700 9px ui-monospace, SFMono-Regular, Consolas, monospace";
       ctx.textAlign = "left";
-      ctx.fillText(`XYZ ${points.length} POINTS · DRAG TO ROTATE`, 8, 13);
+      for (const azimuth of [-azimuthLimit, 0, azimuthLimit]) {
+        line3d(
+          [0, 0, 0],
+          [Math.sin(azimuth) * rangeM, 0, Math.cos(azimuth) * rangeM],
+          "rgba(73, 168, 255, 0.18)",
+        );
+      }
+      for (const elevation of [-40, 40]) {
+        const radians = elevation * Math.PI / 180;
+        line3d(
+          [0, 0, 0],
+          [0, Math.sin(radians) * rangeM, Math.cos(radians) * rangeM],
+          "rgba(92, 228, 208, 0.16)",
+        );
+      }
+      for (const shell of [0.10, 0.30, 0.50]) {
+        drawShell(shell);
+      }
+
+      const bandColor = (track) => track.height_band === "below_sensor"
+        ? "#5bbcff"
+        : track.height_band === "above_sensor"
+          ? "#ffb84d"
+          : "#dffcff";
+      tracks.forEach((track, index) => {
+        const isHeatmap = track.source === "heatmap";
+        const height = isHeatmap ? 0 : Number(track.height_m);
+        const projected = project(track.lateral_m, height, track.forward_m);
+        const markerRadius = 4.5;
+        ctx.shadowBlur = 0;
+        if (isHeatmap) {
+          ctx.fillStyle = "#a98cff";
+          ctx.strokeStyle = "#a98cff";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(projected.x, projected.y - markerRadius);
+          ctx.lineTo(projected.x + markerRadius, projected.y);
+          ctx.lineTo(projected.x, projected.y + markerRadius);
+          ctx.lineTo(projected.x - markerRadius, projected.y);
+          ctx.lineTo(projected.x, projected.y - markerRadius);
+          ctx.fill();
+          ctx.stroke();
+        } else {
+          const color = bandColor(track);
+          ctx.fillStyle = color;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = track.point_confirmed === true ? 1.5 : 1;
+          ctx.beginPath();
+          ctx.arc(projected.x, projected.y, markerRadius, 0, Math.PI * 2);
+          if (track.point_confirmed === true) ctx.fill();
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(projected.x - markerRadius - 2, projected.y);
+          ctx.lineTo(projected.x + markerRadius + 2, projected.y);
+          ctx.moveTo(projected.x, projected.y - markerRadius - 2);
+          ctx.lineTo(projected.x, projected.y + markerRadius + 2);
+          ctx.stroke();
+        }
+        if (index < 5) {
+          const distance = Number.isFinite(track.distance_m)
+            ? track.distance_m
+            : Math.hypot(track.forward_m, track.lateral_m);
+          const zText = isHeatmap
+            ? "Z UNKNOWN"
+            : `Z ${height >= 0 ? "+" : ""}${height.toFixed(2)}m`;
+          ctx.fillStyle = isHeatmap ? "#c7b7ff" : bandColor(track);
+          ctx.fillText(
+            `${distance.toFixed(2)}m · ${zText}`,
+            projected.x + 7,
+            projected.y - 6,
+          );
+        }
+      });
+
+      for (const point of debugPoints) {
+        const projected = project(point.lateral, point.height, point.forward);
+        ctx.strokeStyle = "rgba(170, 180, 180, 0.55)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(projected.x - 2, projected.y - 2);
+        ctx.lineTo(projected.x + 2, projected.y + 2);
+        ctx.moveTo(projected.x + 2, projected.y - 2);
+        ctx.lineTo(projected.x - 2, projected.y + 2);
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = "rgba(220, 242, 255, 0.84)";
+      ctx.fillText(
+        showRaw === true
+          ? `FILTERED ${tracks.length} · RAW DEBUG ${debugPoints.length}`
+          : `FILTERED ${tracks.length} · RAW OFF · Z SENSOR-RELATIVE`,
+        8,
+        13,
+      );
       ctx.fillStyle = "#ffc15b";
-      ctx.fillText("Z UP", 8, 27);
+      ctx.fillText("±40° ELEVATION · DRAG TO ROTATE", 8, 27);
       ctx.fillStyle = "#5ce4d0";
-      ctx.fillText("X LEFT / RIGHT", 8, 40);
-      ctx.fillStyle = "#89cdff";
-      ctx.fillText("Y FORWARD · 50cm", 8, 53);
+      ctx.fillText("±60° AZIMUTH", 8, 40);
       ctx.restore();
 
       const status = document.querySelector("#pointcloud-3d-status");
       if (status) {
-        status.textContent = `${points.length} PTS · Z LIVE`;
+        status.textContent = `${tracks.length} FILTERED · SENSOR-RELATIVE Z`;
       }
     }
 
@@ -645,20 +866,13 @@
     }
 
     drawPlannedPath(ctx, transform, plannedPath) {
-      if (!plannedPath || !Array.isArray(plannedPath.points) ||
-          plannedPath.points.length < 2) {
+      if (!plannedPath || !Array.isArray(plannedPath.points)) {
         return;
       }
-      const visiblePoints = plannedPath.points.filter(
-        (point) => point[0] >= 0 && point[0] <= transform.forwardMaxM &&
-          Math.abs(point[1]) <= transform.halfWidthM,
-      );
-      if (visiblePoints.length < 2) {
-        return;
-      }
-      const stroke = (color, width) => {
+      const strokePath = (points, color, width) => {
+        if (!Array.isArray(points) || points.length < 2) return;
         ctx.beginPath();
-        visiblePoints.forEach((coordinates, index) => {
+        points.forEach((coordinates, index) => {
           const point = window.HanselRadarScene.projectMapPoint(
             transform,
             coordinates[0],
@@ -677,18 +891,42 @@
         ctx.stroke();
       };
       ctx.save();
-      stroke("rgba(5, 9, 12, 0.82)", 7);
-      stroke("rgba(255, 215, 64, 0.96)", 3.2);
-      const end = visiblePoints[visiblePoints.length - 1];
-      const endpoint = window.HanselRadarScene.projectMapPoint(
-        transform,
-        end[0],
-        end[1],
+      const passageWidthM = Number(plannedPath.minimum_passage_width_m);
+      const underlayWidth = Number.isFinite(passageWidthM) && passageWidthM > 0
+        ? passageWidthM * transform.scale
+        : 7;
+      strokePath(
+        plannedPath.points,
+        "rgba(5, 9, 12, 0.42)",
+        underlayWidth,
       );
-      ctx.fillStyle = "#ffe47a";
-      ctx.beginPath();
-      ctx.arc(endpoint.x, endpoint.y, 4, 0, Math.PI * 2);
-      ctx.fill();
+      strokePath(plannedPath.points, "rgba(255, 215, 64, 0.96)", 3.2);
+      const blockedPrevious = plannedPath.blocked_previous_path;
+      if (blockedPrevious && Array.isArray(blockedPrevious.points) &&
+          Array.isArray(blockedPrevious.segments)) {
+        for (const segment of blockedPrevious.segments) {
+          strokePath(
+            blockedPrevious.points.slice(
+              segment.start_index,
+              segment.end_index + 1,
+            ),
+            "rgba(255, 81, 81, 0.92)",
+            3.2,
+          );
+        }
+      }
+      if (plannedPath.points.length > 0) {
+        const end = plannedPath.points[plannedPath.points.length - 1];
+        const endpoint = window.HanselRadarScene.projectMapPoint(
+          transform,
+          end[0],
+          end[1],
+        );
+        ctx.fillStyle = "#ffe47a";
+        ctx.beginPath();
+        ctx.arc(endpoint.x, endpoint.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
       ctx.restore();
     }
 
@@ -1192,13 +1430,13 @@
       ctx.restore();
     }
 
-    drawRawDebugPoints(ctx, transform, frame) {
-      if (!frame || !Array.isArray(frame.points)) {
+    drawRawDebugPoints(ctx, transform, rawPoints) {
+      if (!Array.isArray(rawPoints)) {
         return;
       }
       ctx.save();
       ctx.fillStyle = "rgba(90, 184, 255, 0.48)";
-      for (const rawPoint of frame.points) {
+      for (const rawPoint of rawPoints) {
         const forward = Number(rawPoint[0]);
         const lateral = Number(rawPoint[1]);
         if (
@@ -1382,8 +1620,16 @@
       const visible = Boolean(presentation && !presentation.blocked);
       const frame = visible && state && state.frame;
       const scene = visible && state && state.scene;
-      const diagnostics = scene && scene.diagnostics;
+      const diagnostics = visible && presentation && presentation.diagnostics;
       const counters = visible && state && state.counters;
+      const diagnosticValue = (key) => diagnostics &&
+        Number.isInteger(diagnostics[key]) && diagnostics[key] >= 0
+        ? String(diagnostics[key])
+        : "--";
+      const setDiagnosticValue = (selector, key) => {
+        const element = document.querySelector(selector);
+        if (element) element.textContent = diagnosticValue(key);
+      };
       document.querySelector("#axis-value").textContent = state && state.axes
         ? `${state.axes.forward_sign > 0 ? "+" : "-"}${String(state.axes.forward_axis).toUpperCase()} 전방 · ` +
           `${state.axes.lateral_sign > 0 ? "+" : "-"}${String(state.axes.lateral_axis).toUpperCase()} 우측`
@@ -1400,6 +1646,8 @@
       document.querySelector("#pose-mode-value").textContent =
         poseMode === "motion_compensated"
           ? "MOTION COMPENSATED"
+          : poseMode === "robot_relative_short_memory"
+            ? "ROBOT RELATIVE · SHORT MEMORY"
           : poseMode === "robot_relative"
             ? "ROBOT RELATIVE"
             : "--";
@@ -1413,67 +1661,57 @@
             (counters.writer_drops_total || 0),
           )
         : "--";
-      document.querySelector("#raw-point-value").textContent = frame
-        ? String(frame.source_point_count || 0)
-        : diagnostics && Number.isFinite(diagnostics.scene_point_count)
-          ? String(diagnostics.scene_point_count)
-          : "--";
-      const tracks = presentation && !presentation.blocked
-        ? presentation.tracks
-        : [];
-      const confirmedCount = tracks.length;
+      setDiagnosticValue("#raw-point-value", "raw_point_count");
+      setDiagnosticValue(
+        "#clutter-rejected-value",
+        "self_clutter_rejected_count",
+      );
+      setDiagnosticValue("#reflection-value", "heatmap_reflection_count");
+      const pointConfirmed = diagnostics &&
+        diagnostics.confirmed_point_track_count;
+      const heatmapConfirmed = diagnostics &&
+        diagnostics.confirmed_heatmap_track_count;
       document.querySelector("#confirmed-track-value").textContent =
-        visible ? String(confirmedCount) : "--";
-      document.querySelector("#clutter-rejected-value").textContent =
-        diagnostics && Number.isFinite(diagnostics.clutter_points_rejected)
-          ? String(diagnostics.clutter_points_rejected)
+        Number.isInteger(pointConfirmed) && pointConfirmed >= 0 &&
+        Number.isInteger(heatmapConfirmed) && heatmapConfirmed >= 0
+          ? String(pointConfirmed + heatmapConfirmed)
           : "--";
+      for (const [selector, key] of [
+        ["#quality-rejected-value", "quality_gate_rejected_count"],
+        ["#probability-active-value", "probability_active_cell_count"],
+        ["#probability-occupied-value", "probability_occupied_cell_count"],
+        ["#probability-decayed-value", "probability_decayed_cell_count"],
+        ["#probability-expired-value", "probability_ttl_expired_cell_count"],
+        ["#path-pending-value", "path_switch_pending_count"],
+        ["#path-accepted-value", "path_switch_accepted_count"],
+      ]) {
+        setDiagnosticValue(selector, key);
+      }
       const heatmapCandidateElement = document.querySelector(
         "#heatmap-candidate-value",
       );
       if (heatmapCandidateElement) {
-        heatmapCandidateElement.textContent =
-          diagnostics && Number.isFinite(
-            diagnostics.heatmap_candidate_cells,
-          )
-            ? String(diagnostics.heatmap_candidate_cells)
-            : "--";
+        heatmapCandidateElement.textContent = diagnosticValue(
+          "heatmap_candidate_cells",
+        );
       }
       const heatmapClusterElement = document.querySelector(
         "#heatmap-cluster-value",
       );
       if (heatmapClusterElement) {
-        heatmapClusterElement.textContent =
-          diagnostics && Number.isFinite(diagnostics.heatmap_cluster_count)
-            ? String(diagnostics.heatmap_cluster_count)
-            : "--";
-      }
-      const reflectionElement = document.querySelector("#reflection-value");
-      if (reflectionElement) {
-        reflectionElement.textContent =
-          diagnostics && Number.isFinite(
-            diagnostics.heatmap_reflection_evidence,
-          )
-            ? String(diagnostics.heatmap_reflection_evidence)
-            : "--";
+        heatmapClusterElement.textContent = diagnosticValue(
+          "heatmap_cluster_count",
+        );
       }
       const memoryElement = document.querySelector("#obstacle-memory-value");
       if (memoryElement) {
-        memoryElement.textContent =
-          diagnostics && Number.isFinite(
-            diagnostics.rolling_local_map_cell_count,
-          )
-            ? `${diagnostics.rolling_local_map_cell_count} · IN 50cm`
-            : "--";
+        const count = diagnosticValue("rolling_local_map_cell_count");
+        memoryElement.textContent = count === "--" ? "--" : `${count} · IN 50cm`;
       }
       const stableCellElement = document.querySelector("#stable-cell-value");
       if (stableCellElement) {
-        stableCellElement.textContent =
-          diagnostics && Number.isFinite(
-            diagnostics.stable_occupancy_cell_count,
-          )
-            ? `${diagnostics.stable_occupancy_cell_count} · 5cm GRID`
-            : "--";
+        const count = diagnosticValue("stable_occupancy_cell_count");
+        stableCellElement.textContent = count === "--" ? "--" : `${count} · 5cm GRID`;
       }
       document.querySelector("#grid-status-value").textContent =
         presentation && !presentation.blocked && presentation.grid
@@ -1485,16 +1723,18 @@
           : "SENSOR_FAULT";
       const motionElement = document.querySelector("#motion-status-value");
       if (motionElement) {
-        const motion = presentation && presentation.motionCompensation;
+        const motion = visible && presentation.motionCompensation;
         motionElement.textContent = motion
           ? `${String(motion.status).toUpperCase()} · ${motion.matched_points || 0} match`
           : "--";
       }
       const pathElement = document.querySelector("#path-status-value");
       if (pathElement) {
-        const path = presentation && presentation.plannedPath;
+        const path = visible && presentation.plannedPath;
         pathElement.textContent = path
           ? `${Math.round(path.length_m * 100)}cm · ${String(
+              path.status || "unknown",
+            ).toUpperCase()} · ${String(
               path.stability_status || "stable",
             ).toUpperCase()}`
           : "--";
@@ -1503,7 +1743,7 @@
         "#path-confidence-value",
       );
       if (pathConfidenceElement) {
-        const path = presentation && presentation.plannedPath;
+        const path = visible && presentation.plannedPath;
         pathConfidenceElement.textContent =
           path && Number.isFinite(path.confidence)
             ? `${Math.round(path.confidence * 100)}% · ${String(
@@ -1518,6 +1758,10 @@
           scene &&
           ["ok", "synthetic"].includes(scene.calibration_status),
         );
+      const pointCloudStatus = document.querySelector("#pointcloud-3d-status");
+      if (pointCloudStatus && !visible) {
+        pointCloudStatus.textContent = "SENSOR FAULT";
+      }
     }
 
     updateSectors(presentation) {

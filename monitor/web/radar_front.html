@@ -491,6 +491,23 @@
         background: var(--red);
       }
 
+      .swatch.below {
+        background: #5bbcff;
+      }
+
+      .swatch.sensor-level {
+        background: #dffcff;
+      }
+
+      .swatch.above {
+        background: #ffb84d;
+      }
+
+      .swatch.unknown-height {
+        background: #a98cff;
+        transform: rotate(45deg) scale(0.72);
+      }
+
       dl {
         margin: 0;
         display: grid;
@@ -736,23 +753,21 @@
           ></canvas>
 
           <div class="stage-tags">
-            <span class="tag">50cm ROLLING CIRCLE</span>
+            <span class="tag">PROBABILITY MAP · DEFAULT</span>
             <span class="tag">RADAR AT CENTER</span>
-            <span class="tag">AZIMUTH ONLY</span>
-            <span class="tag">5cm OCCUPANCY</span>
+            <span class="tag">5cm PROBABILITY</span>
             <span class="tag">UNKNOWN ≠ FREE</span>
             <span class="tag">1cm PATH</span>
             <span class="tag">BLUE = TRAVEL TRAIL</span>
-            <span class="tag">MIN GAP 15cm</span>
-            <span class="tag">1s REACTIVE MAP</span>
-            <span class="tag">RETAIN UNTIL OUTSIDE</span>
+            <span class="tag">ROBOT 15cm · MARGIN 3cm</span>
+            <span class="tag">1s DECAY · 2.5s TTL</span>
             <span class="tag">±60° TRUSTED FOV</span>
             <span class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>
-            <span class="tag" id="build-tag">UI R31</span>
+            <span class="tag" id="build-tag">UI R32</span>
             <span class="tag" id="axis-warning">장착축/보정 확인</span>
           </div>
 
-          <section id="collision-inset" data-hazard="UNKNOWN" hidden>
+          <section id="collision-inset" data-hazard="UNKNOWN">
             <header>
               <strong>0~50cm 충돌 확대</strong>
               <span id="collision-distance">-- cm</span>
@@ -765,12 +780,12 @@
 
           <section id="pointcloud-3d-panel">
             <header>
-              <strong>3D POINT CLOUD · 0~50cm</strong>
-              <span id="pointcloud-3d-status">XYZ LIVE</span>
+              <strong>2.5D FILTERED TRACKS · 0~50cm</strong>
+              <span id="pointcloud-3d-status">FILTERED · SENSOR-RELATIVE Z</span>
             </header>
             <canvas
               id="pointcloud-3d-canvas"
-              aria-label="레이더 좌우 전후 상하 3차원 포인트 클라우드"
+              aria-label="레이더 filtered track 센서 상대 2.5차원 보기"
             ></canvas>
           </section>
 
@@ -824,7 +839,23 @@
               </div>
               <div>
                 <span class="swatch point"></span>
-                <span>선명한 원: point track · 높이 제외, 좌우각만 사용</span>
+                <span>Filtered point track · 높이는 센서 상대이며 지면 clearance가 아님</span>
+              </div>
+              <div>
+                <span class="swatch below"></span>
+                <span>BELOW · sensor-relative height band</span>
+              </div>
+              <div>
+                <span class="swatch sensor-level"></span>
+                <span>SENSOR LEVEL · sensor-relative height band</span>
+              </div>
+              <div>
+                <span class="swatch above"></span>
+                <span>ABOVE · sensor-relative height band</span>
+              </div>
+              <div>
+                <span class="swatch unknown-height"></span>
+                <span>Z UNKNOWN · heatmap/reflection evidence</span>
               </div>
               <div>
                 <span class="swatch danger"></span>
@@ -839,7 +870,7 @@
               <dt>좌표축</dt><dd id="axis-value">+Y 전방 · +X 우측</dd>
               <dt>프로필</dt><dd id="profile-value">--</dd>
               <dt>보정 상태</dt><dd id="calibration-value">--</dd>
-              <dt>Pose 모드</dt><dd id="pose-mode-value">ROBOT RELATIVE</dd>
+              <dt>Pose 모드</dt><dd id="pose-mode-value">ROBOT RELATIVE · SHORT MEMORY</dd>
               <dt>이동 보정</dt><dd id="motion-status-value">--</dd>
               <dt>계획 경로</dt><dd id="path-status-value">--</dd>
               <dt>경로 신뢰도</dt><dd id="path-confidence-value">--</dd>
@@ -854,9 +885,16 @@
               <dt>Raw point</dt><dd id="raw-point-value">--</dd>
               <dt>확인 track</dt><dd id="confirmed-track-value">--</dd>
               <dt>Clutter 제거</dt><dd id="clutter-rejected-value">--</dd>
+              <dt>Quality gate 제거</dt><dd id="quality-rejected-value">--</dd>
               <dt>Heatmap 후보 셀</dt><dd id="heatmap-candidate-value">--</dd>
               <dt>Heatmap cluster</dt><dd id="heatmap-cluster-value">--</dd>
               <dt>Reflection evidence</dt><dd id="reflection-value">--</dd>
+              <dt>Probability active</dt><dd id="probability-active-value">--</dd>
+              <dt>Probability occupied</dt><dd id="probability-occupied-value">--</dd>
+              <dt>Probability decayed</dt><dd id="probability-decayed-value">--</dd>
+              <dt>Probability TTL expired</dt><dd id="probability-expired-value">--</dd>
+              <dt>Path switch pending</dt><dd id="path-pending-value">--</dd>
+              <dt>Path switch accepted</dt><dd id="path-accepted-value">--</dd>
               <dt>원형 누적 장애물</dt><dd id="obstacle-memory-value">--</dd>
               <dt>안정 점유 셀</dt><dd id="stable-cell-value">--</dd>
               <dt>Grid decode</dt><dd id="grid-status-value">대기</dd>
@@ -867,8 +905,9 @@
           <section class="side-panel action-row">
             <label class="check" for="raw-toggle">
               <input id="raw-toggle" type="checkbox" />
-              <span>최신 raw point를 보조 표시</span>
+              <span>RAW DEBUG · 표시 전용</span>
             </label>
+            <span>RAW DEBUG는 map/path/hazard에 영향을 주지 않습니다</span>
             <button class="action-button" id="fullscreen-button" type="button">
               레이더 화면 전체화면
             </button>
@@ -887,8 +926,8 @@
       </footer>
     </main>
 
-    <script src="/radar_scene.js?v=20260802-xyz-pointcloud-r31"></script>
-    <script src="/radar_panel.js?v=20260802-xyz-pointcloud-r31"></script>
+    <script src="/radar_scene.js?v=20260807-probability-25d-r32"></script>
+    <script src="/radar_panel.js?v=20260807-probability-25d-r32"></script>
     <script>
       const panel = new window.HanselRadarPanel(
         document.querySelector("#radar-panel"),

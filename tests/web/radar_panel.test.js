@@ -81,21 +81,60 @@ function makeMetric() {
 }
 
 function makeContext() {
-  return {
+  let currentPath = [];
+  let globalAlpha = 1;
+  const context = {
     clearRectCalls: [],
     fillRectCalls: [],
+    fillRectStyles: [],
     fillTextCalls: [],
     fillTextStyles: [],
+    strokeRectCalls: [],
     strokeRectStyles: [],
+    arcCalls: [],
+    ellipseCalls: [],
+    strokeCalls: [],
+    fillCalls: [],
+    globalAlphaValues: [],
+    shadowBlur: 0,
     setTransform() {},
     save() {},
     restore() {},
-    beginPath() {},
-    arc() {},
-    fill() {},
-    stroke() {},
-    moveTo() {},
-    lineTo() {},
+    closePath() {},
+    rect() {},
+    clip() {},
+    translate() {},
+    setLineDash() {},
+    beginPath() {
+      currentPath = [];
+    },
+    arc(...args) {
+      this.arcCalls.push(args);
+      currentPath.push(["arc", ...args]);
+    },
+    ellipse(...args) {
+      this.ellipseCalls.push(args);
+      currentPath.push(["ellipse", ...args]);
+    },
+    fill() {
+      this.fillCalls.push({
+        fillStyle: this.fillStyle,
+        path: currentPath.map((command) => [...command]),
+      });
+    },
+    stroke() {
+      this.strokeCalls.push({
+        strokeStyle: this.strokeStyle,
+        lineWidth: this.lineWidth,
+        path: currentPath.map((command) => [...command]),
+      });
+    },
+    moveTo(...args) {
+      currentPath.push(["moveTo", ...args]);
+    },
+    lineTo(...args) {
+      currentPath.push(["lineTo", ...args]);
+    },
     measureText(text) {
       return { width: String(text).length * 7 };
     },
@@ -104,8 +143,14 @@ function makeContext() {
     },
     fillRect(...args) {
       this.fillRectCalls.push(args);
+      this.fillRectStyles.push({
+        fillStyle: this.fillStyle,
+        globalAlpha: this.globalAlpha,
+        args,
+      });
     },
-    strokeRect() {
+    strokeRect(...args) {
+      this.strokeRectCalls.push(args);
       this.strokeRectStyles.push(this.strokeStyle);
     },
     fillText(text, ...args) {
@@ -113,6 +158,18 @@ function makeContext() {
       this.fillTextStyles.push(this.fillStyle);
     },
   };
+  Object.defineProperty(context, "globalAlpha", {
+    get() {
+      return globalAlpha;
+    },
+    set(value) {
+      globalAlpha = value;
+      if (typeof value === "number") {
+        context.globalAlphaValues.push(value);
+      }
+    },
+  });
+  return context;
 }
 
 function makeCanvas(context) {
@@ -122,6 +179,8 @@ function makeCanvas(context) {
     getContext() {
       return context;
     },
+    addEventListener() {},
+    setPointerCapture() {},
     getBoundingClientRect() {
       return { width: 640, height: 360 };
     },
@@ -131,8 +190,10 @@ function makeCanvas(context) {
 function makeHarness() {
   const mainContext = makeContext();
   const collisionContext = makeContext();
+  const pointCloudContext = makeContext();
   const mainCanvas = makeCanvas(mainContext);
   const collisionCanvas = makeCanvas(collisionContext);
+  const pointCloudCanvas = makeCanvas(pointCloudContext);
   const elements = new Map();
   const metrics = [
     "metric-hazard",
@@ -152,6 +213,7 @@ function makeHarness() {
     "radar-mode",
     "collision-inset",
     "collision-distance",
+    "pointcloud-3d-status",
     "axis-value",
     "profile-value",
     "calibration-value",
@@ -164,6 +226,18 @@ function makeHarness() {
     "heatmap-candidate-value",
     "heatmap-cluster-value",
     "reflection-value",
+    "quality-rejected-value",
+    "probability-active-value",
+    "probability-occupied-value",
+    "probability-decayed-value",
+    "probability-expired-value",
+    "path-pending-value",
+    "path-accepted-value",
+    "obstacle-memory-value",
+    "stable-cell-value",
+    "motion-status-value",
+    "path-status-value",
+    "path-confidence-value",
     "grid-status-value",
     "scene-hazard-value",
     "axis-warning",
@@ -191,6 +265,7 @@ function makeHarness() {
     querySelector(selector) {
       if (selector === "#radar-main-canvas") return mainCanvas;
       if (selector === "#collision-canvas") return collisionCanvas;
+      if (selector === "#pointcloud-3d-canvas") return pointCloudCanvas;
       return null;
     },
   };
@@ -267,20 +342,65 @@ function makeHarness() {
       }],
     },
   };
-  mainContext.clearRectCalls.length = 0;
-  mainContext.fillRectCalls.length = 0;
-  mainContext.fillTextCalls.length = 0;
-  mainContext.fillTextStyles.length = 0;
-  mainContext.strokeRectStyles.length = 0;
-  collisionContext.clearRectCalls.length = 0;
-  collisionContext.fillRectCalls.length = 0;
-  collisionContext.fillTextCalls.length = 0;
-  collisionContext.fillTextStyles.length = 0;
-  collisionContext.strokeRectStyles.length = 0;
+  for (const drawContext of [
+    mainContext,
+    collisionContext,
+    pointCloudContext,
+  ]) {
+    for (const key of [
+      "clearRectCalls",
+      "fillRectCalls",
+      "fillRectStyles",
+      "fillTextCalls",
+      "fillTextStyles",
+      "strokeRectCalls",
+      "strokeRectStyles",
+      "arcCalls",
+      "ellipseCalls",
+      "strokeCalls",
+      "fillCalls",
+      "globalAlphaValues",
+    ]) {
+      drawContext[key].length = 0;
+    }
+  }
   return {
     panel,
     elements,
-    contexts: [mainContext, collisionContext],
+    contexts: [mainContext, collisionContext, pointCloudContext],
+  };
+}
+
+function livePresentationWithProbabilityMap() {
+  return {
+    blocked: false,
+    reason: null,
+    hazard: { level: "NORMAL", threshold_m: 0.10 },
+    poseMode: "robot_relative_short_memory",
+    probabilisticLocalMap: {
+      sourceField: "probabilistic_local_map",
+      radiusM: 0.50,
+      resolutionM: 0.05,
+      occupiedThreshold: 0.75,
+      cells: [],
+    },
+    grid: { cells: [] },
+    rollingMapObstacles: [
+      { forward_m: 0.25, lateral_m: 0.05, confidence: 0.8, age_ms: 0 },
+    ],
+    travelTrail: { points: [] },
+    plannedPath: {
+      status: "clear",
+      stability_status: "stable",
+      length_m: 0.01,
+      points: [[0.00, 0.00], [0.01, 0.00]],
+      minimum_passage_width_m: 0.21,
+      blocked_previous_path: null,
+    },
+    referenceTracks: [],
+    tracks: [],
+    filteredTracks: [],
+    diagnostics: {},
   };
 }
 
@@ -299,21 +419,145 @@ test("main rolling-map transform keeps the radar at circle center", () => {
   assert.equal(transform.centeredCircle, true);
 });
 
-test("3d point cloud uses live height and filters beyond fifty centimeters", () => {
+test("2.5d point cloud uses filtered height and filters beyond fifty centimeters", () => {
   const { panel, contexts } = makeHarness();
-  const context = contexts[0];
+  const context = contexts[2];
 
-  panel.drawPointCloud3d(context, 360, 260, {
-    points: [
-      [0.30, 0.10, 0.10, 0, 24],
-      [0.60, 0.00, 0.00, 0, 30],
-      [0.20, 0.00, null, 0, 20],
-    ],
-  });
+  panel.drawPointCloud25d(context, 360, 260, [
+    { source: "point", classification: "confirmed_obstacle",
+      point_confirmed: true, forward_m: 0.30, lateral_m: 0.10,
+      distance_m: 0.316, height_m: 0.10, height_band: "sensor_level",
+      height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
+      age_ms: 0 },
+    { source: "point", classification: "confirmed_obstacle",
+      point_confirmed: true, forward_m: 0.60, lateral_m: 0,
+      distance_m: 0.60, height_m: 0, height_band: "sensor_level",
+      height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
+      age_ms: 0 },
+  ], [], false);
 
   assert.ok(context.fillTextCalls.some(
-    (entry) => entry[0] === "XYZ 1 POINTS · DRAG TO ROTATE",
+    (entry) => entry[0] === "FILTERED 1 · RAW OFF · Z SENSOR-RELATIVE",
   ));
+});
+
+test("probability cells fade as probability approaches unknown", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[0];
+  const transform = panel.makeCircularViewportTransform(
+    500, 500, 0.5, { top: 0, right: 0, bottom: 0, left: 0 },
+  );
+  panel.drawProbabilisticLocalMap(context, transform, {
+    resolutionM: 0.05,
+    cells: [
+      { forward_m: 0.20, lateral_m: 0, probability: 0.80, occupied: true },
+      { forward_m: 0.30, lateral_m: 0, probability: 0.60, occupied: false },
+    ],
+  }, { clipShape: "circle" });
+  const alphas = context.globalAlphaValues.filter(
+    (value) => value > 0 && value < 1,
+  ).slice(-2);
+  assert.ok(alphas[0] > alphas[1]);
+  assert.deepEqual(context.fillRectCalls[0], [237.5, 137.5, 25, 25]);
+  assert.deepEqual(
+    context.fillRectStyles.slice(-2).map((call) => call.fillStyle),
+    ["rgb(255, 126, 54)", "rgb(92, 228, 208)"],
+  );
+  assert.equal(context.globalAlphaValues.at(-1), 1);
+});
+
+test("probability evidence is nearly invisible as it reaches unknown", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = panel.makeCircularViewportTransform(
+    500, 500, 0.5, { top: 0, right: 0, bottom: 0, left: 0 },
+  );
+  panel.drawProbabilisticLocalMap(contexts[0], transform, {
+    resolutionM: 0.05,
+    cells: [{
+      forward_m: 0.20, lateral_m: 0, probability: 0.5001, occupied: false,
+    }],
+  }, { clipShape: "circle" });
+  assert.ok(contexts[0].globalAlphaValues.some(
+    (value) => value > 0 && value < 0.01,
+  ));
+});
+
+test("new probability map suppresses both legacy layers in both map views", () => {
+  const { panel } = makeHarness();
+  let legacyGridCalls = 0;
+  let legacyCircleCalls = 0;
+  panel.drawEvidenceGrid = () => { legacyGridCalls += 1; };
+  panel.drawAccumulatedObstacles = () => { legacyCircleCalls += 1; };
+  const transform = {
+    originX: 250, originY: 250, scale: 500,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  const presentation = livePresentationWithProbabilityMap();
+  panel.drawLidarTopView(makeContext(), transform, presentation);
+  panel.drawCollisionInset(makeContext(), transform, presentation);
+  assert.equal(legacyGridCalls, 0);
+  assert.equal(legacyCircleCalls, 0);
+});
+
+test("null probability map preserves both legacy layers in both map views", () => {
+  const { panel } = makeHarness();
+  let legacyGridCalls = 0;
+  let legacyCircleCalls = 0;
+  panel.drawEvidenceGrid = () => { legacyGridCalls += 1; };
+  panel.drawAccumulatedObstacles = () => { legacyCircleCalls += 1; };
+  const transform = {
+    originX: 250, originY: 250, scale: 500,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.probabilisticLocalMap = null;
+  panel.drawLidarTopView(makeContext(), transform, presentation);
+  panel.drawCollisionInset(makeContext(), transform, presentation);
+  assert.equal(legacyGridCalls, 2);
+  assert.equal(legacyCircleCalls, 2);
+});
+
+test("both map views invoke probability and robot-footprint renderers", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  const transform = {
+    originX: 250, originY: 250, scale: 500,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  let probabilityCalls = 0;
+  let footprintCalls = 0;
+  panel.drawProbabilisticLocalMap = () => { probabilityCalls += 1; };
+  panel.drawRobotFootprint = () => { footprintCalls += 1; };
+  panel.drawLidarTopView(contexts[0], transform, presentation);
+  panel.drawCollisionInset(contexts[1], transform, presentation);
+  assert.equal(probabilityCalls, 2);
+  assert.equal(footprintCalls, 2);
+});
+
+test("both map views draw probability evidence before every track layer", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  const transform = {
+    originX: 250, originY: 250, scale: 500,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  for (const [context, render] of [
+    [contexts[0], () => panel.drawLidarTopView(contexts[0], transform, presentation)],
+    [contexts[1], () => panel.drawCollisionInset(contexts[1], transform, presentation)],
+  ]) {
+    const order = [];
+    panel.drawProbabilisticLocalMap = () => { order.push("probability"); };
+    panel.drawTracks = () => { order.push("tracks"); };
+    render();
+    assert.equal(order[0], "probability");
+    assert.ok(order.includes("tracks"));
+    assert.ok(order.slice(1).every((entry) => entry === "tracks"));
+    assert.ok(context);
+  }
 });
 
 test("live point tracks render their distance label without a rendering error", () => {
@@ -357,6 +601,291 @@ test("live point tracks render their distance label without a rendering error", 
   );
 });
 
+test("2.5d view renders filtered height bands and unknown heatmap height", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[2];
+  panel.drawPointCloud25d(context, 420, 300, [
+    { source: "point", classification: "confirmed_obstacle", forward_m: 0.30,
+      lateral_m: 0.05, distance_m: 0.304, height_m: 0.12,
+      height_band: "above_sensor",
+      height_reference: "sensor_relative_uncalibrated",
+      confidence: 0.8, age_ms: 0 },
+    { source: "heatmap", classification: "reflection_evidence", forward_m: 0.35,
+      lateral_m: -0.05, distance_m: 0.354, height_m: null,
+      height_band: "unknown", height_reference: "unavailable",
+      confidence: 0.5, age_ms: 0 },
+  ], [], false);
+  assert.ok(context.fillTextCalls.some(([text]) => String(text).includes("FILTERED 2")));
+  assert.ok(context.fillTextCalls.some(([text]) => String(text).includes("Z UNKNOWN")));
+  assert.ok(context.fillTextCalls.some(([text]) => String(text).includes("0.30m")));
+});
+
+test("full draw never evaluates frame points while raw debug is off", () => {
+  const { panel } = makeHarness();
+  panel.presentation = livePresentationWithProbabilityMap();
+  panel.snapshot = { frame: {} };
+  Object.defineProperty(panel.snapshot.frame, "points", {
+    get() { throw new Error("raw accessed"); },
+  });
+  panel.rawToggle.checked = false;
+  assert.doesNotThrow(() => panel.draw());
+});
+
+test("raw debug reads points only when checked without changing guidance", () => {
+  const { panel } = makeHarness();
+  panel.presentation = livePresentationWithProbabilityMap();
+  const before = JSON.stringify(panel.presentation);
+  let reads = 0;
+  panel.snapshot = { frame: {} };
+  Object.defineProperty(panel.snapshot.frame, "points", {
+    get() { reads += 1; return []; },
+  });
+  panel.rawToggle.checked = true;
+  panel.draw();
+  assert.equal(reads, 1);
+  assert.equal(JSON.stringify(panel.presentation), before);
+});
+
+test("robot footprint uses fifteen centimeters plus three centimeter margins", () => {
+  const { panel, contexts } = makeHarness();
+  panel.drawRobotFootprint(contexts[0], { originX: 250, originY: 250, scale: 400 });
+  const radii = contexts[0].arcCalls.map((args) => args[2]);
+  assert.ok(radii.some((radius) => Math.abs(radius - 30) < 0.001));
+  assert.ok(radii.some((radius) => Math.abs(radius - 42) < 0.001));
+});
+
+test("range and lateral uncertainty render as a thin metric outline", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    forwardMaxM: 0.5, halfWidthM: 0.5,
+  };
+  panel.drawUncertaintyOutline(contexts[0], transform, {
+    forward_m: 0.30, lateral_m: 0.10,
+    range_uncertainty_m: 0.05, lateral_uncertainty_m: 0.08,
+  });
+  const [x, y, lateralRadius, rangeRadius, rotation] =
+    contexts[0].ellipseCalls[0];
+  assert.deepEqual([x, y], [290, 130]);
+  assert.equal(lateralRadius, 32);
+  assert.equal(rangeRadius, 20);
+  assert.ok(Math.abs(rotation - Math.atan2(0.10, 0.30)) < 1e-9);
+  assert.equal(contexts[0].fillCalls.length, 0);
+  assert.equal(contexts[0].shadowBlur, 0);
+  assert.ok(contexts[0].strokeCalls.some(
+    (call) => call.strokeStyle === "rgba(223, 252, 255, 0.35)" &&
+      call.lineWidth === 1,
+  ));
+});
+
+test("normal map rendering invokes uncertainty outlines for map and track", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.probabilisticLocalMap.cells = [{
+    forward_m: 0.20, lateral_m: 0.0, probability: 0.8, occupied: true,
+    range_uncertainty_m: 0.05, lateral_uncertainty_m: 0.06,
+    source: "point",
+  }];
+  presentation.filteredTracks = [{
+    forward_m: 0.30, lateral_m: 0.02,
+    range_uncertainty_m: 0.04, lateral_uncertainty_m: 0.07,
+    source: "heatmap", age_ms: 0,
+  }];
+  const outlined = [];
+  panel.drawUncertaintyOutline = (_ctx, _transform, evidence) => {
+    outlined.push(evidence.source);
+  };
+  panel.drawLidarTopView(contexts[0], transform, presentation);
+  assert.deepEqual(outlined.sort(), ["heatmap", "point"]);
+});
+
+test("planned path underlay uses the physical minimum passage width", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    forwardMaxM: 0.5, halfWidthM: 0.5,
+  };
+  panel.drawPlannedPath(contexts[0], transform, {
+    points: [[0.0, 0.0], [0.10, 0.0], [0.20, 0.0]],
+    minimum_passage_width_m: 0.21,
+    blocked_previous_path: null,
+  });
+  assert.ok(contexts[0].strokeCalls.some(
+    (call) => Math.abs(call.lineWidth - 84) < 0.001,
+  ));
+});
+
+test("blocked path segments use original inclusive point indices", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    forwardMaxM: 0.5, halfWidthM: 0.5,
+  };
+  panel.drawPlannedPath(contexts[0], transform, {
+    points: [[0.0, 0.0], [0.10, -0.02]],
+    minimum_passage_width_m: 0.21,
+    blocked_previous_path: {
+      points: [[-0.01, 0.0], [0.10, 0.0], [0.20, 0.05], [0.30, 0.05]],
+      segments: [{ start_index: 1, end_index: 2, reason: "confirmed_obstacle" }],
+    },
+  });
+  const blocked = contexts[0].strokeCalls.find(
+    (call) => call.strokeStyle === "rgba(255, 81, 81, 0.92)",
+  );
+  assert.deepEqual(blocked.path, [
+    ["moveTo", 250, 210], ["lineTo", 270, 170],
+  ]);
+});
+
+test("2.5d view excludes tracks beyond fifty centimeters or sixty degrees", () => {
+  const { panel, contexts } = makeHarness();
+  panel.drawPointCloud25d(contexts[2], 420, 300, [
+    { source: "point", classification: "confirmed_obstacle",
+      forward_m: 0.51, lateral_m: 0, distance_m: 0.51, height_m: 0,
+      height_band: "sensor_level",
+      height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
+      age_ms: 0 },
+    { source: "point", classification: "confirmed_obstacle",
+      forward_m: 0.10, lateral_m: 0.30, distance_m: 0.316, height_m: 0,
+      height_band: "sensor_level",
+      height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
+      age_ms: 0 },
+  ], [], false);
+  assert.ok(contexts[2].fillTextCalls.some(
+    ([text]) => String(text).includes("FILTERED 0"),
+  ));
+});
+
+test("2.5d markers distinguish confirmed tentative heatmap and raw geometry", () => {
+  const { panel, contexts } = makeHarness();
+  const tracks = [
+    { source: "point", classification: "confirmed_obstacle",
+      point_confirmed: true, forward_m: 0.20, lateral_m: -0.04,
+      distance_m: 0.204, height_m: 0.0, height_band: "sensor_level",
+      height_reference: "sensor_relative_uncalibrated", confidence: 0.9, age_ms: 0 },
+    { source: "point", classification: "point_candidate",
+      point_confirmed: false, forward_m: 0.30, lateral_m: 0.04,
+      distance_m: 0.303, height_m: 0.12, height_band: "above_sensor",
+      height_reference: "sensor_relative_uncalibrated", confidence: 0.6, age_ms: 0 },
+    { source: "heatmap", classification: "reflection_evidence",
+      heatmap_confirmed: false, forward_m: 0.40, lateral_m: 0.0,
+      distance_m: 0.40, height_m: null, height_band: "unknown",
+      height_reference: "unavailable", confidence: 0.5, age_ms: 0 },
+    { source: "point", classification: "confirmed_obstacle",
+      point_confirmed: true, forward_m: 0.25, lateral_m: 0.0,
+      distance_m: 0.25, height_m: -0.12, height_band: "below_sensor",
+      height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
+      age_ms: 0 },
+  ];
+  panel.drawPointCloud25d(
+    contexts[2], 420, 300, tracks,
+    [[0.25, 0.0, 0.0, 0.0, 24.0, 70.0]], true,
+  );
+  assert.ok(contexts[2].fillCalls.some(
+    (call) => call.fillStyle === "#dffcff",
+  ));
+  assert.ok(contexts[2].fillCalls.some(
+    (call) => call.fillStyle === "#5bbcff",
+  ));
+  assert.ok(contexts[2].strokeCalls.some(
+    (call) => call.strokeStyle === "#ffb84d",
+  ));
+  assert.ok(contexts[2].fillCalls.some(
+    (call) => call.fillStyle === "#a98cff" &&
+      call.path.filter(([command]) => command === "lineTo").length >= 3,
+  ));
+  assert.ok(contexts[2].strokeCalls.some(
+    (call) => call.strokeStyle === "rgba(170, 180, 180, 0.55)",
+  ));
+  assert.ok(contexts[2].fillTextCalls.some(
+    ([text]) => String(text).includes("RAW DEBUG 1"),
+  ));
+  assert.equal(contexts[2].shadowBlur, 0);
+  for (const label of ["10cm", "30cm", "50cm"]) {
+    assert.ok(contexts[2].fillTextCalls.some(
+      ([text]) => String(text).includes(label),
+    ));
+  }
+});
+
+test("2.5d labels only the nearest five points with signed z", () => {
+  const { panel, contexts } = makeHarness();
+  const tracks = Array.from({ length: 6 }, (_, index) => ({
+    source: "point", classification: "confirmed_obstacle",
+    point_confirmed: true, forward_m: 0.10 + index * 0.05, lateral_m: 0.0,
+    distance_m: 0.10 + index * 0.05, height_m: (index + 1) * 0.01,
+    height_band: "sensor_level",
+    height_reference: "sensor_relative_uncalibrated",
+    confidence: 0.9, age_ms: 0,
+  }));
+  panel.drawPointCloud25d(contexts[2], 420, 300, tracks, [], false);
+  const metricLabels = contexts[2].fillTextCalls
+    .map(([value]) => String(value))
+    .filter((value) => /^0\.\d{2}m · Z [+-]0\.\d{2}m$/.test(value));
+  assert.equal(metricLabels.length, 5);
+  assert.ok(metricLabels.includes("0.10m · Z +0.01m"));
+  assert.equal(metricLabels.includes("0.35m · Z +0.06m"), false);
+});
+
+test("2.5d raw marker is absent when raw debug is off", () => {
+  const { panel, contexts } = makeHarness();
+  panel.drawPointCloud25d(
+    contexts[2], 420, 300, [],
+    [[0.25, 0.0, 0.0, 0.0, 24.0, 70.0]], false,
+  );
+  assert.equal(contexts[2].strokeCalls.some(
+    (call) => call.strokeStyle === "rgba(170, 180, 180, 0.55)"), false,
+  );
+});
+
+test("validated diagnostics and blocked-near-field status drive existing rows", () => {
+  const { panel, elements } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.diagnostics = {
+    raw_point_count: 7,
+    self_clutter_rejected_count: 2,
+    quality_gate_rejected_count: 1,
+    tentative_point_track_count: 3,
+    confirmed_point_track_count: 4,
+    heatmap_reflection_count: 5,
+    confirmed_heatmap_track_count: 6,
+    probability_active_cell_count: 8,
+    probability_occupied_cell_count: 2,
+    probability_decayed_cell_count: 9,
+    probability_ttl_expired_cell_count: 10,
+    path_switch_pending_count: 1,
+    path_switch_accepted_count: 12,
+  };
+  presentation.plannedPath = {
+    ...presentation.plannedPath,
+    status: "blocked_near_field",
+    stability_status: "route_changed_blocked",
+    length_m: 0,
+    points: [[0, 0]],
+  };
+  panel.updateDiagnostics(presentation);
+  assert.equal(elements.get("#raw-point-value").textContent, "7");
+  assert.equal(elements.get("#clutter-rejected-value").textContent, "2");
+  assert.equal(elements.get("#reflection-value").textContent, "5");
+  assert.equal(elements.get("#confirmed-track-value").textContent, "10");
+  assert.equal(elements.get("#quality-rejected-value").textContent, "1");
+  assert.equal(elements.get("#probability-active-value").textContent, "8");
+  assert.equal(elements.get("#probability-occupied-value").textContent, "2");
+  assert.equal(elements.get("#probability-decayed-value").textContent, "9");
+  assert.equal(elements.get("#probability-expired-value").textContent, "10");
+  assert.equal(elements.get("#path-pending-value").textContent, "1");
+  assert.equal(elements.get("#path-accepted-value").textContent, "12");
+  assert.match(
+    elements.get("#path-status-value").textContent,
+    /BLOCKED_NEAR_FIELD.*ROUTE_CHANGED_BLOCKED/,
+  );
+});
+
 function staleBlockedPresentation(reason) {
   return {
     blocked: true,
@@ -396,10 +925,10 @@ test("every blocked reason clears stale maps and renders only its stop overlay",
 
       assert.equal(lidarDraws, 0, `${reason}: stale LiDAR scene rendered`);
       assert.equal(collisionDraws, 0, `${reason}: stale collision scene rendered`);
-      assert.equal(overlayCalls.length, 2, `${reason}: overlay count`);
+      assert.equal(overlayCalls.length, 3, `${reason}: overlay count`);
       assert.deepEqual(
         contexts.map((context) => context.clearRectCalls.length),
-        [1, 1],
+        [1, 1, 1],
         `${reason}: canvas clear count`,
       );
       for (const context of contexts) {
@@ -491,6 +1020,13 @@ test("every blocked reason replaces stale live metrics and sectors with sensor f
         "#heatmap-candidate-value",
         "#heatmap-cluster-value",
         "#reflection-value",
+        "#quality-rejected-value",
+        "#probability-active-value",
+        "#probability-occupied-value",
+        "#probability-decayed-value",
+        "#probability-expired-value",
+        "#path-pending-value",
+        "#path-accepted-value",
       ]) {
         assert.equal(
           elements.get(selector).textContent,
@@ -509,6 +1045,62 @@ test("every blocked reason replaces stale live metrics and sectors with sensor f
       }
     });
   }
+});
+
+test("blocked diagnostics clear all new and legacy count rows after live data", () => {
+  const { panel, elements } = makeHarness();
+  const live = livePresentationWithProbabilityMap();
+  live.diagnostics = {
+    raw_point_count: 11,
+    self_clutter_rejected_count: 2,
+    quality_gate_rejected_count: 3,
+    confirmed_point_track_count: 4,
+    confirmed_heatmap_track_count: 5,
+    heatmap_reflection_count: 6,
+    probability_active_cell_count: 7,
+    probability_occupied_cell_count: 8,
+    probability_decayed_cell_count: 9,
+    probability_ttl_expired_cell_count: 10,
+    path_switch_pending_count: 1,
+    path_switch_accepted_count: 12,
+  };
+  panel.updateDiagnostics(live);
+  panel.updateDiagnostics(staleBlockedPresentation("sensor_fault"));
+  for (const selector of [
+    "#raw-point-value",
+    "#clutter-rejected-value",
+    "#reflection-value",
+    "#confirmed-track-value",
+    "#quality-rejected-value",
+    "#probability-active-value",
+    "#probability-occupied-value",
+    "#probability-decayed-value",
+    "#probability-expired-value",
+    "#path-pending-value",
+    "#path-accepted-value",
+  ]) {
+    assert.equal(elements.get(selector).textContent, "--", selector);
+  }
+});
+
+test("blocked draw clears short-memory pose and marks 2.5d sensor fault", () => {
+  const { panel, elements } = makeHarness();
+  const live = livePresentationWithProbabilityMap();
+  panel.updateDiagnostics(live);
+  panel.drawPointCloud25d(panel.pointCloud3dContext, 420, 300, [], [], false);
+  assert.equal(
+    elements.get("#pose-mode-value").textContent,
+    "ROBOT RELATIVE · SHORT MEMORY",
+  );
+  assert.notEqual(elements.get("#pointcloud-3d-status").textContent, "SENSOR FAULT");
+
+  const blocked = staleBlockedPresentation("sensor_fault");
+  panel.presentation = blocked;
+  panel.updateDiagnostics(blocked);
+  panel.draw();
+
+  assert.equal(elements.get("#pose-mode-value").textContent, "--");
+  assert.equal(elements.get("#pointcloud-3d-status").textContent, "SENSOR FAULT");
 });
 
 test("every blocked reason replaces retained live warning with red stop copy", async (t) => {
