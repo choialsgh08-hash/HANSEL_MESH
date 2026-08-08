@@ -43,6 +43,7 @@ def radar_frame(
     transition="consecutive",
     heatmap=None,
     producer_id="test-radar",
+    calibration_id="radar-clutter-front-test",
 ):
     return RadarFrame(
         header=SensorHeader(
@@ -54,7 +55,7 @@ def radar_frame(
             seq=frame_number + 1,
             monotonic_ns=1_000_000_000 + frame_number,
             frame_id="radar_native",
-            calibration_id="uncalibrated",
+            calibration_id=calibration_id,
         ),
         frame_number=frame_number,
         subframe_number=0,
@@ -258,20 +259,31 @@ class RadarFrontStateTests(unittest.TestCase):
         )
         state.ingest(
             radar_frame(
-                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                [RadarPoint(0.0, 0.09, 0.0, 0.0, 24.0)],
                 frame_number=1,
             )
         )
         clock.value += 0.1
         state.ingest(
             radar_frame(
-                [RadarPoint(0.0, 0.09, 0.0, 0.0)],
+                [RadarPoint(0.0, 0.09, 0.0, 0.0, 24.0)],
                 frame_number=2,
+            )
+        )
+        clock.value += 0.1
+        state.ingest(
+            radar_frame(
+                [RadarPoint(0.0, 0.09, 0.0, 0.0, 24.0)],
+                frame_number=3,
             )
         )
         self.assertEqual(
             state.snapshot()["scene"]["hazard"]["level"],
             "DANGER",
+        )
+        self.assertEqual(
+            len(state.snapshot()["scene"]["rolling_local_map"]["cells"]),
+            1,
         )
 
         state.reset_sensor_sequence_tracking()
@@ -282,6 +294,11 @@ class RadarFrontStateTests(unittest.TestCase):
             reset_scene["diagnostics"]["last_reset_reason"],
             "replay_loop_restart",
         )
+        self.assertEqual(
+            reset_scene["probabilistic_local_map"]["cells"],
+            [],
+        )
+        self.assertEqual(reset_scene["rolling_local_map"]["cells"], [])
 
         clock.value += 0.1
         state.ingest(
@@ -322,6 +339,18 @@ class RadarFrontStateTests(unittest.TestCase):
         ):
             self.assertIn(field, snapshot)
         self.assertIn("scene", snapshot)
+        self.assertEqual(snapshot["version"], 1)
+        self.assertIn("grid", snapshot["scene"])
+        self.assertIn("frame", snapshot)
+        self.assertEqual(
+            snapshot["scene"]["pose_mode"],
+            "robot_relative_short_memory",
+        )
+        self.assertEqual(
+            snapshot["scene"]["probabilistic_local_map"]["resolution_m"],
+            0.05,
+        )
+        json.dumps(snapshot, allow_nan=False)
 
     def test_default_ti_axes_map_y_forward_and_x_right(self):
         clock = FakeClock()
@@ -332,6 +361,7 @@ class RadarFrontStateTests(unittest.TestCase):
             z_m=0.3,
             radial_velocity_mps=-0.4,
             snr_db=17.0,
+            noise_db=6.0,
         )
         self.assertTrue(state.ingest(radar_frame([point])))
         frame = state.snapshot()["frame"]
@@ -343,12 +373,16 @@ class RadarFrontStateTests(unittest.TestCase):
                 "height_m",
                 "radial_velocity_mps",
                 "snr_db",
+                "noise_db",
             ],
         )
         mapped = frame["points"][0]
         self.assertEqual(mapped[0], 2.0)
         self.assertEqual(mapped[1], 1.0)
         self.assertEqual(mapped[2], 0.3)
+        self.assertEqual(mapped[3], -0.4)
+        self.assertEqual(mapped[4], 17.0)
+        self.assertEqual(mapped[5], 6.0)
         self.assertEqual(frame["projection_mode"], "range_azimuth_2d")
         self.assertFalse(frame["elevation_used"])
         self.assertTrue(frame["point_cloud_3d_available"])
@@ -989,7 +1023,7 @@ class RadarFrontStateTests(unittest.TestCase):
         self.assertEqual(occupancy["history_window_ms"], 1000)
         self.assertEqual(occupancy["semantics"], "return_evidence_only_unknown_elsewhere")
         self.assertEqual(
-            sorted(point[5] for point in occupancy["points"]),
+            sorted(point[6] for point in occupancy["points"]),
             [0, 600],
         )
 
@@ -1294,7 +1328,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["scene"]["schema_version"], 1)
             self.assertEqual(
                 payload["scene"]["pose_mode"],
-                "robot_relative",
+                "robot_relative_short_memory",
             )
             with urlopen(base + "/", timeout=2) as response:
                 html = response.read().decode("utf-8")

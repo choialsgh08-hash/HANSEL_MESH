@@ -261,6 +261,11 @@ class RadarFrontState:
                                 if point.snr_db is None
                                 else round(point.snr_db, 3)
                             ),
+                            (
+                                None
+                                if point.noise_db is None
+                                else round(point.noise_db, 3)
+                            ),
                         ],
                     )
                 )
@@ -322,6 +327,7 @@ class RadarFrontState:
                     "height_m",
                     "radial_velocity_mps",
                     "snr_db",
+                    "noise_db",
                 ],
                 "projection_mode": "range_azimuth_2d",
                 "elevation_used": False,
@@ -511,6 +517,7 @@ class RadarFrontState:
                 "height_m",
                 "radial_velocity_mps",
                 "snr_db",
+                "noise_db",
                 "age_ms",
                 "persistence",
             ],

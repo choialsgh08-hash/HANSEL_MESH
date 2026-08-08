@@ -1,4 +1,5 @@
 import base64
+from dataclasses import replace
 import math
 from pathlib import Path
 import unittest
@@ -13,12 +14,14 @@ from common.sensor_contract import (
 from monitor.radar_scene import RadarHazardEvaluator, RadarSceneEstimator
 from sensors.mission_log import iter_replay
 from sensors.radar_calibration import (
+    ClutterPointCluster,
     RadarClutterModel,
     build_clutter_model,
 )
 
 
 PROFILE_ID = "radar-scene-test-profile"
+CALIBRATION_ID = "radar-clutter-scene-test"
 RANGE_BINS = 32
 AZIMUTH_BINS = 16
 RANGE_STEP_M = 0.09765625
@@ -37,11 +40,24 @@ def load_real_fixture() -> tuple[RadarFrame, ...]:
     )
 
 
+def bind_calibration(
+    frames: tuple[RadarFrame, ...],
+    calibration_id: str,
+) -> tuple[RadarFrame, ...]:
+    return tuple(
+        replace(
+            frame,
+            header=replace(frame.header, calibration_id=calibration_id),
+        )
+        for frame in frames
+    )
+
+
 def clutter_model() -> RadarClutterModel:
     cells = RANGE_BINS * AZIMUTH_BINS
     return RadarClutterModel(
         schema_version=1,
-        calibration_id="radar-clutter-scene-test",
+        calibration_id=CALIBRATION_ID,
         profile_id=PROFILE_ID,
         axes=RadarAxes(),
         range_bins=RANGE_BINS,
@@ -80,6 +96,7 @@ def radar_frame(
     frame_number=1,
     frame_transition="consecutive",
     profile_id=PROFILE_ID,
+    calibration_id=CALIBRATION_ID,
     dropped_frames_since_previous=0,
 ) -> RadarFrame:
     return RadarFrame(
@@ -92,6 +109,7 @@ def radar_frame(
             seq=frame_number,
             monotonic_ns=frame_number * 100_000_000,
             frame_id="radar_native",
+            calibration_id=calibration_id,
         ),
         frame_number=frame_number,
         subframe_number=0,
@@ -103,6 +121,37 @@ def radar_frame(
         profile_id=profile_id,
         heatmap=heatmap,
     )
+
+
+def seed_probability_cell(
+    estimator: RadarSceneEstimator,
+    producer_id: str = "radar-scene-producer",
+    start: float = 1.0,
+) -> None:
+    for frame_number in range(1, 4):
+        estimator.ingest(
+            point_frame(
+                0.30,
+                frame_number=frame_number,
+                snr_db=24.0,
+                producer_id=producer_id,
+            ),
+            received_at=start + frame_number * 0.125,
+        )
+
+
+def assert_probability_maps_empty(
+    test_case: unittest.TestCase,
+    scene: dict[str, object],
+) -> None:
+    test_case.assertEqual(scene["probabilistic_local_map"]["cells"], [])
+    test_case.assertEqual(scene["rolling_local_map"]["cells"], [])
+
+
+def confirmed_probability_scene_fixture() -> dict[str, object]:
+    estimator = calibrated_estimator()
+    seed_probability_cell(estimator)
+    return estimator.snapshot(now=1.375)
 
 
 def frame_with_forward_ranges(*ranges_m: float) -> RadarFrame:
@@ -214,6 +263,7 @@ def point_frame(
     *,
     frame_number: int = 1,
     snr_db: float = 20.0,
+    **frame_kwargs,
 ) -> RadarFrame:
     return radar_frame(
         (
@@ -226,6 +276,7 @@ def point_frame(
             ),
         ),
         frame_number=frame_number,
+        **frame_kwargs,
     )
 
 
@@ -425,7 +476,7 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         scene = calibrated_estimator().snapshot()
 
         self.assertEqual(scene["schema_version"], 1)
-        self.assertEqual(scene["pose_mode"], "robot_relative")
+        self.assertEqual(scene["pose_mode"], "robot_relative_short_memory")
         self.assertEqual(
             {
                 key: scene["grid"][key]
@@ -444,6 +495,135 @@ class RadarSceneEstimatorTests(unittest.TestCase):
                 "origin_forward_cell": 0,
                 "origin_lateral_cell": 30,
             },
+        )
+
+    def test_two_hit_point_ghost_never_enters_probability_map(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(
+            point_frame(0.30, frame_number=1, snr_db=24.0),
+            received_at=1.000,
+        )
+        estimator.ingest(
+            point_frame(0.30, frame_number=2, snr_db=24.0),
+            received_at=1.125,
+        )
+
+        self.assertEqual(
+            estimator.snapshot(now=1.125)["probabilistic_local_map"]["cells"],
+            [],
+        )
+
+    def test_two_weak_hits_plus_one_strong_hit_never_enter_probability_map(self):
+        estimator = calibrated_estimator()
+        for frame_number, snr_db in ((1, 15.0), (2, 15.0), (3, 24.0)):
+            estimator.ingest(
+                point_frame(0.30, frame_number=frame_number, snr_db=snr_db),
+                received_at=1.0 + frame_number * 0.125,
+            )
+
+        scene = estimator.snapshot(now=1.375)
+
+        self.assertTrue(scene["tracks"][0]["point_confirmed"])
+        self.assertFalse(scene["tracks"][0]["map_confirmed"])
+        self.assertEqual(scene["probabilistic_local_map"]["cells"], [])
+
+    def test_three_of_five_point_enters_probability_map(self):
+        local_map = confirmed_probability_scene_fixture()[
+            "probabilistic_local_map"
+        ]
+
+        self.assertEqual(local_map["resolution_m"], 0.05)
+        self.assertEqual(local_map["occupied_threshold"], 0.75)
+        occupied = [cell for cell in local_map["cells"] if cell["occupied"]]
+        self.assertEqual(len(occupied), 1)
+        self.assertAlmostEqual(occupied[0]["probability"], 0.80, places=3)
+        self.assertEqual(occupied[0]["hits"], 1)
+
+    def test_probability_map_decays_and_expires_without_new_ingest(self):
+        estimator = calibrated_estimator()
+        seed_probability_cell(estimator)
+
+        self.assertFalse(
+            estimator.snapshot(now=2.375)["probabilistic_local_map"]["cells"][0][
+                "occupied"
+            ]
+        )
+        self.assertEqual(
+            estimator.snapshot(now=3.875)["probabilistic_local_map"]["cells"],
+            [],
+        )
+
+    def test_rolling_map_is_exact_occupied_alias(self):
+        scene = confirmed_probability_scene_fixture()
+        occupied = [
+            cell
+            for cell in scene["probabilistic_local_map"]["cells"]
+            if cell["occupied"]
+        ]
+
+        self.assertEqual(scene["rolling_local_map"]["cells"], occupied)
+        self.assertEqual(
+            scene["rolling_local_map"]["retention"],
+            "probability_decay_with_ttl",
+        )
+
+    def test_raw_and_filter_stage_counts_have_distinct_semantics(self):
+        model = RadarClutterModel(
+            **{
+                **clutter_model().__dict__,
+                "point_clusters": (
+                    ClutterPointCluster(
+                        forward_m=0.10,
+                        lateral_m=0.0,
+                        height_m=0.0,
+                        radius_m=0.03,
+                        observation_fraction=1.0,
+                    ),
+                ),
+            }
+        )
+        estimator = RadarSceneEstimator(RadarAxes(), model)
+        estimator.ingest(
+            radar_frame(
+                (
+                    RadarPoint(0.0, 0.10, 0.0, 0.0, 24.0),
+                    RadarPoint(0.0, 0.30, 0.0, 0.0, 3.0),
+                    RadarPoint(0.0, 0.40, 0.0, 0.0, 24.0),
+                )
+            ),
+            received_at=1.0,
+        )
+
+        diagnostics = estimator.snapshot(now=1.0)["diagnostics"]
+
+        self.assertEqual(diagnostics["raw_point_count"], 3)
+        self.assertEqual(diagnostics["self_clutter_rejected_count"], 1)
+        self.assertEqual(diagnostics["quality_gate_rejected_count"], 1)
+        self.assertEqual(diagnostics["scene_point_count"], 1)
+
+    def test_calibration_rejected_frame_still_reports_raw_input_count(self):
+        estimator = mismatched_estimator()
+        estimator.ingest(
+            radar_frame(
+                (
+                    RadarPoint(0.0, 0.30, 0.0, 0.0, 24.0),
+                    RadarPoint(0.0, 0.40, 0.0, 0.0, 24.0),
+                )
+            ),
+            received_at=1.0,
+        )
+
+        scene = estimator.snapshot(now=1.0)
+
+        self.assertEqual(scene["calibration_status"], "profile_mismatch")
+        self.assertEqual(scene["diagnostics"]["raw_point_count"], 2)
+        self.assertEqual(
+            scene["diagnostics"]["self_clutter_rejected_count"],
+            0,
+        )
+        self.assertEqual(
+            scene["diagnostics"]["quality_gate_rejected_count"],
+            0,
         )
 
     def test_heatmap_never_invents_height(self):
@@ -648,25 +828,6 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         motion = RadarSceneEstimator._estimate_ego_motion(previous, current)
 
         self.assertFalse(motion["applied"])
-
-    def test_rolling_map_keeps_half_centimeter_transform(self):
-        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-        estimator._rolling_map_cells[(80, 0)] = {
-            "forward_m": 0.40,
-            "lateral_m": 0.0,
-            "distance_m": 0.40,
-            "range_uncertainty_m": 0.0,
-            "confidence": 1.0,
-            "source": "point",
-            "hits": 2,
-            "_last_seen_ns": estimator._seconds_to_ns(1.0),
-        }
-
-        estimator._transform_tracks(-0.005, 0.0, 0.0)
-        cells = estimator._rolling_map_payload(1.1)
-
-        self.assertEqual(len(cells), 1)
-        self.assertAlmostEqual(cells[0]["forward_m"], 0.395, delta=0.0001)
 
     def test_travel_trail_moves_behind_robot_and_keeps_current_center(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
@@ -905,9 +1066,10 @@ class RadarSceneEstimatorTests(unittest.TestCase):
 
         estimator.ingest(strong_frame(1), received_at=1.0)
         estimator.ingest(strong_frame(2), received_at=1.1)
+        estimator.ingest(strong_frame(3), received_at=1.2)
 
-        retained = estimator.snapshot(now=6.099)
-        expired = estimator.snapshot(now=6.1)
+        retained = estimator.snapshot(now=6.199)
+        expired = estimator.snapshot(now=6.2)
 
         self.assertEqual(len(retained["accumulated_obstacles"]), 1)
         self.assertEqual(retained["obstacle_memory_window_ms"], 5000)
@@ -923,56 +1085,6 @@ class RadarSceneEstimatorTests(unittest.TestCase):
 
         self.assertTrue(scene["obstacle_tracks"])
         self.assertEqual(scene["accumulated_obstacles"], [])
-
-    def test_rolling_map_retains_strong_obstacle_inside_fifty_centimeters(self):
-        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-        for frame_number, received_at in ((1, 1.0), (2, 1.1), (3, 1.2)):
-            estimator.ingest(
-                radar_frame(
-                    (
-                        RadarPoint(
-                            x_m=0.0,
-                            y_m=0.40,
-                            z_m=0.0,
-                            radial_velocity_mps=0.0,
-                            snr_db=30.0,
-                        ),
-                    ),
-                    frame_number=frame_number,
-                ),
-                received_at=received_at,
-            )
-
-        rolling = estimator.snapshot(now=60.0)["rolling_local_map"]
-
-        self.assertEqual(rolling["radius_m"], 0.50)
-        self.assertEqual(rolling["retention"], "until_outside_radius_or_scene_reset")
-        self.assertTrue(rolling["motion_relative"])
-        self.assertEqual(len(rolling["cells"]), 1)
-        self.assertGreater(rolling["cells"][0]["age_ms"], 50_000)
-
-    def test_rolling_map_moves_and_rotates_around_robot_center(self):
-        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-        estimator._rolling_map_cells[(16, 0)] = {
-            "forward_m": 0.40,
-            "lateral_m": 0.0,
-            "distance_m": 0.40,
-            "range_uncertainty_m": 0.0,
-            "confidence": 1.0,
-            "source": "point",
-            "hits": 2,
-            "_last_seen_ns": estimator._seconds_to_ns(1.0),
-        }
-
-        estimator._transform_tracks(-0.10, 0.0, math.radians(90.0))
-        cells = estimator._rolling_map_payload(1.1)
-
-        self.assertEqual(len(cells), 1)
-        self.assertAlmostEqual(cells[0]["forward_m"], -0.10, delta=0.001)
-        self.assertAlmostEqual(cells[0]["lateral_m"], 0.40, delta=0.001)
-
-        estimator._transform_tracks(-0.30, 0.0, 0.0)
-        self.assertEqual(estimator._rolling_map_payload(1.2), [])
 
     def test_near_obstacle_expires_from_path_after_one_second(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
@@ -1008,7 +1120,10 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             scene["persistent_near_obstacle_memory"]["window_ms"],
             5000,
         )
-        self.assertTrue(any(base64.b64decode(scene["grid"]["data_base64"])))
+        self.assertEqual(
+            set(base64.b64decode(scene["grid"]["data_base64"])),
+            {0},
+        )
 
     def test_path_replans_without_holding_the_whole_route(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
@@ -1336,6 +1451,143 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
             self.assertFalse(scene["tracks"])
 
+    def test_calibration_mismatch_clears_all_evidence(self):
+        estimator = calibrated_estimator()
+        seed_probability_cell(estimator)
+        before = estimator.snapshot(now=1.375)
+        self.assertEqual(len(before["rolling_local_map"]["cells"]), 1)
+
+        estimator.ingest(
+            point_frame(
+                0.30,
+                frame_number=4,
+                snr_db=24.0,
+                calibration_id="different-calibration",
+            ),
+            received_at=1.5,
+        )
+        scene = estimator.snapshot(now=1.5)
+
+        self.assertEqual(scene["calibration_status"], "calibration_mismatch")
+        assert_probability_maps_empty(self, scene)
+        self.assertEqual(scene["tracks"], [])
+        self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
+        self.assertGreater(
+            scene["diagnostics"]["scene_epoch"],
+            before["diagnostics"]["scene_epoch"],
+        )
+
+    def test_scene_epoch_is_stable_until_a_reset_boundary(self):
+        estimator = calibrated_estimator()
+        self.assertEqual(estimator.snapshot(now=1.0)["diagnostics"]["scene_epoch"], 0)
+
+        estimator.ingest(point_frame(0.30), received_at=1.0)
+        self.assertEqual(estimator.snapshot(now=1.0)["diagnostics"]["scene_epoch"], 0)
+        self.assertEqual(estimator.snapshot(now=1.1)["diagnostics"]["scene_epoch"], 0)
+
+        estimator.reset("operator_reset")
+        self.assertEqual(estimator.snapshot(now=1.1)["diagnostics"]["scene_epoch"], 1)
+        estimator.ingest(point_frame(0.30, frame_number=2), received_at=1.2)
+        self.assertEqual(estimator.snapshot(now=1.2)["diagnostics"]["scene_epoch"], 1)
+
+    def test_explicit_reset_clears_probability_maps_and_advances_epoch(self):
+        estimator = calibrated_estimator()
+        seed_probability_cell(estimator)
+        before = estimator.snapshot(now=1.375)
+        self.assertEqual(len(before["rolling_local_map"]["cells"]), 1)
+
+        estimator.reset("operator_reset")
+        scene = estimator.snapshot(now=1.375)
+
+        assert_probability_maps_empty(self, scene)
+        self.assertGreater(
+            scene["diagnostics"]["scene_epoch"],
+            before["diagnostics"]["scene_epoch"],
+        )
+
+    def test_producer_change_clears_probability_maps_and_advances_epoch(self):
+        estimator = calibrated_estimator()
+        seed_probability_cell(estimator)
+        before = estimator.snapshot(now=1.375)
+        self.assertEqual(len(before["rolling_local_map"]["cells"]), 1)
+
+        estimator.ingest(
+            point_frame(
+                0.30,
+                frame_number=1,
+                producer_id="new-producer",
+            ),
+            received_at=1.5,
+        )
+        scene = estimator.snapshot(now=1.5)
+
+        assert_probability_maps_empty(self, scene)
+        self.assertGreater(
+            scene["diagnostics"]["scene_epoch"],
+            before["diagnostics"]["scene_epoch"],
+        )
+
+    def test_duplicate_and_out_of_order_clear_probability_maps(self):
+        for transition in ("duplicate", "reset_or_out_of_order"):
+            with self.subTest(transition=transition):
+                estimator = calibrated_estimator()
+                seed_probability_cell(estimator)
+                before = estimator.snapshot(now=1.375)
+                self.assertEqual(len(before["rolling_local_map"]["cells"]), 1)
+
+                estimator.ingest(
+                    point_frame(
+                        0.30,
+                        frame_number=3,
+                        frame_transition=transition,
+                    ),
+                    received_at=1.5,
+                )
+                scene = estimator.snapshot(now=1.5)
+
+                assert_probability_maps_empty(self, scene)
+                self.assertGreater(
+                    scene["diagnostics"]["scene_epoch"],
+                    before["diagnostics"]["scene_epoch"],
+                )
+
+    def test_profile_mismatch_clears_probability_maps_and_advances_epoch(self):
+        estimator = calibrated_estimator()
+        seed_probability_cell(estimator)
+        before = estimator.snapshot(now=1.375)
+        self.assertEqual(len(before["rolling_local_map"]["cells"]), 1)
+
+        estimator.ingest(
+            point_frame(
+                0.30,
+                frame_number=4,
+                profile_id="different-profile",
+            ),
+            received_at=1.5,
+        )
+        scene = estimator.snapshot(now=1.5)
+
+        self.assertEqual(scene["calibration_status"], "profile_mismatch")
+        assert_probability_maps_empty(self, scene)
+        self.assertGreater(
+            scene["diagnostics"]["scene_epoch"],
+            before["diagnostics"]["scene_epoch"],
+        )
+
+    def test_source_fault_clears_probability_maps_and_advances_epoch(self):
+        estimator = calibrated_estimator()
+        seed_probability_cell(estimator)
+        before = estimator.snapshot(now=1.375)
+        self.assertEqual(len(before["rolling_local_map"]["cells"]), 1)
+
+        scene = estimator.snapshot(source_status="fault", now=1.5)
+
+        assert_probability_maps_empty(self, scene)
+        self.assertGreater(
+            scene["diagnostics"]["scene_epoch"],
+            before["diagnostics"]["scene_epoch"],
+        )
+
     def test_zero_returns_and_heatmap_only_evidence_remain_unknown(self):
         estimator = calibrated_estimator()
         estimator.ingest(empty_frame(), received_at=40.0)
@@ -1506,14 +1758,15 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         )
 
     def test_real_977cm_clutter_is_rejected_without_erasing_transient_points(self):
+        fixture = load_real_fixture()
         model = build_clutter_model(
-            load_real_fixture(),
+            fixture,
             RadarAxes(),
             min_frames=6,
         )
         estimator = RadarSceneEstimator(RadarAxes(), model)
         kept = rejected = danger_frames = 0
-        for frame in load_real_fixture():
+        for frame in bind_calibration(fixture, model.calibration_id):
             estimator.ingest(frame)
             scene = estimator.snapshot()
             kept += scene["diagnostics"]["scene_point_count"]

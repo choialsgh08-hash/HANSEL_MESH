@@ -101,6 +101,15 @@ class RadarStackProcessesTests(unittest.TestCase):
             calibration_path=Path("clutter.json"),
             run_id="run-1",
         )
+        load_model_patcher = mock.patch(
+            "sensors.radar_stack_processes.load_clutter_model",
+            create=True,
+            return_value=SimpleNamespace(
+                calibration_id="radar-clutter-live-test"
+            ),
+        )
+        self.load_clutter_model = load_model_patcher.start()
+        self.addCleanup(load_model_patcher.stop)
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -118,9 +127,40 @@ class RadarStackProcessesTests(unittest.TestCase):
                 str(self.paths.raw_index), "--mission-id",
                 "radar-board-live", "--profile-id",
                 "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1",
-                "--calibration-id", "uncalibrated",
+                "--calibration-id", "radar-clutter-live-test",
             ],
         )
+        self.load_clutter_model.assert_called_once_with(
+            self.config.calibration_path
+        )
+
+    def test_capture_calibration_loader_errors_fail_before_child_start(self):
+        for error in (
+            FileNotFoundError("missing calibration"),
+            ValueError("malformed calibration"),
+            RuntimeError("inconsistent calibration"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                started = []
+                manager = RadarStackProcesses(
+                    popen_factory=lambda command, **kwargs: started.append(
+                        (command, kwargs)
+                    )
+                    or FakeProcess()
+                )
+                with mock.patch(
+                    "sensors.radar_stack_processes.load_clutter_model",
+                    side_effect=error,
+                ) as loader:
+                    with self.assertRaises(type(error)):
+                        manager.start_capture(
+                            self.port,
+                            self.paths,
+                            self.config,
+                        )
+
+                loader.assert_called_once_with(self.config.calibration_path)
+                self.assertEqual(started, [])
 
     def test_viewer_command_follows_epoch_with_supervisor_settings(self):
         self.assertEqual(
@@ -1321,18 +1361,24 @@ class RadarStackLauncherTests(unittest.TestCase):
             viewer_stdout=config.output_root / "runtime" / "viewer.out",
             viewer_stderr=config.output_root / "runtime" / "viewer.err",
         )
-        capture_command = build_capture_command(
-            RadarPortIdentity(
-                "COM3",
-                0x0451,
-                0xBEF3,
-                "RI32",
-                "XDS110 Application/User UART",
-                "usb-1",
-            ),
-            paths,
-            config,
-        )
+        with mock.patch(
+            "sensors.radar_stack_processes.load_clutter_model",
+            create=True,
+            return_value=SimpleNamespace(calibration_id="relative-calibration"),
+        ) as loader:
+            capture_command = build_capture_command(
+                RadarPortIdentity(
+                    "COM3",
+                    0x0451,
+                    0xBEF3,
+                    "RI32",
+                    "XDS110 Application/User UART",
+                    "usb-1",
+                ),
+                paths,
+                config,
+            )
+        loader.assert_called_once_with(config.calibration_path)
         viewer_command = build_viewer_command(paths, config)
         self.assertEqual(
             Path(capture_command[capture_command.index("--output") + 1]),

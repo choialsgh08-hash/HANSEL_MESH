@@ -89,7 +89,9 @@
     if (!["ok", "synthetic"].includes(scene.calibration_status)) {
       return { blocked: true, reason: scene.calibration_status };
     }
-    if (scene.pose_mode !== "robot_relative") {
+    if (!["robot_relative", "robot_relative_short_memory"].includes(
+      scene.pose_mode,
+    )) {
       throw new Error("invalid pose contract");
     }
     if (!scene.hazard || !HAZARD_LEVELS.has(scene.hazard.level) ||

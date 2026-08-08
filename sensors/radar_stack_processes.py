@@ -15,6 +15,7 @@ from sensors.radar_parent_lease import (
     ParentDeathLease,
     create_parent_death_lease,
 )
+from sensors.radar_calibration import load_clutter_model
 from sensors.radar_supervisor import (
     EpochPaths,
     RadarSupervisorConfig,
@@ -126,6 +127,7 @@ def build_capture_command(
     *,
     parent_lease_path: Path | None = None,
 ) -> list[str]:
+    clutter_model = load_clutter_model(config.calibration_path)
     command = [
         sys.executable,
         "-m",
@@ -154,7 +156,7 @@ def build_capture_command(
         "--profile-id",
         config.profile_id,
         "--calibration-id",
-        "uncalibrated",
+        clutter_model.calibration_id,
     ]
     if parent_lease_path is not None:
         command.extend(

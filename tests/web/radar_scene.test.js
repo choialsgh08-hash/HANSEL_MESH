@@ -284,6 +284,13 @@ test("requires the robot-relative pose contract and returns validated pose", () 
   }
 });
 
+test("accepts the short-memory pose enum during additive map rollout", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.pose_mode = "robot_relative_short_memory";
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.poseMode, "robot_relative_short_memory");
+});
+
 test("rejects each scene-v1 grid metadata mismatch independently", async (t) => {
   const mismatches = [
     ["resolution_m", 0.1],

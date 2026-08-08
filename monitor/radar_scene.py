@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from common.radar_geometry import RadarAxes
 from common.sensor_contract import RadarFrame
 from sensors.radar_calibration import RadarClutterModel
+from monitor.radar_local_map import ProbabilisticRollingGrid
 from monitor.radar_tracking import (
     DEFAULT_RANGE_STEP_M,
     POINT_HAZARD_CONFIRM_HITS,
@@ -83,9 +84,7 @@ OBSTACLE_CLUSTER_MAX_AZIMUTH_DELTA_DEG = 25.0
 OBSTACLE_CLUSTER_MAX_RANGE_DELTA_M = 0.10
 STABLE_OCCUPANCY_MIN_HITS = 2
 STABLE_OCCUPANCY_TTL_NS = 5_000_000_000
-ROLLING_MAP_RADIUS_M = 0.50
-ROLLING_MAP_RESOLUTION_M = 0.005
-ROLLING_MAP_MIN_HITS = 2
+SHORT_MEMORY_RADIUS_M = 0.50
 TRAVEL_TRAIL_RESOLUTION_M = 0.01
 ACCUMULATED_OBSTACLE_TTL_S = 5.0
 ACCUMULATED_OBSTACLE_TTL_NS = 5_000_000_000
@@ -264,6 +263,7 @@ class RadarSceneEstimator:
         else:
             self._calibration_status = "ok"
         self._scene_point_count = 0
+        self._raw_point_count = 0
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
         self._heatmap_cells_accepted = 0
@@ -281,14 +281,22 @@ class RadarSceneEstimator:
         self._next_accumulated_obstacle_id = 1
         self._stable_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
         self._near_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
-        self._rolling_map_cells: Dict[
-            Tuple[int, int], Dict[str, object]
-        ] = {}
+        self._probability_grid = ProbabilisticRollingGrid(
+            radius_m=0.50,
+            resolution_m=0.05,
+            occupied_threshold=0.75,
+            decay_half_life_s=1.0,
+            ttl_s=2.5,
+            hit_probability=0.80,
+            maximum_probability=0.97,
+        )
+        self._scene_epoch = 0
         self._travel_trail: List[Tuple[float, float]] = [(0.0, 0.0)]
         self._selected_path_curvature: Optional[float] = None
         self._selected_path_since_ns = 0
         self._pending_path_curvature: Optional[float] = None
         self._pending_path_hits = 0
+        self._path_switch_accepted_count = 0
         self._planned_path: Optional[Dict[str, object]] = None
         self._path_stability_status = "initializing"
 
@@ -297,10 +305,12 @@ class RadarSceneEstimator:
         self._producer_id = None
 
     def _clear_evidence(self, reason: str) -> None:
+        self._scene_epoch += 1
         self._tracks.clear()
         self._next_track_id = 1
         self._hazard_evaluator.reset()
         self._scene_point_count = 0
+        self._raw_point_count = 0
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
         self._heatmap_cells_accepted = 0
@@ -315,12 +325,13 @@ class RadarSceneEstimator:
         self._next_accumulated_obstacle_id = 1
         self._stable_cells = {}
         self._near_cells = {}
-        self._rolling_map_cells = {}
+        self._probability_grid.clear()
         self._travel_trail = [(0.0, 0.0)]
         self._selected_path_curvature = None
         self._selected_path_since_ns = 0
         self._pending_path_curvature = None
         self._pending_path_hits = 0
+        self._path_switch_accepted_count = 0
         self._planned_path = None
         self._path_stability_status = "reset"
         self._last_reset_reason = reason
@@ -345,9 +356,14 @@ class RadarSceneEstimator:
         }:
             self.reset(frame.frame_transition)
         self._producer_id = producer_id
+        self._raw_point_count = len(frame.points)
+        self._scene_point_count = 0
+        self._clutter_points_rejected = 0
+        self._quality_gate_rejected_count = 0
         self._calibration_status = self._binding_status(frame)
         if self._calibration_status not in TRUSTED_CALIBRATION_STATUSES:
             self._clear_evidence(self._calibration_status)
+            self._raw_point_count = len(frame.points)
             return
         self._expire_tracks(now)
         heatmap_range_step_m = (
@@ -549,10 +565,10 @@ class RadarSceneEstimator:
             len(heatmap_tracks) - self._heatmap_confirmed_count
         )
         self._update_accumulated_obstacles(now)
+        self._update_probability_map(now)
         if self._motion["status"] not in {"unstable", "low_confidence"}:
             self._update_near_occupancy(now)
             self._update_stable_occupancy(now)
-            self._update_rolling_map(now)
         self._update_stable_path(now)
 
     def snapshot(
@@ -626,7 +642,11 @@ class RadarSceneEstimator:
             for obstacle in self._accumulated_obstacles
         ]
         stable_obstacles = self._stable_obstacle_payload(observed_at)
-        rolling_map_obstacles = self._rolling_map_payload(observed_at)
+        probability_map = self._probability_grid.payload(observed_at)
+        occupied_probability_cells = self._probability_grid.occupied_cells(
+            observed_at
+        )
+        probability_diagnostics = self._probability_grid.diagnostics()
         persistent_near_obstacles = [
             obstacle
             for obstacle in stable_obstacles
@@ -650,7 +670,7 @@ class RadarSceneEstimator:
         for track in [
             *obstacle_tracks,
             *near_obstacles,
-            *persistent_near_obstacles,
+            *occupied_probability_cells,
         ]:
             forward_cell = min(
                 GRID_FORWARD_CELLS - 1,
@@ -681,7 +701,7 @@ class RadarSceneEstimator:
                 )
         return {
             "schema_version": SCENE_SCHEMA_VERSION,
-            "pose_mode": "robot_relative",
+            "pose_mode": "robot_relative_short_memory",
             "projection_mode": SCENE_PROJECTION_MODE,
             "elevation_used": False,
             "calibration_status": self._calibration_status,
@@ -701,16 +721,17 @@ class RadarSceneEstimator:
             "reference_tracks": reference_tracks,
             "accumulated_obstacles": accumulated_obstacles,
             "persistent_near_obstacles": persistent_near_obstacles,
+            "probabilistic_local_map": probability_map,
             "rolling_local_map": {
-                "radius_m": ROLLING_MAP_RADIUS_M,
-                "resolution_m": ROLLING_MAP_RESOLUTION_M,
-                "minimum_hits": ROLLING_MAP_MIN_HITS,
+                "radius_m": 0.50,
+                "resolution_m": 0.05,
+                "minimum_hits": 1,
                 "motion_relative": True,
-                "retention": "until_outside_radius_or_scene_reset",
-                "cells": rolling_map_obstacles,
+                "retention": "probability_decay_with_ttl",
+                "cells": occupied_probability_cells,
             },
             "travel_trail": {
-                "radius_m": ROLLING_MAP_RADIUS_M,
+                "radius_m": SHORT_MEMORY_RADIUS_M,
                 "resolution_m": TRAVEL_TRAIL_RESOLUTION_M,
                 "motion_relative": True,
                 "source": "radar_ego_motion",
@@ -748,8 +769,12 @@ class RadarSceneEstimator:
                 observed_at,
             ),
             "diagnostics": {
+                "raw_point_count": self._raw_point_count,
                 "scene_point_count": self._scene_point_count,
                 "clutter_points_rejected": self._clutter_points_rejected,
+                "self_clutter_rejected_count": (
+                    self._clutter_points_rejected
+                ),
                 "quality_gate_rejected_count": (
                     self._quality_gate_rejected_count
                 ),
@@ -762,6 +787,32 @@ class RadarSceneEstimator:
                 "heatmap_reflection_evidence": (
                     self._heatmap_reflection_count
                 ),
+                "tentative_point_track_count": sum(
+                    track.get("source") == "point"
+                    and not bool(track.get("point_confirmed"))
+                    for track in tracks
+                ),
+                "confirmed_point_track_count": sum(
+                    track.get("source") == "point"
+                    and bool(track.get("point_confirmed"))
+                    for track in tracks
+                ),
+                "heatmap_reflection_count": self._heatmap_reflection_count,
+                "confirmed_heatmap_track_count": (
+                    self._heatmap_confirmed_count
+                ),
+                "probability_active_cell_count": probability_diagnostics[
+                    "active_cell_count"
+                ],
+                "probability_occupied_cell_count": probability_diagnostics[
+                    "occupied_cell_count"
+                ],
+                "probability_decayed_cell_count": probability_diagnostics[
+                    "decayed_cell_count"
+                ],
+                "probability_ttl_expired_cell_count": (
+                    probability_diagnostics["ttl_expired_cell_count"]
+                ),
                 "occupancy_track_count": len(obstacle_tracks),
                 "accumulated_obstacle_count": len(accumulated_obstacles),
                 "stable_occupancy_cell_count": len(stable_obstacles),
@@ -770,7 +821,7 @@ class RadarSceneEstimator:
                     persistent_near_obstacles
                 ),
                 "rolling_local_map_cell_count": len(
-                    rolling_map_obstacles
+                    occupied_probability_cells
                 ),
                 "travel_trail_point_count": len(
                     self._travel_trail_payload()
@@ -780,6 +831,11 @@ class RadarSceneEstimator:
                 "path_length_m": planned_path["length_m"],
                 "path_stability_status": self._path_stability_status,
                 "path_pending_frames": self._pending_path_hits,
+                "path_switch_pending_count": self._pending_path_hits,
+                "path_switch_accepted_count": (
+                    self._path_switch_accepted_count
+                ),
+                "scene_epoch": self._scene_epoch,
                 "last_reset_reason": self._last_reset_reason,
             },
         }
@@ -1106,51 +1162,12 @@ class RadarSceneEstimator:
                 transformed_near_cells[key] = transformed
         self._near_cells = transformed_near_cells
 
-        transformed_rolling_cells: Dict[
-            Tuple[int, int], Dict[str, object]
-        ] = {}
-        for cell in self._rolling_map_cells.values():
-            forward, lateral = transform(
-                (float(cell["forward_m"]), float(cell["lateral_m"]))
-            )
-            if math.hypot(forward, lateral) > ROLLING_MAP_RADIUS_M:
-                continue
-            key = (
-                round(forward / ROLLING_MAP_RESOLUTION_M),
-                round(lateral / ROLLING_MAP_RESOLUTION_M),
-            )
-            transformed = {
-                **cell,
-                "forward_m": key[0] * ROLLING_MAP_RESOLUTION_M,
-                "lateral_m": key[1] * ROLLING_MAP_RESOLUTION_M,
-                "distance_m": math.hypot(
-                    key[0] * ROLLING_MAP_RESOLUTION_M,
-                    key[1] * ROLLING_MAP_RESOLUTION_M,
-                ),
-            }
-            existing = transformed_rolling_cells.get(key)
-            if existing is None:
-                transformed_rolling_cells[key] = transformed
-            else:
-                existing["hits"] = min(
-                    255, int(existing["hits"]) + int(cell["hits"])
-                )
-                existing["confidence"] = max(
-                    float(existing["confidence"]),
-                    float(cell["confidence"]),
-                )
-                existing["_last_seen_ns"] = max(
-                    int(existing["_last_seen_ns"]),
-                    int(cell["_last_seen_ns"]),
-                )
-        self._rolling_map_cells = transformed_rolling_cells
-
         transformed_trail = [
             transformed
             for point in self._travel_trail
             for transformed in [transform(point)]
             if math.hypot(transformed[0], transformed[1])
-            <= ROLLING_MAP_RADIUS_M
+            <= SHORT_MEMORY_RADIUS_M
         ]
         if not transformed_trail:
             transformed_trail = [(0.0, 0.0)]
@@ -1250,7 +1267,11 @@ class RadarSceneEstimator:
             < ACCUMULATED_OBSTACLE_TTL_NS
         ]
 
-    def _strong_updated_tracks(self) -> List[Dict[str, object]]:
+    def _strong_updated_tracks(
+        self,
+        *,
+        require_point_map_confirmation: bool = True,
+    ) -> List[Dict[str, object]]:
         strong: List[Dict[str, object]] = []
         for track in self._tracks:
             if track.get("classification") != "confirmed_obstacle":
@@ -1265,7 +1286,13 @@ class RadarSceneEstimator:
                 continue
             confidence = float(track["confidence"])
             if source == "point":
-                if confidence < ACCUMULATED_POINT_MIN_CONFIDENCE:
+                if (
+                    (
+                        require_point_map_confirmation
+                        and track.get("map_confirmed") is not True
+                    )
+                    or confidence < ACCUMULATED_POINT_MIN_CONFIDENCE
+                ):
                     continue
             elif (
                 confidence < ACCUMULATED_HEATMAP_MIN_CONFIDENCE
@@ -1279,7 +1306,9 @@ class RadarSceneEstimator:
     def _update_stable_occupancy(self, received_at: float) -> None:
         self._expire_stable_cells(received_at)
         received_at_ns = self._seconds_to_ns(received_at)
-        for track in self._strong_updated_tracks():
+        for track in self._strong_updated_tracks(
+            require_point_map_confirmation=False
+        ):
             forward = float(track["forward_m"])
             lateral = float(track["lateral_m"])
             key = (
@@ -1305,65 +1334,17 @@ class RadarSceneEstimator:
             cell["source"] = str(track["source"])
             cell["_last_seen_ns"] = received_at_ns
 
-    def _update_rolling_map(self, received_at: float) -> None:
-        """Accumulate strong obstacles in a 50 cm robot-centred circle."""
-        received_at_ns = self._seconds_to_ns(received_at)
+    def _update_probability_map(self, received_at: float) -> None:
         for track in self._strong_updated_tracks():
-            forward = float(track["forward_m"])
-            lateral = float(track["lateral_m"])
-            if math.hypot(forward, lateral) > ROLLING_MAP_RADIUS_M:
-                continue
-            key = (
-                round(forward / ROLLING_MAP_RESOLUTION_M),
-                round(lateral / ROLLING_MAP_RESOLUTION_M),
+            self._probability_grid.add_hit(
+                float(track["forward_m"]),
+                float(track["lateral_m"]),
+                float(track["confidence"]),
+                str(track["source"]),
+                float(track.get("range_uncertainty_m", 0.0)),
+                float(track.get("lateral_uncertainty_m", 0.0)),
+                received_at,
             )
-            cell = self._rolling_map_cells.get(key)
-            if cell is None:
-                self._rolling_map_cells[key] = {
-                    "forward_m": key[0] * ROLLING_MAP_RESOLUTION_M,
-                    "lateral_m": key[1] * ROLLING_MAP_RESOLUTION_M,
-                    "distance_m": math.hypot(
-                        key[0] * ROLLING_MAP_RESOLUTION_M,
-                        key[1] * ROLLING_MAP_RESOLUTION_M,
-                    ),
-                    "range_uncertainty_m": 0.0,
-                    "confidence": float(track["confidence"]),
-                    "source": str(track["source"]),
-                    "hits": 1,
-                    "_last_seen_ns": received_at_ns,
-                }
-                continue
-            cell["hits"] = min(255, int(cell["hits"]) + 1)
-            cell["confidence"] = max(
-                float(cell["confidence"]), float(track["confidence"])
-            )
-            cell["source"] = str(track["source"])
-            cell["_last_seen_ns"] = received_at_ns
-
-    def _rolling_map_payload(
-        self,
-        now: float,
-    ) -> List[Dict[str, object]]:
-        now_ns = self._seconds_to_ns(now)
-        return [
-            {
-                key: value
-                for key, value in cell.items()
-                if not key.startswith("_")
-            }
-            | {
-                "age_ms": max(
-                    0,
-                    (now_ns - int(cell["_last_seen_ns"])) // 1_000_000,
-                )
-            }
-            for cell in self._rolling_map_cells.values()
-            if int(cell["hits"]) >= ROLLING_MAP_MIN_HITS
-            and math.hypot(
-                float(cell["forward_m"]),
-                float(cell["lateral_m"]),
-            ) <= ROLLING_MAP_RADIUS_M
-        ]
 
     def _travel_trail_payload(self) -> List[List[float]]:
         points = list(self._travel_trail)
@@ -1547,6 +1528,7 @@ class RadarSceneEstimator:
             status = "replanned"
         else:
             status = "route_changed"
+            self._path_switch_accepted_count += 1
         self._selected_path_curvature = candidate_curvature
         if (
             previous_curvature is None
@@ -1568,7 +1550,7 @@ class RadarSceneEstimator:
         """Fuse immediate confirmed returns with motion-relative strong memory."""
         combined: Dict[Tuple[int, int], Dict[str, object]] = {}
         for obstacle in [
-            *self._rolling_map_payload(now),
+            *self._probability_grid.occupied_cells(now),
             *self._near_obstacle_payload(now),
         ]:
             forward = float(obstacle["forward_m"])
@@ -2446,6 +2428,8 @@ class RadarSceneEstimator:
             != self.clutter_model.axes.signature()
         ):
             return "profile_mismatch"
+        if frame.header.calibration_id != self.clutter_model.calibration_id:
+            return "calibration_mismatch"
         if frame.heatmap is None:
             return "ok"
         return self.clutter_model.binding_status(
