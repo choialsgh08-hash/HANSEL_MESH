@@ -4,7 +4,7 @@
   const UI_BUILD_ID = "20260807-probability-25d-r32";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
-  const CLOSE_MAX_RANGE_M = 0.6;
+  const CLOSE_MAX_RANGE_M = 0.5;
   const DANGER_RANGE_M = 0.1;
   const TRACK_MAX_AGE_MS = 300;
   const NORMAL_COPY =
@@ -905,14 +905,30 @@
       if (blockedPrevious && Array.isArray(blockedPrevious.points) &&
           Array.isArray(blockedPrevious.segments)) {
         for (const segment of blockedPrevious.segments) {
-          strokePath(
-            blockedPrevious.points.slice(
-              segment.start_index,
-              segment.end_index + 1,
-            ),
-            "rgba(255, 81, 81, 0.92)",
-            3.2,
+          const blockedPoints = blockedPrevious.points.slice(
+            segment.start_index,
+            segment.end_index + 1,
           );
+          const blockedColor = "rgba(255, 81, 81, 0.92)";
+          if (blockedPoints.length === 1) {
+            const blockedPoint = window.HanselRadarScene.projectMapPoint(
+              transform,
+              blockedPoints[0][0],
+              blockedPoints[0][1],
+            );
+            ctx.fillStyle = blockedColor;
+            ctx.beginPath();
+            ctx.arc(
+              blockedPoint.x,
+              blockedPoint.y,
+              3.2,
+              0,
+              Math.PI * 2,
+            );
+            ctx.fill();
+          } else {
+            strokePath(blockedPoints, blockedColor, 3.2);
+          }
         }
       }
       if (plannedPath.points.length > 0) {

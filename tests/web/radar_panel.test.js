@@ -742,6 +742,64 @@ test("blocked path segments use original inclusive point indices", () => {
   ]);
 });
 
+test("singleton blocked path segment renders a visible red point", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    forwardMaxM: 0.5, halfWidthM: 0.5,
+  };
+  panel.drawPlannedPath(contexts[0], transform, {
+    points: [[0.0, 0.0], [0.10, 0.0]],
+    minimum_passage_width_m: 0.21,
+    blocked_previous_path: {
+      points: [[0.10, 0.0], [0.20, 0.05], [0.30, 0.05]],
+      segments: [{ start_index: 1, end_index: 1, reason: "confirmed_obstacle" }],
+    },
+  });
+  const blockedPoint = contexts[0].fillCalls.find(
+    (call) => call.fillStyle === "rgba(255, 81, 81, 0.92)",
+  );
+  assert.ok(blockedPoint, "singleton blocked segment must remain visible");
+  assert.deepEqual(blockedPoint.path, [
+    ["arc", 270, 170, 3.2, 0, Math.PI * 2],
+  ]);
+});
+
+test("collision inset includes fifty centimeters and excludes fifty-one", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.tracks = [
+    { source: "point", point_confirmed: true, classification: "confirmed_obstacle",
+      age_ms: 0, distance_m: 0.50, forward_m: 0.50, lateral_m: 0,
+      height_m: 0, height_band: "sensor_level" },
+    { source: "point", point_confirmed: true, classification: "confirmed_obstacle",
+      age_ms: 0, distance_m: 0.51, forward_m: 0.51, lateral_m: 0,
+      height_m: 0, height_band: "sensor_level" },
+  ];
+  panel.presentation = presentation;
+  panel.draw();
+  const labels = contexts[1].fillTextCalls.map(([text]) => String(text));
+  assert.ok(labels.includes("P 50cm"));
+  assert.equal(labels.includes("P 51cm"), false);
+});
+
+test("collision nearest distance excludes evidence beyond fifty centimeters", () => {
+  const { panel, elements } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.tracks = [{
+    source: "point", point_confirmed: true, classification: "confirmed_obstacle",
+    age_ms: 0, distance_m: 0.51, forward_m: 0.51, lateral_m: 0,
+    height_m: 0, height_band: "sensor_level",
+  }];
+  panel.updateText(presentation);
+  assert.equal(elements.get("#collision-distance").textContent, "-- cm");
+
+  presentation.tracks[0].distance_m = 0.50;
+  presentation.tracks[0].forward_m = 0.50;
+  panel.updateText(presentation);
+  assert.equal(elements.get("#collision-distance").textContent, "50 cm");
+});
+
 test("2.5d view excludes tracks beyond fifty centimeters or sixty degrees", () => {
   const { panel, contexts } = makeHarness();
   panel.drawPointCloud25d(contexts[2], 420, 300, [
