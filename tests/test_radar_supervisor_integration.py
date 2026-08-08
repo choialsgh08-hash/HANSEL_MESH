@@ -12,6 +12,7 @@ import time
 from types import SimpleNamespace
 import unittest
 
+from common.radar_geometry import RadarAxes
 from common.sensor_contract import (
     RadarFrame,
     RadarHeatmap,
@@ -19,6 +20,7 @@ from common.sensor_contract import (
     SensorHealth,
 )
 from sensors.mission_log import decode_log_entry, encode_log_entry
+from sensors.radar_calibration import build_clutter_model
 from sensors.radar_stack_processes import ManagedChild, RadarStackProcesses
 from sensors.radar_supervisor import (
     EpochPaths,
@@ -487,6 +489,47 @@ def _write_epoch_records(
     return frame_source, health_source
 
 
+def _write_matching_clutter_model(
+    path: Path,
+    *,
+    profile_id: str,
+    azimuth_bins: int,
+    range_bins: int,
+    range_step_m: float,
+) -> Path:
+    heatmap = RadarHeatmap(
+        data=bytes([37]) * (azimuth_bins * range_bins),
+        range_bins=range_bins,
+        azimuth_bins=azimuth_bins,
+        range_step_m=range_step_m,
+        tlv_type=304,
+        motion_mode="major",
+        floor_db=-90.0,
+        ceiling_db=10.0,
+    )
+    frame = RadarFrame(
+        header=SensorHeader(
+            mission_id="integration-calibration",
+            unit_id="radar-board",
+            boot_id="boot-calibration",
+            producer_id="capture-calibration",
+            stream_id="radar/front",
+            seq=1,
+            monotonic_ns=100_000_000,
+        ),
+        frame_number=1,
+        subframe_number=0,
+        complete=True,
+        dropped_frames_since_previous=0,
+        points=(),
+        profile_id=profile_id,
+        heatmap=heatmap,
+    )
+    model = build_clutter_model((frame,), RadarAxes(), min_frames=1)
+    path.write_bytes(model.canonical_bytes() + b"\n")
+    return path
+
+
 def _events(path: Path) -> list[dict[str, object]]:
     if not path.exists():
         return []
@@ -561,12 +604,30 @@ class RadarSupervisorSubprocessIntegrationTests(unittest.TestCase):
             events_path.mkdir()
             profile = directory / "profile.cfg"
             profile.write_text("sensorStop\nsensorStart\n", encoding="utf-8")
+            profile_id = (
+                "lsdk-05.05.04.02-presence-near-"
+                "heatmap16-elev8-cfar15-8hz-v1"
+            )
+            heatmap_azimuth_bins = 16
+            heatmap_range_bins = 128
+            heatmap_range_step_m = 0.09765625
+            calibration = _write_matching_clutter_model(
+                directory / "clutter-calibration.json",
+                profile_id=profile_id,
+                azimuth_bins=heatmap_azimuth_bins,
+                range_bins=heatmap_range_bins,
+                range_step_m=heatmap_range_step_m,
+            )
             config = RadarSupervisorConfig(
                 repository_root=REPOSITORY_ROOT,
                 output_root=directory / "output",
                 profile_path=profile,
-                calibration_path=directory / "unused-calibration.json",
+                calibration_path=calibration,
                 run_id="subprocess-recovery",
+                profile_id=profile_id,
+                heatmap_azimuth_bins=heatmap_azimuth_bins,
+                heatmap_range_bins=heatmap_range_bins,
+                heatmap_range_step_m=heatmap_range_step_m,
                 xds_serial="RI32",
                 reset_unavailable_reason="integration reset is disabled",
                 first_frame_timeout_s=1.5,
