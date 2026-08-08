@@ -102,8 +102,9 @@ python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
 
 프로필, heatmap shape/range step 또는 axes가 달라지면 모델을 자동 적용하지 않고
 `PROFILE MISMATCH`로 차단한다. 보드 방향, 프로필, 케이블 또는 레이더 주변 고정
-장착물이 바뀌면 빈 장면을 다시 기록해 캘리브레이션한다. 이 클러터 모델의
-`calibration_id`는 `SensorHeader.calibration_id`와 별도다.
+장착물이 바뀌면 빈 장면을 다시 기록해 캘리브레이션한다. 최초 캘리브레이션용
+빈 장면 캡처만 `uncalibrated`를 사용한다. 이후 실제 캡처의
+`SensorHeader.calibration_id`는 선택한 클러터 모델의 `calibration_id`와 일치해야 한다.
 
 기본 축은 TI 좌표의 `+Y` 전방, `+X` 우측이다. 축을 바꾸어 장착했다면
 `radar-calibrate`와 `radar_front.py` 양쪽에 동일한 `--forward-axis`,
@@ -127,7 +128,7 @@ python -m sensors radar-live `
   --raw-output captures\radar-board-live.bin `
   --mission-id radar-board-live `
   --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
-  --calibration-id uncalibrated
+  --calibration-id radar-clutter-adc304fbea2c1e4f
 ```
 
 이 PowerShell은 캡처가 끝날 때까지 닫지 않는다. 출력 요약의

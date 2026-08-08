@@ -450,6 +450,17 @@ class RadarBenchAnnotationTests(unittest.TestCase):
             _write_frontal_bench(root, dropped_seq=5)
             with self.assertRaisesRegex(ValueError, "zero drops"):
                 load_bench_annotations(sidecar_path, log_path, clutter_model())
+            _write_frontal_bench(root, dropped_seq=9)
+            with self.assertRaisesRegex(ValueError, "zero drops"):
+                load_bench_annotations(sidecar_path, log_path, clutter_model())
+
+            log_path, sidecar_path, sidecar = _write_frontal_bench(root)
+            transient = next(window for window in sidecar["windows"]
+                             if window["kind"] == "transient_path")
+            transient.update(start_seq=1, end_seq=3, event_seq=1)
+            sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "predecessor"):
+                load_bench_annotations(sidecar_path, log_path, clutter_model())
 
     def test_one_and_two_frame_ghosts_never_enter_map_but_three_frame_annotation_is_invalid(self):
         target = {"forward_m": 0.30, "lateral_m": 0.0}
@@ -650,25 +661,96 @@ class RadarBenchAnnotationTests(unittest.TestCase):
 
     def test_transient_path_holds_route_and_confirmed_collision_has_zero_frame_delay(self):
         target = {"forward_m": 0.30, "lateral_m": 0.0}
-        frames = [point_frame(0.30, frame_number=index) for index in range(1, 6)]
+        frames = [point_frame(0.30, frame_number=index) for index in range(1, 7)]
         scenes = [_scene_with(calibration="ok") for _ in frames]
-        scenes[4] = _scene_with(
+        scenes[5] = _scene_with(
             calibration="ok", tracks=[_track(0.30)], switch=True,
             status="blocked_near_field", stability="route_changed_blocked")
         windows = [
-            {"id": "transient", "kind": "transient_path", "start_seq": 1,
-             "end_seq": 3, "target": target, "event_seq": 1},
-            {"id": "collision", "kind": "confirmed_collision", "start_seq": 4,
-             "end_seq": 5, "target": target, "evidence_seqs": [4, 5],
-             "confirmation_seq": 5},
+            {"id": "transient", "kind": "transient_path", "start_seq": 2,
+             "end_seq": 4, "target": target, "event_seq": 2},
+            {"id": "collision", "kind": "confirmed_collision", "start_seq": 5,
+             "end_seq": 6, "target": target, "evidence_seqs": [5, 6],
+             "confirmation_seq": 6},
         ]
         report = analyze_records(frames, _ScriptedEstimator(scenes),
                                  bench_annotations=_internal_annotations(frames, windows))
         transient, collision = report["bench"]["windows"]
         self.assertTrue(transient["passed"])
-        self.assertEqual(collision["response_seq"], 5)
+        self.assertEqual(collision["response_seq"], 6)
         self.assertEqual(collision["response_delay_frames"], 0)
         self.assertTrue(collision["passed"])
+
+    def test_transient_path_rejects_first_processed_event_and_event_frame_route_change(self):
+        target = {"forward_m": 0.30, "lateral_m": 0.0}
+        first_frames = [point_frame(0.30, frame_number=index)
+                        for index in range(1, 4)]
+        first_window = {
+            "id": "transient", "kind": "transient_path", "start_seq": 1,
+            "end_seq": 3, "target": target, "event_seq": 1,
+        }
+        with self.assertRaisesRegex(ValueError, "predecessor"):
+            analyze_records(
+                first_frames,
+                _ScriptedEstimator([
+                    _scene_with(calibration="ok", curvature=0.25)
+                    for _ in first_frames
+                ]),
+                bench_annotations=_internal_annotations(first_frames, [first_window]),
+            )
+
+        frames = [point_frame(0.30, frame_number=index)
+                  for index in range(1, 5)]
+        scenes = [_scene_with(calibration="ok", curvature=0.0)] + [
+            _scene_with(calibration="ok", curvature=0.25)
+            for _ in range(3)
+        ]
+        window = {
+            "id": "transient", "kind": "transient_path", "start_seq": 2,
+            "end_seq": 4, "target": target, "event_seq": 2,
+        }
+        transient = analyze_records(
+            frames, _ScriptedEstimator(scenes),
+            bench_annotations=_internal_annotations(frames, [window]),
+        )["bench"]["windows"][0]
+        self.assertFalse(transient["passed"])
+        self.assertTrue(transient["route_identity_changed"])
+        self.assertIn("transient_route_identity_changed", transient["failures"])
+
+    def test_direct_bench_analysis_rejects_duplicate_composite_frame_key(self):
+        frame = point_frame(0.30, frame_number=1)
+        window = {"id": "fixed", "kind": "fixed_target", "start_seq": 1,
+                  "end_seq": 1, "coverage_key": "front_030_metal"}
+        annotations = _internal_annotations([frame], [window])
+
+        with self.assertRaisesRegex(ValueError, "duplicate complete frame key"):
+            analyze_records(
+                [frame, frame],
+                _ScriptedEstimator([
+                    _scene_with(calibration="ok"),
+                    _scene_with(calibration="ok"),
+                ]),
+                bench_annotations=annotations,
+            )
+
+    def test_operational_capture_uses_selected_calibration_model_id(self):
+        guide = (Path(__file__).parents[1] / "docs" / "radar_front_view.md").read_text(
+            encoding="utf-8"
+        )
+        pre_calibration_command = guide.split(
+            "missions\\radar-empty-scene.jsonl", 1
+        )[1].split("```", 1)[0]
+        operational_command = guide.split(
+            "missions\\radar-board-live.jsonl", 1
+        )[1].split("```", 1)[0]
+
+        self.assertIn("--calibration-id uncalibrated", pre_calibration_command)
+        self.assertEqual(guide.count("--calibration-id uncalibrated"), 1)
+        self.assertNotIn("--calibration-id uncalibrated", operational_command)
+        self.assertIn(
+            "--calibration-id radar-clutter-adc304fbea2c1e4f",
+            operational_command,
+        )
 
     def test_collision_rejects_heatmap_only_confirmation(self):
         target = {"forward_m": 0.30, "lateral_m": 0.0}

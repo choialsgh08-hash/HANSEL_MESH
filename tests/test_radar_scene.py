@@ -588,6 +588,7 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             heatmap_track["classification"],
             "confirmed_obstacle",
         )
+        self.assertNotIn("hazard_distance_m", heatmap_track)
 
         cells = scene["probabilistic_local_map"]["cells"]
         self.assertEqual(len(cells), 1)
@@ -1681,6 +1682,22 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             estimator.snapshot(now=10.3)["hazard"]["level"],
             "NORMAL",
         )
+
+    def test_latest_point_hazard_distance_is_distinct_from_robust_position(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(point_frame(0.12, frame_number=1), received_at=20.0)
+        estimator.ingest(point_frame(0.12, frame_number=2), received_at=20.1)
+        estimator.ingest(point_frame(0.09, frame_number=3), received_at=20.2)
+
+        scene = estimator.snapshot(now=20.2)
+        point_track = next(
+            track for track in scene["tracks"] if track["source"] == "point"
+        )
+
+        self.assertEqual(scene["hazard"]["level"], "DANGER")
+        self.assertAlmostEqual(scene["hazard"]["nearest_confirmed_m"], 0.09)
+        self.assertAlmostEqual(point_track["distance_m"], 0.12)
+        self.assertAlmostEqual(point_track["hazard_distance_m"], 0.09)
 
     def test_second_point_in_frame_cannot_overwrite_latched_near_track(self):
         estimator = calibrated_estimator()

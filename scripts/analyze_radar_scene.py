@@ -111,6 +111,14 @@ def _domain(header):
     return tuple(getattr(header, field) for field in _DOMAIN_FIELDS)
 
 
+def _frame_key(record):
+    return (*_domain(record.header), record.header.seq)
+
+
+def _domain_seq_key(domain, seq):
+    return (*tuple(domain), seq)
+
+
 def _target(value, label):
     _keys(value, {"forward_m", "lateral_m"}, label)
     forward = _finite(value["forward_m"], f"{label}.forward_m")
@@ -287,7 +295,7 @@ def load_bench_annotations(path: Path, input_path: Path, clutter_model) -> dict:
         raise ValueError("recording bounds must equal first/last complete frame")
     previous_seq = None
     previous_ns = None
-    by_seq = {}
+    by_key = {}
     for record in complete:
         seq = record.header.seq
         timestamp = record.header.monotonic_ns
@@ -299,36 +307,51 @@ def load_bench_annotations(path: Path, input_path: Path, clutter_model) -> dict:
             raise ValueError("frame profile_id does not match annotations")
         if record.header.calibration_id != annotations["calibration_id"]:
             raise ValueError("frame calibration_id does not match annotations")
-        by_seq[seq] = record
+        by_key[_frame_key(record)] = record
         previous_seq = seq
         previous_ns = timestamp
     duration_s = (complete[-1].header.monotonic_ns - complete[0].header.monotonic_ns) / 1e9
     if duration_s < 60.0:
         raise ValueError("recording duration must be at least 60.0 seconds")
     for window in windows:
-        seqs = [seq for seq in by_seq if window["start_seq"] <= seq <= window["end_seq"]]
+        seqs = [record.header.seq for record in complete
+                if window["start_seq"] <= record.header.seq <= window["end_seq"]]
         if not seqs:
             raise ValueError(f"window {window['id']} contains no complete frame")
         event_groups = []
         if "evidence_seqs" in window:
             event_groups.append(window["evidence_seqs"])
         if window["kind"] == "transient_path":
-            event_groups.append([window["event_seq"], window["event_seq"] + 1,
-                                 window["event_seq"] + 2])
+            event_seq = window["event_seq"]
+            predecessor_key = _domain_seq_key(expected_domain, event_seq - 1)
+            event_key = _domain_seq_key(expected_domain, event_seq)
+            if predecessor_key not in by_key:
+                raise ValueError(
+                    "transient event requires a complete same-domain predecessor"
+                )
+            if event_key not in by_key:
+                raise ValueError("event seq is not a complete processed frame")
+            if by_key[event_key].dropped_frames_since_previous != 0:
+                raise ValueError(
+                    "transient event predecessor must be consecutive with zero drops"
+                )
+            event_groups.append([event_seq, event_seq + 1, event_seq + 2])
         for group in event_groups:
             for offset, seq in enumerate(group):
                 if seq < window["start_seq"] or seq > window["end_seq"]:
                     raise ValueError("event evidence must remain inside its window")
-                if seq not in by_seq:
+                key = _domain_seq_key(expected_domain, seq)
+                if key not in by_key:
                     raise ValueError("event seq is not a complete processed frame")
                 if offset and (seq != group[offset - 1] + 1
-                               or by_seq[seq].dropped_frames_since_previous != 0):
+                               or by_key[key].dropped_frames_since_previous != 0):
                     raise ValueError("event evidence must be consecutive with zero drops")
         if window["kind"] == "removal":
             last_seq = window["last_present_seq"]
-            if last_seq not in by_seq:
+            last_key = _domain_seq_key(expected_domain, last_seq)
+            if last_key not in by_key:
                 raise ValueError("last_present_seq is not a complete frame")
-            deadline = by_seq[last_seq].header.monotonic_ns + 2_500_000_000
+            deadline = by_key[last_key].header.monotonic_ns + 2_500_000_000
             if not any(record.header.monotonic_ns >= deadline
                        and window["start_seq"] <= record.header.seq <= window["end_seq"]
                        for record in complete):
@@ -645,14 +668,27 @@ def _fail(window, message):
 
 def _evaluate_bench(annotations, frames, estimator, report):
     expected_domain = tuple(annotations["_domain"])
-    indexed = {record.header.seq: (record, scene, elapsed)
-               for record, scene, elapsed in frames
-               if _domain(record.header) == expected_domain}
-    ordered_all = [indexed[seq] for seq in sorted(indexed)]
+    indexed = {}
+    for record, scene, elapsed in frames:
+        if _domain(record.header) != expected_domain:
+            continue
+        key = _frame_key(record)
+        if key in indexed:
+            raise ValueError("duplicate complete frame key in bench analysis")
+        indexed[key] = (record, scene, elapsed)
+    ordered_keys = sorted(indexed, key=lambda key: key[-1])
+    ordered_all = [indexed[key] for key in ordered_keys]
+
+    def frame_at(seq):
+        key = _domain_seq_key(expected_domain, seq)
+        if key not in indexed:
+            raise ValueError(f"bench frame {seq} is not complete in the bound domain")
+        return indexed[key]
+
     windows_report = []
     for annotation in annotations["windows"]:
-        selected = [indexed[seq] for seq in sorted(indexed)
-                    if annotation["start_seq"] <= seq <= annotation["end_seq"]]
+        selected = [indexed[key] for key in ordered_keys
+                    if annotation["start_seq"] <= key[-1] <= annotation["end_seq"]]
         result = _window_base(annotation, selected)
         kind = annotation["kind"]
         if kind == "empty":
@@ -732,7 +768,7 @@ def _evaluate_bench(annotations, frames, estimator, report):
                                    target) is not None for _, scene, _ in selected)
             result["probability_map_entries"] = entries
             for seq in annotation["evidence_seqs"]:
-                record, _scene_value, _elapsed = indexed[seq]
+                record, _scene_value, _elapsed = frame_at(seq)
                 if _nearest(_raw_points(record, estimator.axes), target) is None:
                     _fail(result, "missing_raw_target_evidence")
             if entries:
@@ -742,7 +778,7 @@ def _evaluate_bench(annotations, frames, estimator, report):
             last_seq = annotation["last_present_seq"]
             result["last_present_seq"] = last_seq
             first_clear_seq = None
-            last_record, last_scene, _ = indexed[last_seq]
+            last_record, last_scene, _ = frame_at(last_seq)
             if not (_current_confirmed_evidence(last_scene, target) is not None
                     or _nearest(last_scene.get("probabilistic_local_map", {}).get("cells", []),
                                 target) is not None):
@@ -753,7 +789,7 @@ def _evaluate_bench(annotations, frames, estimator, report):
                     break
             persistence = None
             if first_clear_seq is not None:
-                persistence = (indexed[first_clear_seq][0].header.monotonic_ns
+                persistence = (frame_at(first_clear_seq)[0].header.monotonic_ns
                                - last_record.header.monotonic_ns) / 1e6
             deadline = last_record.header.monotonic_ns + 2_500_000_000
             first_at_deadline = next(((record, scene) for record, scene, _ in selected
@@ -765,15 +801,23 @@ def _evaluate_bench(annotations, frames, estimator, report):
         elif kind == "transient_path":
             target = annotation["target"]
             event = annotation["event_seq"]
-            event_frames = [indexed[event + offset] for offset in range(3)]
-            event_index = sorted(indexed).index(event)
-            prior_seq = sorted(indexed)[event_index - 1] if event_index else event
-            baseline = _route_identity(indexed[prior_seq][1])
+            predecessor_key = _domain_seq_key(expected_domain, event - 1)
+            if predecessor_key not in indexed:
+                raise ValueError(
+                    "transient event requires a complete same-domain predecessor"
+                )
+            event_frames = [frame_at(event + offset) for offset in range(3)]
+            if any(record.dropped_frames_since_previous != 0
+                   for record, _, _ in event_frames):
+                raise ValueError(
+                    "transient event evidence must be consecutive with zero drops"
+                )
+            baseline = _route_identity(indexed[predecessor_key][1])
             switches = sum(scene["planned_path"]["switch_accepted"] is True
                            for _, scene, _ in event_frames)
             changed = any(_route_changed(baseline, _route_identity(scene))
                           for _, scene, _ in event_frames)
-            if _nearest(_raw_points(indexed[event][0], estimator.axes), target) is None:
+            if _nearest(_raw_points(frame_at(event)[0], estimator.axes), target) is None:
                 _fail(result, "missing_raw_target_evidence")
             if switches:
                 _fail(result, "transient_path_switch_accepted")
@@ -786,11 +830,11 @@ def _evaluate_bench(annotations, frames, estimator, report):
             evidence = annotation["evidence_seqs"]
             confirmation = annotation["confirmation_seq"]
             for seq in evidence:
-                if _nearest(_raw_points(indexed[seq][0], estimator.axes), target) is None:
+                if _nearest(_raw_points(frame_at(seq)[0], estimator.axes), target) is None:
                     _fail(result, "missing_raw_target_evidence")
-            if _current_confirmed(indexed[evidence[0]][1], target) is not None:
+            if _current_confirmed(frame_at(evidence[0])[1], target) is not None:
                 _fail(result, "collision_confirmed_before_second_evidence_frame")
-            if _current_confirmed(indexed[confirmation][1], target) is None:
+            if _current_confirmed(frame_at(confirmation)[1], target) is None:
                 _fail(result, "collision_not_confirmed_on_second_evidence_frame")
             response = next((record.header.seq for record, scene, _ in selected
                              if scene["planned_path"]["switch_accepted"] is True

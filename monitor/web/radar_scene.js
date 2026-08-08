@@ -187,7 +187,9 @@
       throw new Error("invalid track contract");
     }
     if (track.source === "point") {
-      if (typeof track.point_confirmed !== "boolean" ||
+      if (!Number.isFinite(track.hazard_distance_m) ||
+          track.hazard_distance_m < 0 ||
+          typeof track.point_confirmed !== "boolean" ||
           typeof track.map_confirmed !== "boolean" ||
           track.classification !== (track.point_confirmed
             ? "confirmed_obstacle" : "point_candidate") ||
@@ -197,7 +199,9 @@
           track.height_reference !== "sensor_relative_uncalibrated") {
         throw new Error("invalid track contract");
       }
-    } else if (typeof track.heatmap_confirmed !== "boolean" ||
+    } else if (Object.prototype.hasOwnProperty.call(
+      track, "hazard_distance_m"
+    ) || typeof track.heatmap_confirmed !== "boolean" ||
         track.classification !== (track.heatmap_confirmed
           ? "confirmed_obstacle" : "reflection_evidence") ||
         track.height_m !== null || track.height_band !== "unknown" ||
@@ -450,8 +454,9 @@
     if (scene.hazard.level === "DANGER" && !tracks.some(
       (track) => track.source === "point" &&
         track.point_confirmed === true &&
-        Number.isFinite(track.distance_m) && track.distance_m >= 0 &&
-        track.distance_m <= scene.hazard.threshold_m,
+        Number.isFinite(track.hazard_distance_m) &&
+        track.hazard_distance_m >= 0 &&
+        track.hazard_distance_m <= scene.hazard.threshold_m,
     )) {
       throw new Error("DANGER contract is inconsistent");
     }

@@ -2,7 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
+const path = require("node:path");
 const vm = require("node:vm");
 const sceneApi = require("../../monitor/web/radar_scene.js");
 
@@ -52,6 +54,7 @@ function makePointTrack(overrides = {}) {
     forward_m: 0.40,
     lateral_m: 0.0,
     distance_m: 0.40,
+    hazard_distance_m: 0.40,
     height_m: 0.0,
     height_band: "sensor_level",
     height_reference: "sensor_relative_uncalibrated",
@@ -371,6 +374,9 @@ test("rejects every strict new-mode track violation before freshness filtering",
     ["non-finite lateral", () => makePointTrack({ lateral_m: NaN })],
     ["non-finite distance", () => makePointTrack({ distance_m: Infinity })],
     ["distance/hypot mismatch", () => makePointTrack({ distance_m: 0.402 })],
+    ["missing point hazard distance", () => makePointTrack({ hazard_distance_m: undefined })],
+    ["negative point hazard distance", () => makePointTrack({ hazard_distance_m: -0.01 })],
+    ["non-finite point hazard distance", () => makePointTrack({ hazard_distance_m: Infinity })],
     ["negative confidence", () => makePointTrack({ confidence: -0.01 })],
     ["confidence above one", () => makePointTrack({ confidence: 1.01 })],
     ["missing range uncertainty", () => makePointTrack({ range_uncertainty_m: undefined })],
@@ -390,6 +396,7 @@ test("rejects every strict new-mode track violation before freshness filtering",
     ["missing heatmap confirmation", () => makeHeatmapTrack({ heatmap_confirmed: undefined })],
     ["heatmap invented height", () => makeHeatmapTrack({ height_m: 0, height_band: "sensor_level", height_reference: "sensor_relative_uncalibrated" })],
     ["heatmap invented reference", () => makeHeatmapTrack({ height_reference: "sensor_relative_uncalibrated" })],
+    ["heatmap invented hazard distance", () => makeHeatmapTrack({ hazard_distance_m: 0.09 })],
   ];
   for (const [name, makeTrack] of cases) {
     await t.test(name, () => {
@@ -837,7 +844,11 @@ test("preserves strict hazard and DANGER consistency rules", async (t) => {
   });
   await t.test("DANGER with a fresh confirmed point", () => {
     const snapshot = makeSnapshot();
-    const point = makePointTrack({ forward_m: 0.10, distance_m: 0.10 });
+    const point = makePointTrack({
+      forward_m: 0.10,
+      distance_m: 0.10,
+      hazard_distance_m: 0.10,
+    });
     snapshot.scene.tracks = [point];
     snapshot.scene.obstacle_tracks = [point];
     snapshot.scene.hazard = { level: "DANGER", threshold_m: 0.1, reason: "confirmed" };
@@ -845,6 +856,38 @@ test("preserves strict hazard and DANGER consistency rules", async (t) => {
     assert.equal(parsed.hazard.level, "DANGER");
     assert.equal(parsed.tracks[0].track_id, 1);
   });
+});
+
+test("parses a live producer DANGER snapshot using the current point hazard observation", () => {
+  const repositoryRoot = path.resolve(__dirname, "../..");
+  const source = String.raw`
+import json
+from common.radar_geometry import RadarAxes
+from monitor.radar_scene import RadarSceneEstimator
+from tests.test_radar_scene import point_frame
+
+estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+for frame_number, distance_m in enumerate((0.12, 0.12, 0.09), 1):
+    estimator.ingest(
+        point_frame(distance_m, frame_number=frame_number),
+        received_at=20.0 + frame_number / 10.0,
+    )
+print(json.dumps({
+    "status": "live",
+    "scene": estimator.snapshot(now=20.3),
+}, allow_nan=False))
+`;
+  const result = childProcess.spawnSync("python", ["-B", "-c", source], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const parsed = sceneApi.parseRadarScene(JSON.parse(result.stdout));
+  const point = parsed.tracks.find((track) => track.source === "point");
+  assert.equal(parsed.hazard.level, "DANGER");
+  assert.equal(point.distance_m, 0.12);
+  assert.equal(point.hazard_distance_m, 0.09);
 });
 
 test("projects forward and lateral meters into a centered forward map", () => {

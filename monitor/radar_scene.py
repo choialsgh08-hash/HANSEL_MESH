@@ -2755,7 +2755,6 @@ class RadarSceneEstimator:
                 else "unavailable"
             ),
             "distance_m": math.hypot(forward_m, lateral_m),
-            "hazard_distance_m": math.hypot(forward_m, lateral_m),
             "range_uncertainty_m": range_uncertainty_m,
             "lateral_uncertainty_m": lateral_uncertainty_m,
             "confidence": confidence,
@@ -2794,6 +2793,8 @@ class RadarSceneEstimator:
             "_updated_by_point": point_hit,
             "_updated_by_heatmap": source == "heatmap",
         }
+        if point_hit:
+            track["hazard_distance_m"] = math.hypot(forward_m, lateral_m)
         if source == "heatmap":
             track.update(
                 {
