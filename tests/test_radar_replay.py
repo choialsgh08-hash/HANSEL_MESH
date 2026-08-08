@@ -733,6 +733,42 @@ class RadarBenchAnnotationTests(unittest.TestCase):
                 bench_annotations=annotations,
             )
 
+    def test_direct_bench_analysis_distinguishes_same_seq_across_full_domains(self):
+        bound_frame = point_frame(0.30, frame_number=1)
+        foreign_frame = replace(
+            point_frame(0.45, frame_number=1),
+            header=replace(
+                bound_frame.header,
+                mission_id="foreign-mission",
+                unit_id="foreign-unit",
+                boot_id="foreign-boot",
+                producer_id="foreign-producer",
+                stream_id="foreign-stream",
+            ),
+        )
+        window = {"id": "fixed", "kind": "fixed_target", "start_seq": 1,
+                  "end_seq": 1, "coverage_key": "front_030_metal"}
+
+        report = analyze_records(
+            [bound_frame, foreign_frame],
+            _ScriptedEstimator([
+                _scene_with(
+                    calibration="ok",
+                    tracks=[_track(0.30, map_confirmed=True)],
+                ),
+                _scene_with(calibration="ok"),
+            ]),
+            bench_annotations=_internal_annotations([bound_frame], [window]),
+        )
+        fixed = report["bench"]["windows"][0]
+
+        self.assertEqual(report["frames_processed"], 2)
+        self.assertEqual(fixed["frames_evaluated"], 1)
+        self.assertEqual(fixed["raw_target_samples"], 1)
+        self.assertEqual(fixed["filtered_target_samples"], 1)
+        self.assertEqual(fixed["paired_target_samples"], 1)
+        self.assertEqual(fixed["target_detection_rate"], 1.0)
+
     def test_operational_capture_uses_selected_calibration_model_id(self):
         guide = (Path(__file__).parents[1] / "docs" / "radar_front_view.md").read_text(
             encoding="utf-8"
