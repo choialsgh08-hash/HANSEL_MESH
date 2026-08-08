@@ -13,6 +13,7 @@ from common.sensor_contract import RadarFrame
 from sensors.radar_calibration import RadarClutterModel
 from monitor.radar_local_map import ProbabilisticRollingGrid
 from monitor.radar_motion import RadarMotionEstimator
+from monitor.radar_path import PathSelectionHysteresis
 from monitor.radar_tracking import (
     DEFAULT_RANGE_STEP_M,
     POINT_HAZARD_CONFIRM_HITS,
@@ -43,7 +44,6 @@ PATH_RESOLUTION_M = 0.01
 PATH_MAX_LENGTH_M = 3.0
 PATH_ROBOT_WIDTH_M = 0.15
 PATH_SAFETY_MARGIN_M = 0.03
-PATH_NEAR_FIELD_EXCLUSION_M = 0.12
 PATH_GOAL_LATERAL_M = 0.0
 PATH_GOAL_WEIGHT = 0.8
 PATH_SEARCH_STEP_M = 0.05
@@ -283,12 +283,8 @@ class RadarSceneEstimator:
         )
         self._scene_epoch = 0
         self._travel_trail: List[Tuple[float, float]] = [(0.0, 0.0)]
-        self._selected_path_curvature: Optional[float] = None
-        self._selected_path_since_ns = 0
-        self._pending_path_curvature: Optional[float] = None
-        self._pending_path_hits = 0
-        self._path_switch_accepted_count = 0
-        self._planned_path: Optional[Dict[str, object]] = None
+        self._path_selector = PathSelectionHysteresis(confirm_frames=3)
+        self._planned_path = self._neutral_planned_path("initializing")
         self._path_stability_status = "initializing"
 
     def reset(self, reason: str) -> None:
@@ -317,12 +313,8 @@ class RadarSceneEstimator:
         self._near_cells = {}
         self._probability_grid.clear()
         self._travel_trail = [(0.0, 0.0)]
-        self._selected_path_curvature = None
-        self._selected_path_since_ns = 0
-        self._pending_path_curvature = None
-        self._pending_path_hits = 0
-        self._path_switch_accepted_count = 0
-        self._planned_path = None
+        self._path_selector.reset()
+        self._planned_path = self._neutral_planned_path("reset")
         self._path_stability_status = "reset"
         self._last_reset_reason = reason
 
@@ -610,8 +602,8 @@ class RadarSceneEstimator:
             len(heatmap_tracks) - self._heatmap_confirmed_count
         )
         self._update_accumulated_obstacles(now)
+        self._update_near_occupancy(now)
         if self._motion["status"] not in {"unstable", "low_confidence"}:
-            self._update_near_occupancy(now)
             self._update_stable_occupancy(now)
         self._update_stable_path(now)
 
@@ -700,13 +692,7 @@ class RadarSceneEstimator:
             ) <= PATH_LOCAL_MAX_RANGE_M
         ]
         near_obstacles = self._near_obstacle_payload(observed_at)
-        planned_path = dict(
-            self._planned_path
-            if self._planned_path is not None
-            else self._plan_path(
-                self._planning_obstacle_payload(observed_at)
-            )
-        )
+        planned_path = dict(self._planned_path)
         grid = bytearray(GRID_FORWARD_CELLS * GRID_LATERAL_CELLS)
         # Keep newly confirmed returns visible immediately while retaining the
         # multi-frame stable cells that the path planner trusts.  Duplicate
@@ -874,11 +860,10 @@ class RadarSceneEstimator:
                 "motion_matches": self._motion["matched_points"],
                 "path_length_m": planned_path["length_m"],
                 "path_stability_status": self._path_stability_status,
-                "path_pending_frames": self._pending_path_hits,
-                "path_switch_pending_count": self._pending_path_hits,
-                "path_switch_accepted_count": (
-                    self._path_switch_accepted_count
-                ),
+                "path_pending_frames": planned_path[
+                    "pending_switch_frames"
+                ],
+                **self._path_selector.diagnostics(),
                 "scene_epoch": self._scene_epoch,
                 "last_reset_reason": self._last_reset_reason,
             },
@@ -1249,41 +1234,29 @@ class RadarSceneEstimator:
         received_at_ns = self._seconds_to_ns(received_at)
         for track in self._tracks:
             source = str(track["source"])
-            updated = bool(
-                track.get(
-                    "_updated_by_point"
-                    if source == "point"
-                    else "_updated_by_heatmap"
-                )
-            )
-            if not updated:
+            if source == "point":
+                confirmed = track.get("point_confirmed") is True
+                updated = bool(track.get("_updated_by_point"))
+            elif source == "heatmap":
+                confirmed = track.get("heatmap_confirmed") is True
+                updated = bool(track.get("_updated_by_heatmap"))
+            else:
+                continue
+            if not confirmed or not updated:
                 continue
             confidence = float(track["confidence"])
             if source == "point":
-                confirmed = (
-                    track.get("classification") == "confirmed_obstacle"
-                )
-                if (
-                    confidence
-                    < (
-                        NEAR_POINT_MIN_CONFIDENCE
-                        if confirmed
-                        else NEAR_POINT_REACTIVE_MIN_CONFIDENCE
-                    )
-                ):
+                if confidence < NEAR_POINT_MIN_CONFIDENCE:
                     continue
-            elif (
-                track.get("classification") != "confirmed_obstacle"
-                or confidence < NEAR_HEATMAP_MIN_CONFIDENCE
-            ):
+            elif confidence < NEAR_HEATMAP_MIN_CONFIDENCE:
                 continue
             forward = float(track["forward_m"])
             lateral = float(track["lateral_m"])
             distance = math.hypot(forward, lateral)
             if not (
-                PATH_NEAR_FIELD_EXCLUSION_M
-                <= distance
-                <= PATH_LOCAL_MAX_RANGE_M
+                math.isfinite(forward)
+                and math.isfinite(lateral)
+                and distance <= PATH_LOCAL_MAX_RANGE_M
             ):
                 continue
             if abs(math.degrees(math.atan2(lateral, forward))) > (
@@ -1302,6 +1275,9 @@ class RadarSceneEstimator:
                     "range_uncertainty_m": float(
                         track.get("range_uncertainty_m", 0.0)
                     ),
+                    "lateral_uncertainty_m": float(
+                        track.get("lateral_uncertainty_m", 0.0)
+                    ),
                     "confidence": confidence,
                     "source": source,
                     "hits": 1,
@@ -1311,7 +1287,16 @@ class RadarSceneEstimator:
                 continue
             cell["hits"] = min(255, int(cell["hits"]) + 1)
             cell["confidence"] = max(float(cell["confidence"]), confidence)
-            cell["source"] = source
+            cell["range_uncertainty_m"] = max(
+                float(cell.get("range_uncertainty_m", 0.0)),
+                float(track.get("range_uncertainty_m", 0.0)),
+            )
+            cell["lateral_uncertainty_m"] = max(
+                float(cell.get("lateral_uncertainty_m", 0.0)),
+                float(track.get("lateral_uncertainty_m", 0.0)),
+            )
+            if cell["source"] != source:
+                cell["source"] = "mixed"
             cell["_last_seen_ns"] = received_at_ns
 
     def _expire_near_cells(self, now: float) -> None:
@@ -1401,35 +1386,18 @@ class RadarSceneEstimator:
             else "medium" if confidence >= 0.55
             else "low"
         )
-        candidate_curvature = float(candidate["curvature_per_m"])
         now_ns = self._seconds_to_ns(now)
-        previous_curvature = self._selected_path_curvature
-        if self._selected_path_curvature is None:
-            status = "selected_initial"
-        elif self._motion["status"] in {"unstable", "low_confidence"}:
-            status = "replanned_frozen_map"
-        elif math.isclose(
-            candidate_curvature,
-            self._selected_path_curvature,
-            abs_tol=1e-9,
-        ):
-            status = "replanned"
-        else:
-            status = "route_changed"
-            self._path_switch_accepted_count += 1
-        self._selected_path_curvature = candidate_curvature
-        if (
-            previous_curvature is None
-            or not math.isclose(
-                candidate_curvature,
-                previous_curvature,
-                abs_tol=1e-9,
-            )
-        ):
-            self._selected_path_since_ns = now_ns
-        self._pending_path_curvature = None
-        self._pending_path_hits = 0
-        self._set_planned_path(candidate, status, now_ns)
+        blocked_segments = self._path_collision_segments(
+            self._planned_path,
+            obstacles,
+        )
+        selected = self._path_selector.select(
+            candidate,
+            bool(blocked_segments),
+            blocked_segments,
+            now_ns,
+        )
+        self._set_planned_path(selected, now_ns)
 
     def _planning_obstacle_payload(
         self,
@@ -1437,51 +1405,307 @@ class RadarSceneEstimator:
     ) -> List[Dict[str, object]]:
         """Fuse immediate confirmed returns with motion-relative strong memory."""
         combined: Dict[Tuple[int, int], Dict[str, object]] = {}
-        for obstacle in [
-            *self._probability_grid.occupied_cells(now),
-            *self._near_obstacle_payload(now),
-        ]:
-            forward = float(obstacle["forward_m"])
-            lateral = float(obstacle["lateral_m"])
-            distance = math.hypot(forward, lateral)
-            if (
-                forward <= 0.0
-                or distance > PATH_LOCAL_MAX_RANGE_M
-                or abs(math.degrees(math.atan2(lateral, forward)))
-                > PATH_FOV_AZIMUTH_DEG
-            ):
-                continue
-            key = (
-                round(
-                    float(obstacle["forward_m"])
-                    / NEAR_OCCUPANCY_RESOLUTION_M
-                ),
-                round(
-                    float(obstacle["lateral_m"])
-                    / NEAR_OCCUPANCY_RESOLUTION_M
-                ),
-            )
-            existing = combined.get(key)
-            if existing is None or bool(obstacle.get("reactive")):
-                combined[key] = dict(obstacle)
+        containers = (
+            (
+                self._probability_grid.occupied_cells(now),
+                "probability",
+                GRID_RESOLUTION_M / math.sqrt(2.0),
+            ),
+            (
+                self._near_obstacle_payload(now),
+                "reactive",
+                NEAR_OCCUPANCY_RESOLUTION_M / math.sqrt(2.0),
+            ),
+        )
+        for obstacles, evidence_kind, support_radius_m in containers:
+            for obstacle in obstacles:
+                normalized = self._normalize_planning_obstacle({
+                    **obstacle,
+                    "evidence_kind": evidence_kind,
+                    "support_radius_m": support_radius_m,
+                })
+                forward = float(normalized["forward_m"])
+                lateral = float(normalized["lateral_m"])
+                distance = math.hypot(forward, lateral)
+                if (
+                    not math.isfinite(forward)
+                    or not math.isfinite(lateral)
+                    or forward <= 0.0
+                    or distance > PATH_LOCAL_MAX_RANGE_M
+                    or abs(math.degrees(math.atan2(lateral, forward)))
+                    > PATH_FOV_AZIMUTH_DEG
+                ):
+                    continue
+                key = (
+                    round(forward / NEAR_OCCUPANCY_RESOLUTION_M),
+                    round(lateral / NEAR_OCCUPANCY_RESOLUTION_M),
+                )
+                normalized["forward_m"] = (
+                    key[0] * NEAR_OCCUPANCY_RESOLUTION_M
+                )
+                normalized["lateral_m"] = (
+                    key[1] * NEAR_OCCUPANCY_RESOLUTION_M
+                )
+                existing = combined.get(key)
+                combined[key] = (
+                    normalized
+                    if existing is None
+                    else self._merge_planning_obstacles(existing, normalized)
+                )
         return list(combined.values())
+
+    @staticmethod
+    def _neutral_planned_path(status: str) -> Dict[str, object]:
+        return {
+            "status": status,
+            "stability_status": status,
+            "resolution_m": PATH_RESOLUTION_M,
+            "length_m": 0.0,
+            "curvature_per_m": 0.0,
+            "points": [[0.0, 0.0]],
+            "robot_width_m": PATH_ROBOT_WIDTH_M,
+            "safety_margin_m": PATH_SAFETY_MARGIN_M,
+            "minimum_passage_width_m": (
+                PATH_ROBOT_WIDTH_M + PATH_SAFETY_MARGIN_M * 2.0
+            ),
+            "minimum_hold_ms": 0,
+            "switch_confirm_frames": 3,
+            "pending_switch_frames": 0,
+            "switch_accepted": False,
+            "replan_every_frame": True,
+            "selected_for_ms": 0,
+            "blocked_previous_path": None,
+        }
+
+    @staticmethod
+    def _normalize_planning_obstacle(
+        obstacle: Dict[str, object],
+    ) -> Dict[str, object]:
+        normalized = dict(obstacle)
+        normalized["forward_m"] = float(obstacle["forward_m"])
+        normalized["lateral_m"] = float(obstacle["lateral_m"])
+        for field in (
+            "range_uncertainty_m",
+            "lateral_uncertainty_m",
+            "support_radius_m",
+        ):
+            value = float(obstacle.get(field, 0.0))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{field} must be finite and non-negative")
+            normalized[field] = value
+        normalized["confidence"] = float(obstacle.get("confidence", 0.0))
+        normalized["hits"] = min(255, max(0, int(obstacle.get("hits", 0))))
+        normalized["evidence_kind"] = str(
+            obstacle.get("evidence_kind", "direct")
+        )
+        normalized["source"] = str(obstacle.get("source", "unknown"))
+        return normalized
+
+    @staticmethod
+    def _merge_planning_obstacles(
+        left: Dict[str, object],
+        right: Dict[str, object],
+    ) -> Dict[str, object]:
+        merged = dict(left)
+        for field in (
+            "range_uncertainty_m",
+            "lateral_uncertainty_m",
+            "support_radius_m",
+            "confidence",
+        ):
+            merged[field] = max(float(left[field]), float(right[field]))
+        merged["hits"] = min(255, max(int(left["hits"]), int(right["hits"])))
+        if left["evidence_kind"] != right["evidence_kind"]:
+            merged["evidence_kind"] = "mixed"
+        if left["source"] != right["source"]:
+            merged["source"] = "mixed"
+        return merged
+
+    @staticmethod
+    def _wall_obstacles_linked(
+        left: Dict[str, object],
+        right: Dict[str, object],
+    ) -> bool:
+        left_forward = float(left["forward_m"])
+        left_lateral = float(left["lateral_m"])
+        right_forward = float(right["forward_m"])
+        right_lateral = float(right["lateral_m"])
+        distance = math.hypot(
+            right_forward - left_forward,
+            right_lateral - left_lateral,
+        )
+        link_limit = (
+            OBSTACLE_CLUSTER_LINK_M
+            if left["source"] == right["source"]
+            else OBSTACLE_CLUSTER_CROSS_SOURCE_LINK_M
+        )
+        return (
+            distance <= link_limit
+            and abs(
+                math.hypot(right_forward, right_lateral)
+                - math.hypot(left_forward, left_lateral)
+            ) <= OBSTACLE_CLUSTER_MAX_RANGE_DELTA_M
+            and abs(
+                math.degrees(math.atan2(right_lateral, right_forward))
+                - math.degrees(math.atan2(left_lateral, left_forward))
+            ) <= OBSTACLE_CLUSTER_MAX_AZIMUTH_DELTA_DEG
+        )
+
+    @staticmethod
+    def _interpolate_wall_obstacles(
+        obstacles: Sequence[Dict[str, object]],
+    ) -> Tuple[List[Dict[str, object]], int]:
+        normalized = [
+            RadarSceneEstimator._normalize_planning_obstacle(obstacle)
+            for obstacle in obstacles
+        ]
+        positions: Dict[Tuple[float, float], Dict[str, object]] = {}
+        for obstacle in normalized:
+            key = (
+                float(obstacle["forward_m"]),
+                float(obstacle["lateral_m"]),
+            )
+            existing = positions.get(key)
+            positions[key] = (
+                obstacle
+                if existing is None
+                else RadarSceneEstimator._merge_planning_obstacles(
+                    existing, obstacle
+                )
+            )
+        segment_count = 0
+        for left_index, left in enumerate(normalized):
+            for right in normalized[left_index + 1:]:
+                if not RadarSceneEstimator._wall_obstacles_linked(left, right):
+                    continue
+                segment_count += 1
+                distance = math.hypot(
+                    float(right["forward_m"]) - float(left["forward_m"]),
+                    float(right["lateral_m"]) - float(left["lateral_m"]),
+                )
+                samples = max(
+                    1,
+                    math.ceil(distance / NEAR_OCCUPANCY_RESOLUTION_M),
+                )
+                for sample_index in range(1, samples):
+                    ratio = sample_index / samples
+                    sample = RadarSceneEstimator._merge_planning_obstacles(
+                        left, right
+                    )
+                    sample["forward_m"] = round(
+                        float(left["forward_m"])
+                        + (
+                            float(right["forward_m"])
+                            - float(left["forward_m"])
+                        ) * ratio,
+                        4,
+                    )
+                    sample["lateral_m"] = round(
+                        float(left["lateral_m"])
+                        + (
+                            float(right["lateral_m"])
+                            - float(left["lateral_m"])
+                        ) * ratio,
+                        4,
+                    )
+                    key = (sample["forward_m"], sample["lateral_m"])
+                    existing = positions.get(key)
+                    positions[key] = (
+                        sample
+                        if existing is None
+                        else RadarSceneEstimator._merge_planning_obstacles(
+                            existing, sample
+                        )
+                    )
+        return list(positions.values()), segment_count
+
+    @staticmethod
+    def _obstacle_collision_radii(
+        obstacle: Dict[str, object],
+    ) -> Tuple[float, float]:
+        normalized = RadarSceneEstimator._normalize_planning_obstacle(obstacle)
+        physical_radius = (
+            PATH_ROBOT_WIDTH_M / 2.0
+            + PATH_SAFETY_MARGIN_M
+            + max(
+                float(normalized["range_uncertainty_m"]),
+                float(normalized["lateral_uncertainty_m"]),
+            )
+            + float(normalized["support_radius_m"])
+        )
+        return (
+            physical_radius,
+            physical_radius + PATH_COLLISION_GRID_M / math.sqrt(2.0),
+        )
+
+    @staticmethod
+    def _path_collision_segments(
+        path: Dict[str, object],
+        obstacles: Sequence[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        interpolated, _ = RadarSceneEstimator._interpolate_wall_obstacles(
+            obstacles
+        )
+        blocked_indices: List[Tuple[int, str]] = []
+        for index, point in enumerate(path.get("points", [])):
+            reason = None
+            for obstacle in interpolated:
+                _, effective_radius = (
+                    RadarSceneEstimator._obstacle_collision_radii(obstacle)
+                )
+                if math.hypot(
+                    float(point[0]) - float(obstacle["forward_m"]),
+                    float(point[1]) - float(obstacle["lateral_m"]),
+                ) <= effective_radius:
+                    reason = (
+                        "near_field_overlap"
+                        if math.hypot(
+                            float(obstacle["forward_m"]),
+                            float(obstacle["lateral_m"]),
+                        ) <= effective_radius
+                        else "confirmed_obstacle"
+                    )
+                    break
+            if reason is not None:
+                blocked_indices.append((index, reason))
+        segments: List[Dict[str, object]] = []
+        for index, reason in blocked_indices:
+            if (
+                segments
+                and index == int(segments[-1]["end_index"]) + 1
+                and reason == segments[-1]["reason"]
+            ):
+                segments[-1]["end_index"] = index
+            else:
+                segments.append({
+                    "start_index": index,
+                    "end_index": index,
+                    "reason": reason,
+                })
+        return segments
 
     def _set_planned_path(
         self,
-        path: Dict[str, object],
-        status: str,
+        selection: Dict[str, object],
         now_ns: int,
     ) -> None:
+        path = dict(selection["path"])
+        status = str(selection["status"])
         self._path_stability_status = status
-        held_ms = max(0, (now_ns - self._selected_path_since_ns) // 1_000_000)
+        selected_since_ns = int(selection["selected_since_ns"])
+        held_ms = max(0, (now_ns - selected_since_ns) // 1_000_000)
         self._planned_path = {
             **path,
             "stability_status": status,
             "selected_for_ms": held_ms,
             "minimum_hold_ms": 0,
-            "switch_confirm_frames": 0,
-            "pending_switch_frames": self._pending_path_hits,
+            "switch_confirm_frames": 3,
+            "pending_switch_frames": int(
+                selection["pending_switch_frames"]
+            ),
+            "switch_accepted": bool(selection["switch_accepted"]),
             "replan_every_frame": True,
+            "blocked_previous_path": selection["blocked_previous_path"],
         }
 
     @staticmethod
@@ -1490,33 +1714,21 @@ class RadarSceneEstimator:
         curvatures: Sequence[float] = PATH_CURVATURES,
     ) -> Dict[str, object]:
         base_clearance = PATH_ROBOT_WIDTH_M / 2.0 + PATH_SAFETY_MARGIN_M
-        near_field_excluded = sum(
-            math.hypot(
-                float(track["forward_m"]),
-                float(track["lateral_m"]),
-            ) < PATH_NEAR_FIELD_EXCLUSION_M
+        collision_grid_padding = PATH_COLLISION_GRID_M / math.sqrt(2.0)
+        normalized_obstacles = [
+            RadarSceneEstimator._normalize_planning_obstacle(track)
             for track in obstacle_tracks
-        )
+        ]
         observed_obstacles = [
-            {
-                "forward_m": float(track["forward_m"]),
-                "lateral_m": float(track["lateral_m"]),
-                "source": str(track.get("source", "unknown")),
-            }
-            for track in obstacle_tracks
-            if math.hypot(
-                float(track["forward_m"]),
-                float(track["lateral_m"]),
-            ) >= PATH_NEAR_FIELD_EXCLUSION_M
+            obstacle
+            for obstacle in normalized_obstacles
+            if math.isfinite(float(obstacle["forward_m"]))
+            and math.isfinite(float(obstacle["lateral_m"]))
             and math.hypot(
-                float(track["forward_m"]),
-                float(track["lateral_m"]),
+                float(obstacle["forward_m"]),
+                float(obstacle["lateral_m"]),
             ) <= PATH_LOCAL_MAX_RANGE_M
         ]
-        obstacle_positions = {
-            (float(item["forward_m"]), float(item["lateral_m"]))
-            for item in observed_obstacles
-        }
         cluster_parents = list(range(len(observed_obstacles)))
 
         def find_cluster(index: int) -> int:
@@ -1533,78 +1745,34 @@ class RadarSceneEstimator:
             if left_root != right_root:
                 cluster_parents[right_root] = left_root
 
-        wall_segment_count = 0
         for left_index, left in enumerate(observed_obstacles):
-            left_forward = float(left["forward_m"])
-            left_lateral = float(left["lateral_m"])
-            left_range = math.hypot(left_forward, left_lateral)
-            left_azimuth = math.degrees(
-                math.atan2(left_lateral, left_forward)
-            )
             for right_index in range(
                 left_index + 1, len(observed_obstacles)
             ):
                 right = observed_obstacles[right_index]
-                right_forward = float(right["forward_m"])
-                right_lateral = float(right["lateral_m"])
-                right_range = math.hypot(right_forward, right_lateral)
-                right_azimuth = math.degrees(
-                    math.atan2(right_lateral, right_forward)
-                )
-                distance = math.hypot(
-                    right_forward - left_forward,
-                    right_lateral - left_lateral,
-                )
-                link_limit = (
-                    OBSTACLE_CLUSTER_LINK_M
-                    if left["source"] == right["source"]
-                    else OBSTACLE_CLUSTER_CROSS_SOURCE_LINK_M
-                )
-                if (
-                    distance > link_limit
-                    or abs(right_range - left_range)
-                    > OBSTACLE_CLUSTER_MAX_RANGE_DELTA_M
-                    or abs(right_azimuth - left_azimuth)
-                    > OBSTACLE_CLUSTER_MAX_AZIMUTH_DELTA_DEG
-                ):
-                    continue
-                union_cluster(left_index, right_index)
-                wall_segment_count += 1
-                samples = max(
-                    1,
-                    math.ceil(distance / NEAR_OCCUPANCY_RESOLUTION_M),
-                )
-                for sample_index in range(1, samples):
-                    ratio = sample_index / samples
-                    obstacle_positions.add(
-                        (
-                            round(
-                                left_forward
-                                + (right_forward - left_forward) * ratio,
-                                4,
-                            ),
-                            round(
-                                left_lateral
-                                + (right_lateral - left_lateral) * ratio,
-                                4,
-                            ),
-                        )
-                    )
+                if RadarSceneEstimator._wall_obstacles_linked(left, right):
+                    union_cluster(left_index, right_index)
         cluster_sizes: Dict[int, int] = {}
         for obstacle_index in range(len(observed_obstacles)):
             root = find_cluster(obstacle_index)
             cluster_sizes[root] = cluster_sizes.get(root, 0) + 1
         object_cluster_count = len(cluster_sizes)
         largest_object_cluster = max(cluster_sizes.values(), default=0)
-        obstacles = tuple(obstacle_positions)
+        obstacles, wall_segment_count = (
+            RadarSceneEstimator._interpolate_wall_obstacles(
+                observed_obstacles
+            )
+        )
         blocked_collision_cells: set[Tuple[int, int]] = set()
-        collision_radius = (
-            base_clearance + PATH_COLLISION_GRID_M / math.sqrt(2.0)
-        )
-        collision_cell_radius = math.ceil(
-            collision_radius / PATH_COLLISION_GRID_M
-        )
-        for obstacle_forward, obstacle_lateral in obstacles:
+        for obstacle in obstacles:
+            obstacle_forward = float(obstacle["forward_m"])
+            obstacle_lateral = float(obstacle["lateral_m"])
+            _, collision_radius = (
+                RadarSceneEstimator._obstacle_collision_radii(obstacle)
+            )
+            collision_cell_radius = math.ceil(
+                collision_radius / PATH_COLLISION_GRID_M
+            )
             center_forward = round(
                 obstacle_forward / PATH_COLLISION_GRID_M
             )
@@ -1644,11 +1812,14 @@ class RadarSceneEstimator:
                 forward = float(obstacle["forward_m"])
                 lateral = float(obstacle["lateral_m"])
                 distance = math.hypot(forward, lateral)
-                if distance <= PATH_NEAR_FIELD_EXCLUSION_M:
-                    continue
+                physical_radius, _ = (
+                    RadarSceneEstimator._obstacle_collision_radii(obstacle)
+                )
                 azimuth = math.degrees(math.atan2(lateral, forward))
                 half_width = math.degrees(
-                    math.asin(min(0.95, collision_radius / distance))
+                    math.asin(
+                        min(0.95, physical_radius / max(distance, 1e-9))
+                    )
                 )
                 occupied.append(
                     (
@@ -1982,6 +2153,19 @@ class RadarSceneEstimator:
             smooth_points if smoothing_valid else lattice_points
         )
 
+        near_field_blocked = any(
+            math.hypot(
+                float(obstacle["forward_m"]),
+                float(obstacle["lateral_m"]),
+            ) <= RadarSceneEstimator._obstacle_collision_radii(obstacle)[1]
+            for obstacle in obstacles
+        )
+        if near_field_blocked:
+            points = [[0.0, 0.0]]
+            primitive_path = []
+            goal_state = None
+            smoothing_valid = False
+
         length_m = (len(points) - 1) * PATH_RESOLUTION_M
         initial_curvature = next(
             (
@@ -2006,12 +2190,12 @@ class RadarSceneEstimator:
         if obstacles and points:
             minimum_clearance = min(
                 math.hypot(
-                    point[0] - obstacle_forward,
-                    point[1] - obstacle_lateral,
+                    point[0] - float(obstacle["forward_m"]),
+                    point[1] - float(obstacle["lateral_m"]),
                 )
-                - base_clearance
+                - RadarSceneEstimator._obstacle_collision_radii(obstacle)[0]
                 for point in points
-                for obstacle_forward, obstacle_lateral in obstacles
+                for obstacle in obstacles
             )
         completion = min(
             1.0,
@@ -2058,8 +2242,34 @@ class RadarSceneEstimator:
             ),
             default=0.0,
         )
+        maximum_uncertainty = max(
+            (
+                max(
+                    float(obstacle["range_uncertainty_m"]),
+                    float(obstacle["lateral_uncertainty_m"]),
+                )
+                for obstacle in obstacles
+            ),
+            default=0.0,
+        )
+        maximum_support = max(
+            (float(obstacle["support_radius_m"]) for obstacle in obstacles),
+            default=0.0,
+        )
+        maximum_collision_radius = max(
+            (
+                RadarSceneEstimator._obstacle_collision_radii(obstacle)[1]
+                for obstacle in obstacles
+            ),
+            default=base_clearance + collision_grid_padding,
+        )
         return {
-            "status": "clear" if goal_state is not None else "limited",
+            "status": (
+                "blocked_near_field"
+                if near_field_blocked
+                else "clear" if goal_state is not None
+                else "limited"
+            ),
             "resolution_m": PATH_RESOLUTION_M,
             "length_m": round(length_m, 2),
             "curvature_per_m": round(initial_curvature, 3),
@@ -2098,9 +2308,12 @@ class RadarSceneEstimator:
             "obstacle_cross_source_link_m": (
                 OBSTACLE_CLUSTER_CROSS_SOURCE_LINK_M
             ),
-            "near_field_exclusion_m": PATH_NEAR_FIELD_EXCLUSION_M,
-            "near_field_excluded": near_field_excluded,
-            "range_uncertainty_lateral_inflation_m": 0.0,
+            "near_field_exclusion_m": 0.0,
+            "near_field_excluded": 0,
+            "range_uncertainty_lateral_inflation_m": maximum_uncertainty,
+            "obstacle_support_radius_m": maximum_support,
+            "collision_grid_padding_m": collision_grid_padding,
+            "maximum_collision_radius_m": maximum_collision_radius,
             "goal_forward_m": round(goal_forward_m, 3),
             "goal_lateral_m": round(goal_lateral_m, 3),
             "goal_angle_deg": round(goal_angle_deg, 1),

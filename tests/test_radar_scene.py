@@ -3,7 +3,7 @@ from dataclasses import replace
 import math
 from pathlib import Path
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from common.radar_geometry import RadarAxes
 from common.sensor_contract import (
@@ -918,28 +918,286 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         )
         self.assertEqual(retained[-1], [0.0, 0.0])
 
-    def test_single_high_confidence_point_reacts_without_waiting_for_map(self):
+    def test_single_high_confidence_point_does_not_enter_path(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-        estimator.ingest(
-            radar_frame(
-                (
-                    RadarPoint(
-                        x_m=0.0,
-                        y_m=0.35,
-                        z_m=0.0,
-                        radial_velocity_mps=0.0,
-                        snr_db=30.0,
-                    ),
-                ),
-                frame_number=1,
-            ),
-            received_at=1.0,
-        )
+        estimator.ingest(radar_frame((RadarPoint(0.0, 0.35, 0.0, 0.0, 30.0),),
+                                     frame_number=1), received_at=1.0)
         scene = estimator.snapshot(now=1.0)
 
-        self.assertEqual(scene["tracks"][0]["classification"], "point_candidate")
-        self.assertEqual(len(scene["near_occupancy"]["cells"]), 1)
-        self.assertNotEqual(scene["planned_path"]["curvature_per_m"], 0.0)
+        self.assertEqual(scene["near_occupancy"]["cells"], [])
+        self.assertEqual(scene["planned_path"]["curvature_per_m"], 0.0)
+
+    def test_path_uncertainty_is_added_to_robot_width_margin(self):
+        obstacle = {
+            "forward_m": 0.30, "lateral_m": 0.18,
+            "range_uncertainty_m": 0.04, "lateral_uncertainty_m": 0.08,
+            "support_radius_m": 0.0, "evidence_kind": "direct", "source": "point",
+        }
+        path = RadarSceneEstimator._plan_path([obstacle])
+        self.assertEqual(path["robot_width_m"], 0.15)
+        self.assertEqual(path["safety_margin_m"], 0.03)
+        self.assertEqual(path["minimum_passage_width_m"], 0.21)
+        self.assertEqual(path["range_uncertainty_lateral_inflation_m"], 0.08)
+        self.assertEqual(path["obstacle_support_radius_m"], 0.0)
+        self.assertAlmostEqual(
+            path["collision_grid_padding_m"], 0.025 / math.sqrt(2),
+        )
+        self.assertAlmostEqual(
+            path["maximum_collision_radius_m"],
+            0.15 / 2 + 0.03 + 0.08 + 0.025 / math.sqrt(2),
+        )
+
+    def test_probability_cell_adds_its_half_diagonal_support(self):
+        obstacle = {
+            "forward_m": 0.30, "lateral_m": 0.18,
+            "range_uncertainty_m": 0.04, "lateral_uncertainty_m": 0.08,
+            "support_radius_m": 0.05 / math.sqrt(2),
+            "evidence_kind": "probability", "source": "point",
+        }
+        path = RadarSceneEstimator._plan_path([obstacle])
+        self.assertAlmostEqual(
+            path["maximum_collision_radius_m"],
+            0.15 / 2 + 0.03 + 0.08
+            + 0.05 / math.sqrt(2) + 0.025 / math.sqrt(2),
+        )
+
+    def test_maximum_collision_radius_uses_one_obstacles_combined_terms(self):
+        obstacles = [
+            {"forward_m": 0.30, "lateral_m": -0.20,
+             "range_uncertainty_m": 0.10, "lateral_uncertainty_m": 0.02,
+             "support_radius_m": 0.0, "evidence_kind": "direct", "source": "point"},
+            {"forward_m": 0.30, "lateral_m": 0.20,
+             "range_uncertainty_m": 0.01, "lateral_uncertainty_m": 0.01,
+             "support_radius_m": 0.07, "evidence_kind": "direct", "source": "point"},
+        ]
+        path = RadarSceneEstimator._plan_path(obstacles)
+        self.assertEqual(path["range_uncertainty_lateral_inflation_m"], 0.10)
+        self.assertEqual(path["obstacle_support_radius_m"], 0.07)
+        self.assertAlmostEqual(
+            path["maximum_collision_radius_m"],
+            0.15 / 2 + 0.03 + 0.10 + 0.025 / math.sqrt(2),
+        )
+
+    def test_planner_rejects_invalid_uncertainty_and_support_values(self):
+        base = {
+            "forward_m": 0.30, "lateral_m": 0.18,
+            "range_uncertainty_m": 0.01, "lateral_uncertainty_m": 0.01,
+            "support_radius_m": 0.0, "evidence_kind": "direct", "source": "point",
+        }
+        for field in (
+            "range_uncertainty_m", "lateral_uncertainty_m", "support_radius_m",
+        ):
+            for invalid in (-0.01, float("nan"), float("inf"), float("-inf")):
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(ValueError):
+                    RadarSceneEstimator._plan_path([dict(base, **{field: invalid})])
+
+    def test_wall_interpolation_conservatively_carries_endpoint_inflation(self):
+        endpoints = [
+            {
+                "forward_m": 0.20, "lateral_m": 0.15,
+                "range_uncertainty_m": 0.02, "lateral_uncertainty_m": 0.07,
+                "support_radius_m": 0.01, "confidence": 0.8,
+                "evidence_kind": "direct", "source": "point",
+            },
+            {
+                "forward_m": 0.27, "lateral_m": 0.15,
+                "range_uncertainty_m": 0.08, "lateral_uncertainty_m": 0.03,
+                "support_radius_m": 0.04, "confidence": 0.9,
+                "evidence_kind": "probability", "source": "heatmap",
+            },
+        ]
+        interpolated, segment_count = RadarSceneEstimator._interpolate_wall_obstacles(
+            endpoints,
+        )
+        middle = min(
+            interpolated,
+            key=lambda obstacle: abs(obstacle["forward_m"] - 0.25),
+        )
+        self.assertEqual(segment_count, 1)
+        self.assertAlmostEqual(middle["forward_m"], 0.25, delta=0.013)
+        self.assertEqual(middle["range_uncertainty_m"], 0.08)
+        self.assertEqual(middle["lateral_uncertainty_m"], 0.07)
+        self.assertEqual(middle["support_radius_m"], 0.04)
+        self.assertEqual(middle["confidence"], 0.9)
+        self.assertEqual(middle["evidence_kind"], "mixed")
+        self.assertEqual(middle["source"], "mixed")
+
+    def test_per_obstacle_inflation_widens_goal_exclusion_and_clearance(self):
+        base = {
+            "forward_m": 0.35, "lateral_m": 0.0,
+            "range_uncertainty_m": 0.0, "lateral_uncertainty_m": 0.0,
+            "support_radius_m": 0.0, "evidence_kind": "direct", "source": "point",
+        }
+        inflated = dict(
+            base, range_uncertainty_m=0.08, support_radius_m=0.02,
+        )
+        base_path = RadarSceneEstimator._plan_path([base])
+        inflated_path = RadarSceneEstimator._plan_path([inflated])
+        self.assertLess(
+            inflated_path["goal_corridor_width_deg"],
+            base_path["goal_corridor_width_deg"],
+        )
+        self.assertGreater(
+            abs(inflated_path["goal_angle_deg"]), abs(base_path["goal_angle_deg"]),
+        )
+        expected_clearance = min(
+            math.hypot(point[0] - 0.35, point[1]) - (0.075 + 0.03 + 0.08 + 0.02)
+            for point in inflated_path["points"]
+        )
+        self.assertAlmostEqual(
+            inflated_path["minimum_clearance_m"], round(expected_clearance, 3),
+        )
+
+    def test_current_path_collision_can_be_caused_only_by_uncertainty(self):
+        selected = {
+            "points": [[0.0, 0.0], [0.10, 0.0], [0.20, 0.0], [0.30, 0.0]],
+        }
+        base = {
+            "forward_m": 0.20, "lateral_m": 0.14,
+            "range_uncertainty_m": 0.0, "lateral_uncertainty_m": 0.0,
+            "support_radius_m": 0.0, "evidence_kind": "direct", "source": "point",
+        }
+        self.assertEqual(
+            RadarSceneEstimator._path_collision_segments(selected, [base]), [],
+        )
+        inflated = dict(base, lateral_uncertainty_m=0.04)
+        segments = RadarSceneEstimator._path_collision_segments(selected, [inflated])
+        self.assertTrue(segments)
+        self.assertEqual(segments[0]["reason"], "confirmed_obstacle")
+
+    def test_probability_and_reactive_evidence_merge_conservatively(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._probability_grid.add_hit(
+            0.30, 0.10, now=1.0, confidence=1.0,
+            source="point",
+            range_uncertainty_m=0.08, lateral_uncertainty_m=0.03,
+        )
+        estimator._near_cells[(12, 4)] = {
+            "forward_m": 0.30, "lateral_m": 0.10,
+            "range_uncertainty_m": 0.02, "lateral_uncertainty_m": 0.09,
+            "confidence": 0.95, "source": "point", "hits": 2,
+            "reactive": True, "_last_seen_ns": 1_000_000_000,
+        }
+        obstacles = estimator._planning_obstacle_payload(1.0)
+        merged = next(item for item in obstacles if item["evidence_kind"] == "mixed")
+        self.assertEqual(merged["range_uncertainty_m"], 0.08)
+        self.assertEqual(merged["lateral_uncertainty_m"], 0.09)
+        self.assertAlmostEqual(merged["support_radius_m"], 0.05 / math.sqrt(2))
+
+    def test_confirmed_point_propagates_lateral_uncertainty_to_reactive_cell(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        point = RadarPoint(0.10, 0.30, 0.0, 0.0, 30.0)
+        estimator.ingest(radar_frame((point,), frame_number=1), received_at=1.0)
+        estimator.ingest(radar_frame((point,), frame_number=2), received_at=1.125)
+        cell = estimator.snapshot(now=1.125)["near_occupancy"]["cells"][0]
+        self.assertGreater(cell["lateral_uncertainty_m"], 0.0)
+
+    def test_above_sensor_confirmed_point_still_blocks_the_2d_path(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        elevated = RadarPoint(0.0, 0.20, 0.50, 0.0, 30.0)
+        estimator.ingest(radar_frame((elevated,), frame_number=1), received_at=1.000)
+        estimator.ingest(radar_frame((elevated,), frame_number=2), received_at=1.125)
+        scene = estimator.snapshot(now=1.125)
+        self.assertEqual(scene["tracks"][0]["height_band"], "above_sensor")
+        self.assertTrue(scene["near_occupancy"]["cells"])
+        self.assertNotEqual(scene["planned_path"]["status"], "clear")
+
+    def test_same_key_point_and_heatmap_reactive_hits_merge_conservatively(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._tracks = [
+            {
+                "source": "point", "forward_m": 0.30, "lateral_m": 0.10,
+                "confidence": 0.90, "point_confirmed": True,
+                "range_uncertainty_m": 0.08, "lateral_uncertainty_m": 0.03,
+                "_updated_by_point": True,
+            },
+            {
+                "source": "heatmap", "forward_m": 0.30, "lateral_m": 0.10,
+                "confidence": 0.95, "heatmap_confirmed": True,
+                "range_uncertainty_m": 0.02, "lateral_uncertainty_m": 0.09,
+                "_updated_by_heatmap": True,
+            },
+        ]
+        estimator._update_near_occupancy(1.0)
+        cell = estimator._near_obstacle_payload(1.0)[0]
+        self.assertEqual(cell["range_uncertainty_m"], 0.08)
+        self.assertEqual(cell["lateral_uncertainty_m"], 0.09)
+        self.assertEqual(cell["confidence"], 0.95)
+        self.assertEqual(cell["source"], "mixed")
+        self.assertEqual(cell["hits"], 2)
+
+    def test_unblocked_candidate_is_accepted_on_third_ingested_frame(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        straight = estimator._plan_path([])
+        alternate = dict(straight, curvature_per_m=1.0)
+        with patch.object(estimator, "_plan_path",
+                          side_effect=[straight, alternate, alternate, alternate]):
+            scenes = []
+            for number, when in enumerate((1.0, 1.125, 1.250, 1.375), start=1):
+                estimator.ingest(radar_frame((), frame_number=number), received_at=when)
+                scenes.append(estimator.snapshot(now=when))
+        self.assertEqual(scenes[1]["planned_path"]["curvature_per_m"], 0.0)
+        self.assertEqual(scenes[2]["planned_path"]["pending_switch_frames"], 2)
+        self.assertEqual(scenes[3]["planned_path"]["curvature_per_m"], 1.0)
+
+    def test_confirmed_obstacle_switches_blocked_path_immediately(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator.ingest(radar_frame((), frame_number=1), received_at=1.0)
+        original = estimator.snapshot(now=1.0)["planned_path"]["points"]
+        point = RadarPoint(0.0, 0.35, 0.0, 0.0, 30.0)
+        estimator.ingest(radar_frame((point,), frame_number=2), received_at=1.125)
+        estimator.ingest(radar_frame((point,), frame_number=3), received_at=1.250)
+        path = estimator.snapshot(now=1.250)["planned_path"]
+        self.assertEqual(path["stability_status"], "route_changed_blocked")
+        self.assertIn(path["status"], {"clear", "limited"})
+        self.assertNotEqual(path["curvature_per_m"], 0.0)
+        self.assertEqual(path["blocked_previous_path"]["points"], original)
+        self.assertTrue(path["blocked_previous_path"]["segments"])
+        self.assertTrue(path["blocked_previous_path"]["segments"][0]["reason"])
+
+    def test_confirmed_eleven_centimeter_obstacle_stops_path_before_danger(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        point = RadarPoint(0.0, 0.11, 0.0, 0.0, 30.0)
+        estimator.ingest(radar_frame((point,), frame_number=1), received_at=1.000)
+        estimator.ingest(radar_frame((point,), frame_number=2), received_at=1.125)
+        scene = estimator.snapshot(now=1.125)
+        self.assertEqual(scene["hazard"]["level"], "NORMAL")
+        self.assertEqual(scene["planned_path"]["status"], "blocked_near_field")
+        self.assertEqual(scene["planned_path"]["length_m"], 0.0)
+        self.assertEqual(scene["planned_path"]["points"], [[0.0, 0.0]])
+
+    def test_repeated_eleven_centimeter_stop_does_not_count_switch_each_frame(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        point = RadarPoint(0.0, 0.11, 0.0, 0.0, 30.0)
+        for frame_number in range(1, 6):
+            estimator.ingest(
+                radar_frame((point,), frame_number=frame_number),
+                received_at=1.0 + frame_number * 0.125,
+            )
+        scene = estimator.snapshot(now=1.625)
+        self.assertEqual(scene["planned_path"]["status"], "blocked_near_field")
+        self.assertEqual(scene["diagnostics"]["path_switch_accepted_count"], 1)
+
+    def test_snapshot_after_init_or_reset_never_plans_without_ingest(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        with patch.object(estimator, "_plan_path",
+                          side_effect=AssertionError("snapshot planned")):
+            initial = estimator.snapshot(now=1.0)
+            estimator.reset("explicit_test")
+            reset = estimator.snapshot(now=1.1)
+        for scene in (initial, reset):
+            self.assertEqual(scene["planned_path"]["points"], [[0.0, 0.0]])
+            self.assertEqual(scene["planned_path"]["robot_width_m"], 0.15)
+            self.assertEqual(scene["planned_path"]["safety_margin_m"], 0.03)
+            self.assertEqual(scene["planned_path"]["minimum_passage_width_m"], 0.21)
+            self.assertEqual(scene["planned_path"]["minimum_hold_ms"], 0)
+            self.assertEqual(scene["planned_path"]["switch_confirm_frames"], 3)
+            self.assertFalse(scene["planned_path"]["switch_accepted"])
+            self.assertTrue(scene["planned_path"]["replan_every_frame"])
+            self.assertEqual(scene["planned_path"]["pending_switch_frames"], 0)
+            self.assertIsNone(scene["planned_path"].get("blocked_previous_path"))
+            self.assertEqual(scene["diagnostics"]["path_switch_pending_count"], 0)
+            self.assertEqual(scene["diagnostics"]["path_switch_accepted_count"], 0)
 
     def test_planned_path_uses_one_centimeter_spacing(self):
         path = RadarSceneEstimator._plan_path([])
@@ -979,12 +1237,12 @@ class RadarSceneEstimatorTests(unittest.TestCase):
                     {
                         "forward_m": forward,
                         "lateral_m": -0.075,
-                        "range_uncertainty_m": 0.2,
+                        "range_uncertainty_m": 0.0,
                     },
                     {
                         "forward_m": forward,
                         "lateral_m": 0.075,
-                        "range_uncertainty_m": 0.2,
+                        "range_uncertainty_m": 0.0,
                     },
                 ]
             )
@@ -1094,21 +1352,6 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertGreater(path["length_m"], 0.0)
         self.assertLess(path["length_m"], 0.35)
 
-    def test_near_field_return_does_not_zero_the_forward_path(self):
-        path = RadarSceneEstimator._plan_path(
-            [
-                {
-                    "forward_m": 0.07,
-                    "lateral_m": 0.04,
-                    "range_uncertainty_m": 0.0,
-                }
-            ]
-        )
-
-        self.assertEqual(path["near_field_excluded"], 1)
-        self.assertEqual(path["near_field_exclusion_m"], 0.12)
-        self.assertEqual(path["length_m"], 0.50)
-
     def test_only_strong_confirmed_point_is_retained_for_five_seconds(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
 
@@ -1187,56 +1430,29 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             {0},
         )
 
-    def test_path_replans_without_holding_the_whole_route(self):
+    def test_rejected_motion_does_not_transform_map_or_freeze_blocked_path(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-        estimator._update_stable_path(1.0)
-        self.assertEqual(estimator._planned_path["curvature_per_m"], 0.0)
-
-        estimator._near_cells[(14, 0)] = {
-            "forward_m": 0.35,
-            "lateral_m": 0.0,
-            "range_uncertainty_m": 0.0,
-            "confidence": 1.0,
-            "source": "point",
-            "hits": 1,
-            "reactive": True,
-            "_last_seen_ns": estimator._seconds_to_ns(2.8),
-        }
-        estimator._update_stable_path(1.2)
-        self.assertNotEqual(estimator._planned_path["curvature_per_m"], 0.0)
-        self.assertEqual(
-            estimator._planned_path["stability_status"],
-            "route_changed",
+        estimator.ingest(radar_frame((), frame_number=1), received_at=1.0)
+        real_transform = estimator._probability_grid.transform
+        estimator._probability_grid.transform = Mock(wraps=real_transform)
+        obstacle = RadarPoint(0.0, 0.35, 0.0, 0.0, 30.0)
+        estimator.ingest(
+            radar_frame((obstacle,), frame_number=2), received_at=1.125,
         )
+        estimator.ingest(
+            radar_frame((obstacle,), frame_number=3), received_at=1.250,
+        )
+
+        scene = estimator.snapshot(now=1.250)
+        estimator._probability_grid.transform.assert_not_called()
         self.assertIn(
-            estimator._planned_path["confidence_level"],
-            {"low", "medium", "high"},
+            scene["motion_compensation"]["status"],
+            {"insufficient_points", "stabilizing"},
         )
-        self.assertGreater(estimator._planned_path["confidence"], 0.0)
-
-    def test_unstable_motion_freezes_selected_path(self):
-        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-        estimator._update_stable_path(1.0)
-        estimator._near_cells[(14, 0)] = {
-            "forward_m": 0.35,
-            "lateral_m": 0.0,
-            "range_uncertainty_m": 0.0,
-            "confidence": 1.0,
-            "source": "point",
-            "hits": 1,
-            "reactive": True,
-            "_last_seen_ns": estimator._seconds_to_ns(3.0),
-        }
-        estimator._motion = estimator._empty_motion("unstable")
-
-        estimator._update_stable_path(3.0)
-
-        self.assertNotEqual(estimator._planned_path["curvature_per_m"], 0.0)
         self.assertEqual(
-            estimator._planned_path["stability_status"],
-            "replanned_frozen_map",
+            scene["planned_path"]["stability_status"],
+            "route_changed_blocked",
         )
-        self.assertEqual(estimator._planned_path["pending_switch_frames"], 0)
 
     def test_unconfirmed_point_track_does_not_enter_occupancy_grid(self):
         estimator = calibrated_estimator()
@@ -1566,6 +1782,87 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             scene["diagnostics"]["scene_epoch"],
             before["diagnostics"]["scene_epoch"],
         )
+
+    def test_every_scene_boundary_clears_path_selector_epoch_state(self):
+        boundary_names = (
+            "explicit_reset",
+            "producer_change",
+            "duplicate",
+            "reset_or_out_of_order",
+            "profile_mismatch",
+            "calibration_mismatch",
+            "source_fault",
+            "replay_restart",
+        )
+        for boundary_name in boundary_names:
+            with self.subTest(boundary=boundary_name):
+                estimator = calibrated_estimator()
+                straight = RadarSceneEstimator._plan_path([])
+                alternate = dict(straight, curvature_per_m=1.0)
+                with patch.object(
+                    estimator,
+                    "_plan_path",
+                    side_effect=[
+                        straight, alternate, alternate, alternate, straight,
+                    ],
+                ):
+                    for frame_number in range(1, 6):
+                        estimator.ingest(
+                            empty_frame(frame_number=frame_number),
+                            received_at=1.0 + frame_number * 0.125,
+                        )
+                seeded = estimator.snapshot(now=1.625)
+                self.assertEqual(
+                    seeded["diagnostics"]["path_switch_accepted_count"], 1,
+                )
+                self.assertEqual(
+                    seeded["planned_path"]["pending_switch_frames"], 1,
+                )
+
+                if boundary_name == "explicit_reset":
+                    estimator.reset("operator_reset")
+                elif boundary_name == "producer_change":
+                    estimator.ingest(
+                        radar_frame((), producer_id="new-producer", frame_number=6),
+                        received_at=2.0,
+                    )
+                elif boundary_name in {"duplicate", "reset_or_out_of_order"}:
+                    estimator.ingest(
+                        radar_frame(
+                            (), frame_number=6, frame_transition=boundary_name,
+                        ),
+                        received_at=2.0,
+                    )
+                elif boundary_name == "profile_mismatch":
+                    estimator.ingest(
+                        radar_frame((), frame_number=6,
+                                    profile_id="different-profile"),
+                        received_at=2.0,
+                    )
+                elif boundary_name == "calibration_mismatch":
+                    estimator.ingest(
+                        radar_frame((), frame_number=6,
+                                    calibration_id="different-calibration"),
+                        received_at=2.0,
+                    )
+                elif boundary_name == "source_fault":
+                    estimator.snapshot(source_status="fault", now=2.0)
+                else:
+                    estimator.reset("replay_restart")
+
+                scene = estimator.snapshot(now=2.0)
+                self.assertEqual(
+                    scene["planned_path"]["pending_switch_frames"], 0,
+                )
+                self.assertEqual(
+                    scene["diagnostics"]["path_switch_pending_count"], 0,
+                )
+                self.assertEqual(
+                    scene["diagnostics"]["path_switch_accepted_count"], 0,
+                )
+                self.assertIsNone(
+                    scene["planned_path"].get("blocked_previous_path"),
+                )
 
     def test_producer_change_clears_probability_maps_and_advances_epoch(self):
         estimator = calibrated_estimator()
