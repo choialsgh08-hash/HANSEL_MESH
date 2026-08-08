@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence as SequenceABC
 import math
+from numbers import Real
 from typing import List, Optional, Sequence, Tuple
 
 
@@ -44,12 +45,24 @@ def _empty_motion(status: str) -> dict:
     }
 
 
-def _is_exact_pair(value) -> bool:
+def _is_ordered_sequence(value) -> bool:
     return (
         isinstance(value, SequenceABC)
         and not isinstance(value, (str, bytes, bytearray))
-        and len(value) == 2
     )
+
+
+def _is_exact_pair(value) -> bool:
+    return _is_ordered_sequence(value) and len(value) == 2
+
+
+def _is_finite_real(value) -> bool:
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
 
 
 class RadarMotionEstimator:
@@ -71,11 +84,10 @@ class RadarMotionEstimator:
             self.reset()
             return _empty_motion("invalid_input")
 
-        try:
-            pairs: Sequence[Correspondence] = tuple(correspondences)
-        except (TypeError, ValueError):
+        if not _is_ordered_sequence(correspondences):
             self.reset()
             return _empty_motion("invalid_input")
+        pairs: Sequence[Correspondence] = tuple(correspondences)
 
         if len(pairs) > eligible_anchor_count:
             self.reset()
@@ -90,13 +102,14 @@ class RadarMotionEstimator:
             if not _is_exact_pair(old) or not _is_exact_pair(new):
                 self.reset()
                 return _empty_motion("invalid_input")
+            coordinates = (old[0], old[1], new[0], new[1])
+            if not all(_is_finite_real(value) for value in coordinates):
+                self.reset()
+                return _empty_motion("invalid_input")
             try:
                 old_point = (float(old[0]), float(old[1]))
                 new_point = (float(new[0]), float(new[1]))
             except (OverflowError, TypeError, ValueError):
-                self.reset()
-                return _empty_motion("invalid_input")
-            if not all(math.isfinite(value) for value in (*old_point, *new_point)):
                 self.reset()
                 return _empty_motion("invalid_input")
             validated.append((old_point, new_point))

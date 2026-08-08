@@ -103,6 +103,41 @@ class RadarMotionEstimatorTests(unittest.TestCase):
                 self.assertEqual(result["status"], "invalid_input")
                 self.assertFalse(result["applied"])
 
+    def test_sparse_coordinates_require_numeric_non_boolean_values(self):
+        for invalid_value in ("0.25", True, False):
+            for side_index in (0, 1):
+                for coordinate_index in (0, 1):
+                    pair = [
+                        [0.25, -0.16],
+                        [0.23, -0.16],
+                    ]
+                    pair[side_index][coordinate_index] = invalid_value
+                    correspondences = ((tuple(pair[0]), tuple(pair[1])),)
+                    with self.subTest(
+                        invalid_value=invalid_value,
+                        side_index=side_index,
+                        coordinate_index=coordinate_index,
+                    ):
+                        result = RadarMotionEstimator().update(
+                            correspondences,
+                            1,
+                        )
+                        self.assertEqual(result["status"], "invalid_input")
+                        self.assertFalse(result["applied"])
+
+    def test_malformed_empty_outer_containers_are_invalid_input(self):
+        for malformed in ({}, "", b"", bytearray(), set()):
+            with self.subTest(container_type=type(malformed).__name__):
+                result = RadarMotionEstimator().update(malformed, 0)
+                self.assertEqual(result["status"], "invalid_input")
+                self.assertFalse(result["applied"])
+
+        for valid in ([], ()):
+            with self.subTest(container_type=type(valid).__name__):
+                result = RadarMotionEstimator().update(valid, 0)
+                self.assertEqual(result["status"], "insufficient_points")
+                self.assertFalse(result["applied"])
+
     def test_unrepresentable_coordinates_are_invalid_input(self):
         pairs = translated_pairs(5)
         pairs[0] = ((10 ** 1000, pairs[0][0][1]), pairs[0][1])
