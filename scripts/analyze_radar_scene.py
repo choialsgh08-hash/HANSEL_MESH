@@ -208,7 +208,8 @@ def load_bench_annotations(path: Path, input_path: Path, clutter_model) -> dict:
     recording = annotations["recording"]
     _keys(recording, {"id", "kind", "start_seq", "end_seq"}, "recording")
     _text(recording["id"], "recording.id")
-    if recording["kind"] not in _RECORDING_KINDS:
+    recording_kind = recording["kind"]
+    if not isinstance(recording_kind, str) or recording_kind not in _RECORDING_KINDS:
         raise ValueError("recording.kind is unsupported")
     start_seq = _integer(recording["start_seq"], "recording.start_seq", 0)
     end_seq = _integer(recording["end_seq"], "recording.end_seq", 0)
@@ -225,7 +226,7 @@ def load_bench_annotations(path: Path, input_path: Path, clutter_model) -> dict:
         if not isinstance(window, dict):
             raise ValueError(f"{label} must be an object")
         kind = window.get("kind")
-        if kind not in _WINDOW_FIELDS:
+        if not isinstance(kind, str) or kind not in _WINDOW_FIELDS:
             raise ValueError(f"{label}.kind is unsupported")
         _keys(window, {"id", "kind", "start_seq", "end_seq"} | _WINDOW_FIELDS[kind], label)
         window_id = _text(window["id"], f"{label}.id")
@@ -241,7 +242,9 @@ def load_bench_annotations(path: Path, input_path: Path, clutter_model) -> dict:
                 raise ValueError(f"overlapping {kind} windows")
         by_kind[kind].append((window_start, window_end))
         if kind == "fixed_target":
-            if window["coverage_key"] not in BENCH_FIXED_TARGETS:
+            coverage_key = window["coverage_key"]
+            if (not isinstance(coverage_key, str)
+                    or coverage_key not in BENCH_FIXED_TARGETS):
                 raise ValueError(f"{label}.coverage_key is unsupported")
         if "target" in window:
             window["target"] = _target(window["target"], f"{label}.target")
@@ -265,8 +268,8 @@ def load_bench_annotations(path: Path, input_path: Path, clutter_model) -> dict:
                     raise ValueError(f"{label}.{field} lies outside its window")
         if kind == "confirmed_collision" and window["confirmation_seq"] != window["evidence_seqs"][-1]:
             raise ValueError("confirmation_seq must equal final evidence seq")
-    _validate_coverage(recording["kind"], windows)
-    if recording["kind"] == "empty_mounted":
+    _validate_coverage(recording_kind, windows)
+    if recording_kind == "empty_mounted":
         only = windows[0]
         if only["start_seq"] != start_seq or only["end_seq"] != end_seq:
             raise ValueError("empty window must span the recording")
@@ -421,10 +424,15 @@ def analyze_records(records, estimator, max_frames=None, timer=time.perf_counter
         planned_path = scene["planned_path"]
         path_points = planned_path.get("points", [])
         occupied_count = sum(cell.get("occupied") is True for cell in probability_cells)
-        active_count = int(diagnostics.get("probability_active_cell_count",
-                                           len(probability_cells)))
-        diagnostic_occupied = int(diagnostics.get("probability_occupied_cell_count",
-                                                   occupied_count))
+        active_count = len(probability_cells)
+        diagnostic_active = diagnostics.get("probability_active_cell_count")
+        diagnostic_occupied = diagnostics.get("probability_occupied_cell_count")
+        if diagnostic_active is not None:
+            diagnostic_active = _nonnegative_int(
+                diagnostic_active, "probability_active_cell_count")
+        if diagnostic_occupied is not None:
+            diagnostic_occupied = _nonnegative_int(
+                diagnostic_occupied, "probability_occupied_cell_count")
         report["frames_processed"] += 1
         report["producer_reported_drops_total"] += record.dropped_frames_since_previous
         for source, target in (
@@ -441,7 +449,7 @@ def analyze_records(records, estimator, max_frames=None, timer=time.perf_counter
         ):
             report[target] = max(report[target], int(diagnostics[source]))
         report["probability_cells_max"] = max(report["probability_cells_max"], active_count)
-        report["occupied_cells_max"] = max(report["occupied_cells_max"], diagnostic_occupied)
+        report["occupied_cells_max"] = max(report["occupied_cells_max"], occupied_count)
 
         def inside(item, radius=0.15):
             return math.hypot(float(item["forward_m"]),
@@ -462,14 +470,18 @@ def analyze_records(records, estimator, max_frames=None, timer=time.perf_counter
                 for cell in probability_cells),
         )
         report["probability_cells_final"] = active_count
-        report["occupied_cells_final"] = diagnostic_occupied
+        report["occupied_cells_final"] = occupied_count
         report["planned_path_points_max"] = max(report["planned_path_points_max"],
                                                  len(path_points))
         failures = []
         if active_count > 317:
             failures.append("probability_cells_exceed_317")
-        if diagnostic_occupied > active_count:
+        if occupied_count > active_count:
             failures.append("occupied_cells_exceed_active_cells")
+        if diagnostic_active is not None and diagnostic_active != active_count:
+            failures.append("probability_active_diagnostic_mismatch")
+        if diagnostic_occupied is not None and diagnostic_occupied != occupied_count:
+            failures.append("probability_occupied_diagnostic_mismatch")
         if len(path_points) > 121:
             failures.append("planned_path_points_exceed_121")
         if not all(isinstance(point, (list, tuple)) and len(point) == 2
@@ -571,6 +583,21 @@ def _current_confirmed(scene, target, require_map=False):
     return _nearest(scene.get("tracks", []), target, lambda track: (
         matches(track)
     ))
+
+
+def _current_confirmed_evidence(scene, target):
+    def matches(track):
+        age = track.get("age_ms")
+        current = (not isinstance(age, bool)
+                   and isinstance(age, (int, float))
+                   and math.isfinite(float(age)) and float(age) == 0.0)
+        if not current:
+            return False
+        return ((track.get("source") == "point"
+                 and track.get("point_confirmed") is True)
+                or (track.get("source") == "heatmap"
+                    and track.get("heatmap_confirmed") is True))
+    return _nearest(scene.get("tracks", []), target, matches)
 
 
 def _roi_state_present(scene, target):
@@ -716,7 +743,7 @@ def _evaluate_bench(annotations, frames, estimator, report):
             result["last_present_seq"] = last_seq
             first_clear_seq = None
             last_record, last_scene, _ = indexed[last_seq]
-            if not (_current_confirmed(last_scene, target) is not None
+            if not (_current_confirmed_evidence(last_scene, target) is not None
                     or _nearest(last_scene.get("probabilistic_local_map", {}).get("cells", []),
                                 target) is not None):
                 _fail(result, "missing_removal_presence")

@@ -5,7 +5,7 @@ import io
 import json
 import math
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -166,6 +166,7 @@ class RadarReplayReportTests(unittest.TestCase):
         report = analyze_records(
             [object(), replace(first, complete=False), first, second],
             _ScriptedEstimator(scenes),
+            timer=iter((0.000, 0.001, 0.001, 0.003)).__next__,
         )
         self.assertEqual(report["records_seen"], 4)
         self.assertEqual(report["non_radar_records_skipped"], 1)
@@ -181,6 +182,23 @@ class RadarReplayReportTests(unittest.TestCase):
         self.assertEqual(report["confirmed_heatmap_tracks_max"], 1)
         self.assertEqual(report["blocked_path_replans"], 1)
         self.assertEqual(report["path_switches"], 1)
+        self.assertEqual(report["probability_decayed_total"], 1)
+        self.assertEqual(report["probability_ttl_expired_total"], 1)
+        self.assertEqual(report["probability_cells_max"], 0)
+        self.assertEqual(report["occupied_cells_max"], 0)
+        self.assertEqual(report["probability_cells_final"], 0)
+        self.assertEqual(report["occupied_cells_final"], 0)
+        self.assertEqual(report["planned_path_points_max"], 0)
+        self.assertEqual(report["confirmed_tracks_in_self_clutter_zone_max"], 0)
+        self.assertEqual(report["reactive_cells_in_self_clutter_zone_max"], 0)
+        self.assertEqual(report["occupied_cells_in_self_clutter_zone_max"], 0)
+        self.assertEqual(report["danger_frames"], 0)
+        self.assertEqual(report["blocked_near_field_frames"], 1)
+        self.assertEqual(report["blocked_near_field_longest_ms"], 0.0)
+        self.assertAlmostEqual(report["duration_s"], 0.1)
+        self.assertAlmostEqual(report["path_switches_per_min"], 600.0)
+        self.assertTrue(report["state_bounds_passed"])
+        self.assertEqual(report["state_bound_failures"], [])
         self.assertEqual(report["planned_path_status_final"], "blocked_near_field")
         self.assertEqual(report["planned_path_stability_status_final"],
                          "route_changed_blocked")
@@ -188,6 +206,10 @@ class RadarReplayReportTests(unittest.TestCase):
         self.assertEqual(report["calibration_status_counts"], {"synthetic": 1, "ok": 1})
         self.assertEqual(report["motion_status_counts"],
                          {"insufficient_points": 1, "applied": 1})
+        self.assertEqual(report["processing_ms_mean"], 1.5)
+        self.assertEqual(report["processing_ms_p95"], 2.0)
+        self.assertEqual(report["processing_ms_max"], 2.0)
+        self.assertIsNone(report["bench"])
 
     def test_state_bounds_fail_on_too_many_probability_cells_or_path_points(self):
         valid = _scene(0, 0, cells=317, occupied=317, path_points=121)
@@ -195,7 +217,8 @@ class RadarReplayReportTests(unittest.TestCase):
                                         _ScriptedEstimator([valid]))["state_bounds_passed"])
         cases = (
             (_scene(0, 0, cells=318), "probability_cells_exceed_317"),
-            (_scene(0, 0, cells=2, occupied=3), "occupied_cells_exceed_active_cells"),
+            (_scene(0, 0, cells=2, occupied=3),
+             "probability_occupied_diagnostic_mismatch"),
             (_scene(0, 0, path_points=122), "planned_path_points_exceed_121"),
         )
         for scene, failure in cases:
@@ -203,6 +226,22 @@ class RadarReplayReportTests(unittest.TestCase):
                 report = analyze_records([radar_frame()], _ScriptedEstimator([scene]))
                 self.assertFalse(report["state_bounds_passed"])
                 self.assertIn(failure, report["state_bound_failures"])
+
+    def test_serialized_probability_cells_are_authoritative_and_diagnostic_disagreement_fails(self):
+        scene = _scene(0, 0, cells=318, occupied=2)
+        scene["diagnostics"]["probability_active_cell_count"] = 0
+        scene["diagnostics"]["probability_occupied_cell_count"] = 0
+        report = analyze_records([radar_frame()], _ScriptedEstimator([scene]))
+        self.assertEqual(report["probability_cells_max"], 318)
+        self.assertEqual(report["probability_cells_final"], 318)
+        self.assertEqual(report["occupied_cells_max"], 2)
+        self.assertEqual(report["occupied_cells_final"], 2)
+        self.assertFalse(report["state_bounds_passed"])
+        self.assertEqual(report["state_bound_failures"], [
+            "probability_cells_exceed_317",
+            "probability_active_diagnostic_mismatch",
+            "probability_occupied_diagnostic_mismatch",
+        ])
 
     def test_cli_prints_one_json_report_and_returns_zero(self):
         with TemporaryDirectory() as directory:
@@ -286,8 +325,58 @@ class RadarReplayReportTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertEqual(json.loads(stdout.getvalue()), failed)
 
+    def test_cli_prints_bound_failure_report_before_returning_two_without_thresholds(self):
+        failed = {"state_bounds_passed": False,
+                  "state_bound_failures": ["probability_cells_exceed_317"],
+                  "processing_ms_p95": 1.0, "processing_ms_max": 2.0,
+                  "bench": None}
+        stdout = io.StringIO()
+        with patch("scripts.analyze_radar_scene.iter_replay", return_value=()), \
+             patch("scripts.analyze_radar_scene.analyze_records",
+                   return_value=failed), redirect_stdout(stdout):
+            exit_code = main(["--input", "log.jsonl", "--synthetic"])
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(json.loads(stdout.getvalue()), failed)
+
 
 class RadarBenchAnnotationTests(unittest.TestCase):
+    def test_annotations_and_cli_reject_unhashable_kind_and_coverage_values(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            log_path, sidecar_path, original = _write_empty_bench(root)
+            malformed_values = (
+                ("recording.kind", lambda value: value["recording"].__setitem__("kind", [])),
+                ("window.kind", lambda value: value["windows"][0].__setitem__("kind", {})),
+                ("coverage_key", lambda value: (
+                    value["recording"].__setitem__("kind", "angled_targets"),
+                    value.__setitem__("windows", [
+                        {"id": "left", "kind": "fixed_target", "start_seq": 1,
+                         "end_seq": 1, "coverage_key": []},
+                        {"id": "right", "kind": "fixed_target", "start_seq": 2,
+                         "end_seq": 2, "coverage_key": "azimuth_pos30_metal"},
+                    ]),
+                )),
+            )
+            for label, mutate in malformed_values:
+                sidecar = json.loads(json.dumps(original))
+                mutate(sidecar)
+                sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+                with self.subTest(label=label), self.assertRaises(ValueError):
+                    load_bench_annotations(sidecar_path, log_path, clutter_model())
+
+            sidecar = json.loads(json.dumps(original))
+            sidecar["recording"]["kind"] = []
+            sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+            stdout = io.StringIO()
+            with patch("scripts.analyze_radar_scene.load_clutter_model",
+                       return_value=clutter_model()), redirect_stdout(stdout), \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                main(["--input", str(log_path),
+                      "--clutter-calibration", "model.json",
+                      "--annotations", str(sidecar_path)])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+
     def test_annotations_reject_wrong_sha_domain_profile_calibration_provenance_unknown_and_duplicate_keys(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -374,6 +463,20 @@ class RadarBenchAnnotationTests(unittest.TestCase):
             report = analyze_records(frames, _ScriptedEstimator(scenes),
                                      bench_annotations=annotations)
             self.assertTrue(report["bench"]["windows"][0]["passed"])
+        failing_frames = [point_frame(0.30, frame_number=1)]
+        failing_scenes = [_scene_with(
+            calibration="ok", cells=[_cell(0.30, occupied=False)])]
+        failing_annotations = _internal_annotations(
+            failing_frames, [{"id": "ghost", "kind": "ghost",
+                              "start_seq": 1, "end_seq": 1,
+                              "target": target, "evidence_seqs": [1]}])
+        failed = analyze_records(
+            failing_frames, _ScriptedEstimator(failing_scenes),
+            bench_annotations=failing_annotations,
+        )["bench"]["windows"][0]
+        self.assertEqual(failed["probability_map_entries"], 1)
+        self.assertFalse(failed["passed"])
+        self.assertIn("ghost_entered_probability_map", failed["failures"])
         with TemporaryDirectory() as directory:
             root = Path(directory)
             log_path, sidecar_path, sidecar = _write_frontal_bench(root)
@@ -420,6 +523,37 @@ class RadarBenchAnnotationTests(unittest.TestCase):
         failed = analyze_records(frames, _ScriptedEstimator(retained),
                                  bench_annotations=_internal_annotations(frames, [window]))
         self.assertEqual(failed["bench"]["windows"][0]["paired_target_samples"], 0)
+
+    def test_fixed_target_pairing_uses_nondefault_model_axes(self):
+        axes = RadarAxes(
+            forward_axis="x", forward_sign=-1,
+            lateral_axis="y", lateral_sign=1,
+        )
+        frames = []
+        scenes = []
+        for index in range(1, 31):
+            raw_forward = 0.28 if index % 2 else 0.32
+            frames.append(radar_frame((
+                RadarPoint(-raw_forward, 0.0, 0.01, 0.0, 24.0),
+            ), frame_number=index))
+            filtered_forward = 0.295 if index % 2 else 0.305
+            scenes.append(_scene_with(
+                calibration="ok",
+                tracks=[_track(filtered_forward, map_confirmed=True, age_ms=0)],
+            ))
+        estimator = _ScriptedEstimator(scenes)
+        estimator.axes = axes
+        window = {"id": "fixed", "kind": "fixed_target", "start_seq": 1,
+                  "end_seq": 30, "coverage_key": "front_030_metal"}
+        fixed = analyze_records(
+            frames, estimator,
+            bench_annotations=_internal_annotations(frames, [window]),
+        )["bench"]["windows"][0]
+        self.assertEqual(fixed["raw_target_samples"], 30)
+        self.assertEqual(fixed["paired_target_samples"], 30)
+        self.assertAlmostEqual(fixed["raw_position_std_m"], 0.02)
+        self.assertAlmostEqual(fixed["filtered_position_std_m"], 0.005)
+        self.assertTrue(fixed["passed"])
 
     def test_empty_metrics_report_exact_false_rates_switches_per_min_and_block_run(self):
         point_counts = (2, 0, 1, 1)
@@ -473,6 +607,26 @@ class RadarBenchAnnotationTests(unittest.TestCase):
             report = analyze_records(frames, _ScriptedEstimator([present_scene, later]),
                                      bench_annotations=_internal_annotations(frames, [window]))
             self.assertEqual(report["bench"]["windows"][0]["passed"], expected)
+
+    def test_removal_accepts_current_confirmed_heatmap_presence(self):
+        target = {"forward_m": 0.30, "lateral_m": 0.0}
+        frames = [_timed_frame(1, 1_000_000_000),
+                  _timed_frame(2, 3_500_000_000)]
+        heatmap = {"forward_m": 0.30, "lateral_m": 0.0,
+                   "source": "heatmap", "age_ms": 0,
+                   "point_confirmed": False, "heatmap_confirmed": True,
+                   "map_confirmed": False}
+        scenes = [_scene_with(calibration="ok", tracks=[heatmap]),
+                  _scene_with(calibration="ok")]
+        window = {"id": "remove", "kind": "removal", "start_seq": 1,
+                  "end_seq": 2, "target": target, "last_present_seq": 1}
+        removal = analyze_records(
+            frames, _ScriptedEstimator(scenes),
+            bench_annotations=_internal_annotations(frames, [window]),
+        )["bench"]["windows"][0]
+        self.assertTrue(removal["passed"])
+        self.assertEqual(removal["first_clear_seq"], 2)
+        self.assertEqual(removal["ghost_persistence_ms"], 2500.0)
 
     def test_transient_path_holds_route_and_confirmed_collision_has_zero_frame_delay(self):
         target = {"forward_m": 0.30, "lateral_m": 0.0}
