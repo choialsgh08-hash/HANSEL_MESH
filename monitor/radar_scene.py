@@ -12,6 +12,7 @@ from common.radar_geometry import RadarAxes
 from common.sensor_contract import RadarFrame
 from sensors.radar_calibration import RadarClutterModel
 from monitor.radar_local_map import ProbabilisticRollingGrid
+from monitor.radar_motion import RadarMotionEstimator
 from monitor.radar_tracking import (
     DEFAULT_RANGE_STEP_M,
     POINT_HAZARD_CONFIRM_HITS,
@@ -38,15 +39,6 @@ GRID_ORIGIN_FORWARD_CELL = 0
 GRID_ORIGIN_LATERAL_CELL = 30
 SCENE_MAX_FORWARD_M = 3.0
 SCENE_HALF_WIDTH_M = 1.5
-MOTION_MAX_TRANSLATION_M = 0.08
-MOTION_MAX_YAW_DEG = 8
-MOTION_TRANSLATION_BIN_M = 0.005
-MOTION_ASSOCIATION_M = 0.16
-MOTION_MIN_MATCHES = 3
-MOTION_MIN_MATCH_RATIO = 0.45
-MOTION_MAX_RMSE_M = 0.09
-MOTION_STABILITY_TRANSLATION_M = 0.05
-MOTION_STABILITY_YAW_DEG = 2.0
 PATH_RESOLUTION_M = 0.01
 PATH_MAX_LENGTH_M = 3.0
 PATH_ROBOT_WIDTH_M = 0.15
@@ -274,8 +266,7 @@ class RadarSceneEstimator:
         self._hazard_evaluator = RadarHazardEvaluator()
         self._producer_id: Optional[str] = None
         self._last_reset_reason: Optional[str] = None
-        self._previous_point_positions: List[Tuple[float, float]] = []
-        self._motion_candidates: List[Dict[str, object]] = []
+        self._motion_estimator = RadarMotionEstimator()
         self._motion: Dict[str, object] = self._empty_motion("initializing")
         self._accumulated_obstacles: List[Dict[str, object]] = []
         self._next_accumulated_obstacle_id = 1
@@ -318,8 +309,7 @@ class RadarSceneEstimator:
         self._heatmap_cluster_count = 0
         self._heatmap_reflection_count = 0
         self._heatmap_confirmed_count = 0
-        self._previous_point_positions = []
-        self._motion_candidates = []
+        self._motion_estimator.reset()
         self._motion = self._empty_motion("reset")
         self._accumulated_obstacles = []
         self._next_accumulated_obstacle_id = 1
@@ -410,23 +400,77 @@ class RadarSceneEstimator:
                 (point, forward_m, lateral_m, range_step_m, quality_score)
             )
 
-        current_point_positions = [
-            (forward_m, lateral_m)
-            for _, forward_m, lateral_m, _, _ in accepted_points
+        now_ns = self._seconds_to_ns(now)
+        prior_anchors = [
+            track
+            for track in self._tracks
+            if track.get("source") == "point"
+            and track.get("map_confirmed") is True
+            and float(track.get("quality_score", 0.0)) >= POINT_STRONG_QUALITY
+            and now_ns - int(track["_received_at_ns"]) < TRACK_TTL_NS
         ]
-        self._motion = self._stabilize_motion(
-            self._estimate_ego_motion(
-                self._previous_point_positions,
-                current_point_positions,
-            )
+        association_candidates = []
+        for anchor_index, anchor in enumerate(prior_anchors):
+            for point_index, accepted_point in enumerate(accepted_points):
+                _, forward_m, lateral_m, range_step_m, quality_score = (
+                    accepted_point
+                )
+                if quality_score < POINT_STRONG_QUALITY:
+                    continue
+                if not point_association_gate(
+                    float(anchor["forward_m"]),
+                    float(anchor["lateral_m"]),
+                    forward_m,
+                    lateral_m,
+                    range_step_m,
+                ):
+                    continue
+                association_candidates.append((
+                    math.hypot(
+                        float(anchor["forward_m"]) - forward_m,
+                        float(anchor["lateral_m"]) - lateral_m,
+                    ),
+                    anchor_index,
+                    point_index,
+                ))
+        used_anchors = set()
+        used_points = set()
+        correspondences = []
+        for _, anchor_index, point_index in sorted(association_candidates):
+            if anchor_index in used_anchors or point_index in used_points:
+                continue
+            used_anchors.add(anchor_index)
+            used_points.add(point_index)
+            anchor = prior_anchors[anchor_index]
+            accepted_point = accepted_points[point_index]
+            correspondences.append((
+                (
+                    float(anchor["forward_m"]),
+                    float(anchor["lateral_m"]),
+                ),
+                (float(accepted_point[1]), float(accepted_point[2])),
+            ))
+        self._motion = self._motion_estimator.update(
+            correspondences,
+            len(prior_anchors),
         )
         if bool(self._motion["applied"]):
-            self._transform_tracks(
-                float(self._motion["transform_forward_m"]),
-                float(self._motion["transform_lateral_m"]),
-                math.radians(float(self._motion["transform_yaw_deg"])),
+            transform_forward_m = float(self._motion["transform_forward_m"])
+            transform_lateral_m = float(self._motion["transform_lateral_m"])
+            transform_yaw_rad = math.radians(
+                float(self._motion["transform_yaw_deg"])
             )
-        self._previous_point_positions = current_point_positions
+            self._transform_tracks(
+                transform_forward_m,
+                transform_lateral_m,
+                transform_yaw_rad,
+            )
+            self._probability_grid.transform(
+                transform_forward_m,
+                transform_lateral_m,
+                transform_yaw_rad,
+                now,
+            )
 
         point_elapsed_frame_windows = min(
             POINT_HISTORY_FRAMES,
@@ -551,6 +595,7 @@ class RadarSceneEstimator:
             self._heatmap_candidate_cells = 0
             self._heatmap_cluster_count = 0
 
+        self._update_probability_map(now)
         self._scene_point_count = point_count
         self._clutter_points_rejected = rejected
         self._heatmap_cells_accepted = self._heatmap_candidate_cells
@@ -565,7 +610,6 @@ class RadarSceneEstimator:
             len(heatmap_tracks) - self._heatmap_confirmed_count
         )
         self._update_accumulated_obstacles(now)
-        self._update_probability_map(now)
         if self._motion["status"] not in {"unstable", "low_confidence"}:
             self._update_near_occupancy(now)
             self._update_stable_occupancy(now)
@@ -857,183 +901,6 @@ class RadarSceneEstimator:
             "transform_yaw_deg": 0.0,
         }
 
-    @classmethod
-    def _estimate_ego_motion(
-        cls,
-        previous: Sequence[Tuple[float, float]],
-        current: Sequence[Tuple[float, float]],
-    ) -> Dict[str, object]:
-        """Estimate the rigid transform mapping the previous scan to current.
-
-        A yaw/translation vote followed by one-to-one nearest-neighbour scoring
-        keeps moving outliers from defining robot motion.  The transform is
-        only authorized when at least a small static consensus exists.
-        """
-        if len(previous) < MOTION_MIN_MATCHES or len(current) < MOTION_MIN_MATCHES:
-            return cls._empty_motion("insufficient_points")
-
-        best: Optional[Tuple[int, float, float, float, float, float]] = None
-        for yaw_deg in range(-MOTION_MAX_YAW_DEG, MOTION_MAX_YAW_DEG + 1):
-            yaw_rad = math.radians(yaw_deg)
-            cosine = math.cos(yaw_rad)
-            sine = math.sin(yaw_rad)
-            rotated = [
-                (
-                    cosine * forward - sine * lateral,
-                    sine * forward + cosine * lateral,
-                )
-                for forward, lateral in previous
-            ]
-            votes: Dict[Tuple[int, int], int] = {}
-            for old_forward, old_lateral in rotated:
-                for new_forward, new_lateral in current:
-                    delta_forward = new_forward - old_forward
-                    delta_lateral = new_lateral - old_lateral
-                    if (
-                        abs(delta_forward) > MOTION_MAX_TRANSLATION_M
-                        or abs(delta_lateral) > MOTION_MAX_TRANSLATION_M
-                    ):
-                        continue
-                    key = (
-                        round(delta_forward / MOTION_TRANSLATION_BIN_M),
-                        round(delta_lateral / MOTION_TRANSLATION_BIN_M),
-                    )
-                    votes[key] = votes.get(key, 0) + 1
-            for (forward_bin, lateral_bin), _ in sorted(
-                votes.items(), key=lambda item: item[1], reverse=True
-            )[:4]:
-                delta_forward = forward_bin * MOTION_TRANSLATION_BIN_M
-                delta_lateral = lateral_bin * MOTION_TRANSLATION_BIN_M
-                pairs: List[Tuple[float, int, int]] = []
-                for old_index, (old_forward, old_lateral) in enumerate(rotated):
-                    transformed_forward = old_forward + delta_forward
-                    transformed_lateral = old_lateral + delta_lateral
-                    for new_index, (new_forward, new_lateral) in enumerate(current):
-                        distance = math.hypot(
-                            transformed_forward - new_forward,
-                            transformed_lateral - new_lateral,
-                        )
-                        if distance <= MOTION_ASSOCIATION_M:
-                            pairs.append((distance, old_index, new_index))
-                used_old = set()
-                used_new = set()
-                residuals: List[float] = []
-                for distance, old_index, new_index in sorted(pairs):
-                    if old_index in used_old or new_index in used_new:
-                        continue
-                    used_old.add(old_index)
-                    used_new.add(new_index)
-                    residuals.append(distance)
-                if not residuals:
-                    continue
-                rmse = math.sqrt(
-                    sum(value * value for value in residuals) / len(residuals)
-                )
-                regularized_error = (
-                    rmse
-                    + abs(yaw_deg) * 0.004
-                    + math.hypot(delta_forward, delta_lateral) * 0.03
-                )
-                candidate = (
-                    len(residuals),
-                    regularized_error,
-                    rmse,
-                    float(yaw_deg),
-                    delta_forward,
-                    delta_lateral,
-                )
-                if best is None or (
-                    candidate[0] > best[0]
-                    or (
-                        candidate[0] == best[0]
-                        and candidate[1] < best[1]
-                    )
-                ):
-                    best = candidate
-
-        if best is None:
-            return cls._empty_motion("no_consensus")
-        (
-            matches,
-            _,
-            rmse,
-            yaw_deg,
-            delta_forward,
-            delta_lateral,
-        ) = best
-        match_ratio = matches / min(len(previous), len(current))
-        authorized = (
-            matches >= MOTION_MIN_MATCHES
-            and match_ratio >= MOTION_MIN_MATCH_RATIO
-            and rmse <= MOTION_MAX_RMSE_M
-        )
-        result = cls._empty_motion("ok" if authorized else "low_confidence")
-        yaw_rad = math.radians(yaw_deg)
-        cosine = math.cos(yaw_rad)
-        sine = math.sin(yaw_rad)
-        ego_forward = -(
-            cosine * delta_forward + sine * delta_lateral
-        )
-        ego_lateral = -(
-            -sine * delta_forward + cosine * delta_lateral
-        )
-        confidence = min(
-            1.0,
-            match_ratio * max(0.0, 1.0 - rmse / MOTION_ASSOCIATION_M),
-        )
-        result.update(
-            {
-                "applied": authorized,
-                "confidence": round(confidence, 3),
-                "matched_points": matches,
-                "match_ratio": round(match_ratio, 3),
-                "rmse_m": round(rmse, 4),
-                "ego_forward_m": round(ego_forward, 4),
-                "ego_lateral_m": round(ego_lateral, 4),
-                "ego_yaw_deg": round(-yaw_deg, 3),
-                "transform_forward_m": round(delta_forward, 4),
-                "transform_lateral_m": round(delta_lateral, 4),
-                "transform_yaw_deg": round(yaw_deg, 3),
-            }
-        )
-        return result
-
-    def _stabilize_motion(
-        self,
-        candidate: Dict[str, object],
-    ) -> Dict[str, object]:
-        if not bool(candidate.get("applied")):
-            self._motion_candidates = []
-            return candidate
-        self._motion_candidates.append(candidate)
-        del self._motion_candidates[:-2]
-        if len(self._motion_candidates) < 2:
-            pending = dict(candidate)
-            pending["status"] = "stabilizing"
-            pending["applied"] = False
-            return pending
-        previous, current = self._motion_candidates
-        stable = (
-            abs(
-                float(previous["transform_forward_m"])
-                - float(current["transform_forward_m"])
-            ) <= MOTION_STABILITY_TRANSLATION_M
-            and abs(
-                float(previous["transform_lateral_m"])
-                - float(current["transform_lateral_m"])
-            ) <= MOTION_STABILITY_TRANSLATION_M
-            and abs(
-                float(previous["transform_yaw_deg"])
-                - float(current["transform_yaw_deg"])
-            ) <= MOTION_STABILITY_YAW_DEG
-        )
-        if stable:
-            return candidate
-        rejected = dict(candidate)
-        rejected["status"] = "unstable"
-        rejected["applied"] = False
-        return rejected
-
     def _transform_tracks(
         self,
         delta_forward: float,
@@ -1156,10 +1023,31 @@ class RadarSceneEstimator:
                 "forward_m": key[0] * NEAR_OCCUPANCY_RESOLUTION_M,
                 "lateral_m": key[1] * NEAR_OCCUPANCY_RESOLUTION_M,
             }
-            if existing is None or float(transformed["confidence"]) > float(
-                existing["confidence"]
-            ):
+            if existing is None:
                 transformed_near_cells[key] = transformed
+                continue
+            existing["confidence"] = max(
+                float(existing["confidence"]),
+                float(transformed["confidence"]),
+            )
+            existing["range_uncertainty_m"] = max(
+                float(existing.get("range_uncertainty_m", 0.0)),
+                float(transformed.get("range_uncertainty_m", 0.0)),
+            )
+            existing["lateral_uncertainty_m"] = max(
+                float(existing.get("lateral_uncertainty_m", 0.0)),
+                float(transformed.get("lateral_uncertainty_m", 0.0)),
+            )
+            existing["hits"] = min(
+                255,
+                max(int(existing["hits"]), int(transformed["hits"])),
+            )
+            existing["_last_seen_ns"] = max(
+                int(existing["_last_seen_ns"]),
+                int(transformed["_last_seen_ns"]),
+            )
+            if existing["source"] != transformed["source"]:
+                existing["source"] = "mixed"
         self._near_cells = transformed_near_cells
 
         transformed_trail = [

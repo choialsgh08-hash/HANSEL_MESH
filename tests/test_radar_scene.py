@@ -3,6 +3,7 @@ from dataclasses import replace
 import math
 from pathlib import Path
 import unittest
+from unittest.mock import Mock
 
 from common.radar_geometry import RadarAxes
 from common.sensor_contract import (
@@ -121,6 +122,24 @@ def radar_frame(
         profile_id=profile_id,
         heatmap=heatmap,
     )
+
+
+def point_scan(count: int, offset: float, frame_number: int) -> RadarFrame:
+    positions = (
+        (0.28, -0.30, -0.12),
+        (0.34, -0.15, -0.04),
+        (0.42, 0.00, 0.02),
+        (0.36, 0.16, 0.08),
+        (0.25, 0.28, 0.14),
+    )
+    return radar_frame(tuple(
+        RadarPoint(lateral, forward + offset, height, 0.0, 24.0)
+        for forward, lateral, height in positions[:count]
+    ), frame_number=frame_number)
+
+
+def five_point_scan(offset: float, frame_number: int) -> RadarFrame:
+    return point_scan(5, offset, frame_number)
 
 
 def seed_probability_cell(
@@ -539,6 +558,43 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertAlmostEqual(occupied[0]["probability"], 0.80, places=3)
         self.assertEqual(occupied[0]["hits"], 1)
 
+    def test_confirmed_heatmap_enters_probability_map_without_point_map_confirmation(self):
+        estimator = calibrated_estimator()
+
+        for frame_number in range(1, 4):
+            frame = clustered_heatmap_frame(
+                4,
+                frame_number=frame_number,
+                with_point=True,
+            )
+            weak_point = replace(frame.points[0], snr_db=18.0)
+            estimator.ingest(
+                replace(frame, points=(weak_point,)),
+                received_at=6.0 + frame_number * 0.1,
+            )
+
+        scene = estimator.snapshot(now=6.3)
+        point_track = next(
+            track for track in scene["tracks"] if track["source"] == "point"
+        )
+        heatmap_track = next(
+            track for track in scene["tracks"] if track["source"] == "heatmap"
+        )
+
+        self.assertEqual(point_track["quality_score"], 0.60)
+        self.assertFalse(point_track["map_confirmed"])
+        self.assertTrue(heatmap_track["heatmap_confirmed"])
+        self.assertEqual(
+            heatmap_track["classification"],
+            "confirmed_obstacle",
+        )
+
+        cells = scene["probabilistic_local_map"]["cells"]
+        self.assertEqual(len(cells), 1)
+        self.assertEqual(cells[0]["source"], "heatmap")
+        self.assertAlmostEqual(cells[0]["probability"], 0.80, places=3)
+        self.assertEqual(cells[0]["hits"], 1)
+
     def test_probability_map_decays_and_expires_without_new_ingest(self):
         estimator = calibrated_estimator()
         seed_probability_cell(estimator)
@@ -762,72 +818,78 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(scene["tracks"], [])
         self.assertEqual(scene["diagnostics"]["quality_gate_rejected_count"], 1)
 
-    def test_radar_scan_matching_compensates_forward_robot_motion(self):
+    def test_tentative_raw_points_cannot_move_probability_map(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-
-        def scan(offset: float, frame_number: int) -> RadarFrame:
-            positions = ((0.50, -0.30), (0.82, 0.08), (1.21, 0.41), (1.63, -0.18))
-            return radar_frame(
-                tuple(
-                    RadarPoint(
-                        x_m=lateral,
-                        y_m=forward + offset,
-                        z_m=0.0,
-                        radial_velocity_mps=0.0,
-                        snr_db=20.0,
-                    )
-                    for forward, lateral in positions
-                ),
-                frame_number=frame_number,
-            )
-
-        estimator.ingest(scan(0.0, 1), received_at=1.0)
-        estimator.ingest(scan(-0.05, 2), received_at=1.1)
-        estimator.ingest(scan(-0.10, 3), received_at=1.2)
-        scene = estimator.snapshot(now=1.2)
-
-        motion = scene["motion_compensation"]
-        self.assertEqual(motion["status"], "ok")
-        self.assertTrue(motion["applied"])
-        self.assertEqual(motion["matched_points"], 4)
-        self.assertAlmostEqual(motion["ego_forward_m"], 0.05, delta=0.03)
-        self.assertEqual(len(scene["obstacle_tracks"]), 4)
-
-    def test_radar_scan_matching_preserves_sub_centimeter_motion(self):
-        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
-        positions = ((0.30, -0.20), (0.52, 0.12), (0.74, 0.31), (0.91, -0.08))
-
-        def scan(offset: float, frame_number: int) -> RadarFrame:
-            return radar_frame(
-                tuple(
-                    RadarPoint(
-                        x_m=lateral,
-                        y_m=forward + offset,
-                        z_m=0.0,
-                        radial_velocity_mps=0.0,
-                        snr_db=25.0,
-                    )
-                    for forward, lateral in positions
-                ),
-                frame_number=frame_number,
-            )
-
-        estimator.ingest(scan(0.0, 1), received_at=1.0)
-        estimator.ingest(scan(-0.006, 2), received_at=1.125)
-        estimator.ingest(scan(-0.012, 3), received_at=1.250)
-        motion = estimator.snapshot(now=1.250)["motion_compensation"]
-
-        self.assertTrue(motion["applied"])
-        self.assertGreater(motion["ego_forward_m"], 0.0)
-        self.assertAlmostEqual(motion["ego_forward_m"], 0.005, delta=0.003)
-
-    def test_radar_scan_matching_rejects_implausible_frame_jump(self):
-        previous = ((0.30, -0.20), (0.52, 0.12), (0.74, 0.31), (0.91, -0.08))
-        current = tuple((forward - 0.20, lateral) for forward, lateral in previous)
-
-        motion = RadarSceneEstimator._estimate_ego_motion(previous, current)
-
+        estimator.ingest(five_point_scan(0.0, 1), received_at=1.000)
+        estimator.ingest(five_point_scan(-0.02, 2), received_at=1.125)
+        motion = estimator.snapshot(now=1.125)["motion_compensation"]
         self.assertFalse(motion["applied"])
+        self.assertEqual(motion["matched_points"], 0)
+
+    def test_rejected_four_anchor_motion_never_calls_map_transform(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        for frame_number in range(1, 4):
+            estimator.ingest(point_scan(4, 0.0, frame_number),
+                             received_at=1.0 + frame_number * 0.125)
+        before = sorted(
+            (cell["forward_m"], cell["lateral_m"])
+            for cell in estimator.snapshot(now=1.375)["rolling_local_map"]["cells"]
+        )
+        real_transform = estimator._probability_grid.transform
+        estimator._probability_grid.transform = Mock(wraps=real_transform)
+        estimator.ingest(point_scan(4, -0.02, 4), received_at=1.500)
+        scene = estimator.snapshot(now=1.500)
+        after = sorted(
+            (cell["forward_m"], cell["lateral_m"])
+            for cell in scene["rolling_local_map"]["cells"]
+        )
+        self.assertEqual(scene["motion_compensation"]["status"], "insufficient_points")
+        estimator._probability_grid.transform.assert_not_called()
+        self.assertEqual(after, before)
+
+    def test_only_stable_five_match_motion_transforms_short_memory_map(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        for frame_number in range(1, 4):
+            estimator.ingest(five_point_scan(0.0, frame_number),
+                             received_at=1.0 + frame_number * 0.125)
+        before = sorted(cell["forward_m"] for cell in
+                        estimator.snapshot(now=1.375)["rolling_local_map"]["cells"])
+        estimator.ingest(five_point_scan(-0.02, 4), received_at=1.500)
+        estimator.ingest(five_point_scan(-0.04, 5), received_at=1.625)
+        scene = estimator.snapshot(now=1.625)
+        after = sorted(cell["forward_m"] for cell in scene["rolling_local_map"]["cells"])
+        self.assertTrue(scene["motion_compensation"]["applied"])
+        self.assertEqual(scene["motion_compensation"]["matched_points"], 5)
+        self.assertLess(min(after), min(before))
+        self.assertEqual(
+            sorted(round(track["height_m"], 2) for track in scene["tracks"]),
+            [-0.12, -0.04, 0.02, 0.08, 0.14],
+        )
+
+    def test_near_cell_transform_collision_merges_uncertainty_and_source(self):
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator._near_cells = {
+            (1, -8): {
+                "forward_m": 0.025, "lateral_m": -0.200,
+                "range_uncertainty_m": 0.08, "lateral_uncertainty_m": 0.03,
+                "confidence": 0.90, "source": "point", "hits": 2,
+                "reactive": True, "_last_seen_ns": 1_000_000_000,
+            },
+            (1, -7): {
+                "forward_m": 0.025, "lateral_m": -0.175,
+                "range_uncertainty_m": 0.02, "lateral_uncertainty_m": 0.09,
+                "confidence": 0.95, "source": "heatmap", "hits": 5,
+                "reactive": True, "_last_seen_ns": 1_100_000_000,
+            },
+        }
+        estimator._transform_tracks(0.0, 0.0, math.radians(15.0))
+        cell = estimator._near_obstacle_payload(1.1)[0]
+        self.assertEqual(len(estimator._near_cells), 1)
+        self.assertEqual(cell["range_uncertainty_m"], 0.08)
+        self.assertEqual(cell["lateral_uncertainty_m"], 0.09)
+        self.assertEqual(cell["confidence"], 0.95)
+        self.assertEqual(cell["source"], "mixed")
+        self.assertEqual(cell["hits"], 5)
 
     def test_travel_trail_moves_behind_robot_and_keeps_current_center(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
