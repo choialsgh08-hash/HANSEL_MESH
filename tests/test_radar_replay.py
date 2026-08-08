@@ -628,6 +628,26 @@ class RadarBenchAnnotationTests(unittest.TestCase):
         self.assertEqual(removal["first_clear_seq"], 2)
         self.assertEqual(removal["ghost_persistence_ms"], 2500.0)
 
+    def test_removal_accepts_active_unoccupied_map_cell_presence(self):
+        target = {"forward_m": 0.30, "lateral_m": 0.0}
+        frames = [_timed_frame(1, 1_000_000_000),
+                  _timed_frame(2, 3_500_000_000)]
+        scenes = [
+            _scene_with(
+                calibration="ok", cells=[_cell(0.30, occupied=False)]),
+            _scene_with(calibration="ok"),
+        ]
+        window = {"id": "remove", "kind": "removal", "start_seq": 1,
+                  "end_seq": 2, "target": target, "last_present_seq": 1}
+        removal = analyze_records(
+            frames, _ScriptedEstimator(scenes),
+            bench_annotations=_internal_annotations(frames, [window]),
+        )["bench"]["windows"][0]
+        self.assertTrue(removal["passed"])
+        self.assertEqual(removal["failures"], [])
+        self.assertEqual(removal["first_clear_seq"], 2)
+        self.assertEqual(removal["ghost_persistence_ms"], 2500.0)
+
     def test_transient_path_holds_route_and_confirmed_collision_has_zero_frame_delay(self):
         target = {"forward_m": 0.30, "lateral_m": 0.0}
         frames = [point_frame(0.30, frame_number=index) for index in range(1, 6)]
@@ -649,6 +669,39 @@ class RadarBenchAnnotationTests(unittest.TestCase):
         self.assertEqual(collision["response_seq"], 5)
         self.assertEqual(collision["response_delay_frames"], 0)
         self.assertTrue(collision["passed"])
+
+    def test_collision_rejects_heatmap_only_confirmation(self):
+        target = {"forward_m": 0.30, "lateral_m": 0.0}
+        frames = [point_frame(0.30, frame_number=index) for index in (1, 2)]
+        heatmap = {"forward_m": 0.30, "lateral_m": 0.0,
+                   "source": "heatmap", "age_ms": 0,
+                   "point_confirmed": False, "heatmap_confirmed": True,
+                   "map_confirmed": False}
+        scenes = [
+            _scene_with(calibration="ok", tracks=[dict(heatmap)],
+                        cells=[_cell(0.30)]),
+            _scene_with(
+                calibration="ok", tracks=[dict(heatmap)], cells=[_cell(0.30)],
+                switch=True, status="blocked_near_field",
+                stability="route_changed_blocked",
+            ),
+        ]
+        window = {
+            "id": "collision", "kind": "confirmed_collision",
+            "start_seq": 1, "end_seq": 2, "target": target,
+            "evidence_seqs": [1, 2], "confirmation_seq": 2,
+        }
+        collision = analyze_records(
+            frames, _ScriptedEstimator(scenes),
+            bench_annotations=_internal_annotations(frames, [window]),
+        )["bench"]["windows"][0]
+        self.assertFalse(collision["passed"])
+        self.assertEqual(collision["response_seq"], 2)
+        self.assertEqual(collision["response_delay_frames"], 0)
+        self.assertEqual(
+            collision["failures"],
+            ["collision_not_confirmed_on_second_evidence_frame"],
+        )
 
     def test_hazard_boundaries_accept_exact_010_and_013_and_reject_outside_values(self):
         frames = [radar_frame(frame_number=index) for index in range(1, 4)]
