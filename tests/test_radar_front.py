@@ -1322,7 +1322,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260810-corridor-r35",
+                "20260810-direction-r36",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1337,11 +1337,11 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
             self.assertIn(
-                "/radar_scene.js?v=20260810-corridor-r35",
+                "/radar_scene.js?v=20260810-direction-r36",
                 html,
             )
             self.assertIn(
-                "/radar_panel.js?v=20260810-corridor-r35",
+                "/radar_panel.js?v=20260810-direction-r36",
                 html,
             )
             self.assertIn(
@@ -1352,7 +1352,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 '#radar-status[data-status="http_lost"]',
                 html,
             )
-            self.assertIn('id="build-tag">UI R35</span>', html)
+            self.assertIn('id="build-tag">UI R36</span>', html)
             self.assertIn('class="tag">WHITE = STABLE REFLECTIVITY</span>', html)
             self.assertIn(
                 'id="ground-filter-tag">SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN</span>',
@@ -1377,7 +1377,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html,
             )
             self.assertIn(
-                'const UI_BUILD_ID = "20260810-corridor-r35";',
+                'const UI_BUILD_ID = "20260810-direction-r36";',
                 javascript,
             )
             self.assertIn(

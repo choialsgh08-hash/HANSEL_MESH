@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260810-corridor-r35";
+  const UI_BUILD_ID = "20260810-direction-r36";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -988,7 +988,11 @@
       );
       strokePath(plannedPath.points, "rgba(255, 215, 64, 0.96)", 3.2);
       const blockedPrevious = plannedPath.blocked_previous_path;
-      if (blockedPrevious && Array.isArray(blockedPrevious.points) &&
+      const showBlockedTransition =
+        plannedPath.stability_status == null ||
+        plannedPath.stability_status === "route_changed_blocked";
+      if (showBlockedTransition && blockedPrevious &&
+          Array.isArray(blockedPrevious.points) &&
           Array.isArray(blockedPrevious.segments)) {
         for (const segment of blockedPrevious.segments) {
           const blockedPoints = blockedPrevious.points.slice(
@@ -1015,6 +1019,43 @@
           } else {
             strokePath(blockedPoints, blockedColor, 3.2);
           }
+        }
+      }
+      if (plannedPath.status === "blocked_near_field") {
+        const goalForward = Number(plannedPath.goal_forward_m);
+        const goalLateral = Number(plannedPath.goal_lateral_m);
+        if (Number.isFinite(goalForward) && goalForward > 0 &&
+            Number.isFinite(goalLateral)) {
+          const origin = window.HanselRadarScene.projectMapPoint(
+            transform,
+            0,
+            0,
+          );
+          const goal = window.HanselRadarScene.projectMapPoint(
+            transform,
+            goalForward,
+            goalLateral,
+          );
+          ctx.setLineDash([7, 5]);
+          ctx.strokeStyle = "rgba(255, 213, 79, 0.88)";
+          ctx.lineWidth = 2.4;
+          ctx.beginPath();
+          ctx.moveTo(origin.x, origin.y);
+          ctx.lineTo(goal.x, goal.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          const direction = goalLateral > 0.025
+            ? "RIGHT" : goalLateral < -0.025 ? "LEFT" : "STRAIGHT";
+          ctx.fillStyle = "rgba(255, 225, 125, 0.96)";
+          ctx.font = "700 11px ui-monospace, monospace";
+          ctx.textAlign = goalLateral >= 0 ? "left" : "right";
+          ctx.textBaseline = "bottom";
+          ctx.fillText(
+            `${direction} OPENING · STOP`,
+            goal.x + (goalLateral >= 0 ? 7 : -7),
+            goal.y - 5,
+          );
         }
       }
       if (plannedPath.points.length > 0) {

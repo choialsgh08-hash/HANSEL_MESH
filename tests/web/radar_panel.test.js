@@ -849,6 +849,61 @@ test("singleton blocked path segment renders a visible red point", () => {
   ]);
 });
 
+test("stable stopped view does not present a stale blocked route as guidance", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    forwardMaxM: 0.5, halfWidthM: 0.5,
+  };
+  panel.drawPlannedPath(contexts[0], transform, {
+    status: "blocked_near_field",
+    stability_status: "stable",
+    points: [[0.0, 0.0]],
+    minimum_passage_width_m: 0.21,
+    goal_forward_m: 0.329,
+    goal_lateral_m: 0.376,
+    goal_angle_deg: 48.8,
+    blocked_previous_path: {
+      points: [[0.0, 0.0], [0.20, -0.20], [0.35, -0.37]],
+      segments: [{ start_index: 0, end_index: 2, reason: "near_field_overlap" }],
+    },
+  });
+
+  assert.equal(contexts[0].strokeCalls.some(
+    (call) => call.strokeStyle === "rgba(255, 81, 81, 0.92)",
+  ), false, "an old left route must disappear after the block transition frame");
+});
+
+test("stopped view shows the current positive-lateral opening on screen right", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    forwardMaxM: 0.5, halfWidthM: 0.5,
+  };
+  panel.drawPlannedPath(contexts[0], transform, {
+    status: "blocked_near_field",
+    stability_status: "stable",
+    points: [[0.0, 0.0]],
+    minimum_passage_width_m: 0.21,
+    goal_forward_m: 0.329,
+    goal_lateral_m: 0.376,
+    goal_angle_deg: 48.8,
+    blocked_previous_path: null,
+  });
+
+  const opening = contexts[0].strokeCalls.find(
+    (call) => call.strokeStyle === "rgba(255, 213, 79, 0.88)",
+  );
+  assert.ok(opening, "the stopped view must retain a visible opening direction");
+  assert.ok(
+    opening.path.at(-1)[1] > transform.originX,
+    "positive lateral (right) must end right of the robot center",
+  );
+  assert.ok(contexts[0].fillTextCalls.some(
+    ([label, x]) => String(label).includes("RIGHT") && x > transform.originX,
+  ));
+});
+
 test("collision inset includes fifty centimeters and excludes fifty-one", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
