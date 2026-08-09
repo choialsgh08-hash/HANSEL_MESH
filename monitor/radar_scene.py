@@ -101,7 +101,6 @@ HEATMAP_POINT_CONFIRM_HITS = 2
 HEATMAP_HISTORY_FRAMES = 5
 HEATMAP_MAX_POSITION_JITTER_M = 0.15
 HEATMAP_MAX_CLUSTER_RADIUS_M = 0.30
-HEATMAP_MAX_RANGE_UNCERTAINTY_M = 0.20
 HEATMAP_MAX_CLUSTERS_PER_FRAME = 64
 DANGER_ENTER_M = 0.10
 DANGER_EXIT_M = 0.13
@@ -263,6 +262,7 @@ class RadarSceneEstimator:
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
         self._ground_rejected_count = 0
+        self._ground_fringe_rejected_count = 0
         self._heatmap_cells_accepted = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
@@ -307,6 +307,7 @@ class RadarSceneEstimator:
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
         self._ground_rejected_count = 0
+        self._ground_fringe_rejected_count = 0
         self._heatmap_cells_accepted = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
@@ -351,6 +352,7 @@ class RadarSceneEstimator:
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
         self._ground_rejected_count = 0
+        self._ground_fringe_rejected_count = 0
         self._calibration_status = self._binding_status(frame)
         if self._calibration_status not in TRUSTED_CALIBRATION_STATUSES:
             self._clear_evidence(self._calibration_status)
@@ -382,12 +384,16 @@ class RadarSceneEstimator:
             forward_m, lateral_m = self.axes.map_point(point)
             if not self._in_scene(forward_m, lateral_m):
                 continue
-            if self.mount_geometry.is_ground(
+            ground_classification = self.mount_geometry.ground_classification(
                 forward_m,
                 lateral_m,
                 point.z_m,
-            ):
-                self._ground_rejected_count += 1
+            )
+            if ground_classification is not None:
+                if ground_classification == "ground":
+                    self._ground_rejected_count += 1
+                else:
+                    self._ground_fringe_rejected_count += 1
                 continue
             if (
                 self.clutter_model is not None
@@ -837,6 +843,9 @@ class RadarSceneEstimator:
                     self._quality_gate_rejected_count
                 ),
                 "ground_rejected_count": self._ground_rejected_count,
+                "ground_fringe_rejected_count": (
+                    self._ground_fringe_rejected_count
+                ),
                 "reflectivity_surface_cell_count": len(
                     reflectivity_surface["cells"]
                 ),
@@ -1655,32 +1664,69 @@ class RadarSceneEstimator:
     def _obstacle_collision_radii(
         obstacle: Dict[str, object],
     ) -> Tuple[float, float]:
+        physical_axes = RadarSceneEstimator._obstacle_collision_axes(
+            obstacle,
+            include_grid_padding=False,
+        )
+        effective_axes = RadarSceneEstimator._obstacle_collision_axes(
+            obstacle,
+            include_grid_padding=True,
+        )
+        return max(physical_axes), max(effective_axes)
+
+    @staticmethod
+    def _obstacle_collision_axes(
+        obstacle: Dict[str, object],
+        *,
+        include_grid_padding: bool,
+    ) -> Tuple[float, float]:
         normalized = RadarSceneEstimator._normalize_planning_obstacle(obstacle)
-        physical_radius = (
+        base_radius = (
             PATH_ROBOT_WIDTH_M / 2.0
             + PATH_SAFETY_MARGIN_M
-            + max(
-                float(normalized["range_uncertainty_m"]),
-                float(normalized["lateral_uncertainty_m"]),
-            )
             + float(normalized["support_radius_m"])
         )
+        padding = (
+            PATH_COLLISION_GRID_M / math.sqrt(2.0)
+            if include_grid_padding
+            else 0.0
+        )
         return (
-            physical_radius,
-            physical_radius + PATH_COLLISION_GRID_M / math.sqrt(2.0),
+            base_radius + float(normalized["range_uncertainty_m"]) + padding,
+            base_radius + float(normalized["lateral_uncertainty_m"]) + padding,
         )
 
     @staticmethod
-    def _inside_collision_disk(
+    def _inside_collision_ellipse(
         forward_m: float,
         lateral_m: float,
         obstacle: Dict[str, object],
-        collision_radius_m: float,
+        radial_radius_m: float,
+        tangential_radius_m: float,
     ) -> bool:
-        return math.hypot(
-            forward_m - float(obstacle["forward_m"]),
-            lateral_m - float(obstacle["lateral_m"]),
-        ) <= collision_radius_m
+        obstacle_forward = float(obstacle["forward_m"])
+        obstacle_lateral = float(obstacle["lateral_m"])
+        obstacle_distance = math.hypot(obstacle_forward, obstacle_lateral)
+        if obstacle_distance <= 1e-12:
+            radial_forward, radial_lateral = 1.0, 0.0
+        else:
+            radial_forward = obstacle_forward / obstacle_distance
+            radial_lateral = obstacle_lateral / obstacle_distance
+        delta_forward = forward_m - obstacle_forward
+        delta_lateral = lateral_m - obstacle_lateral
+        radial_delta = (
+            delta_forward * radial_forward
+            + delta_lateral * radial_lateral
+        )
+        tangential_delta = (
+            -delta_forward * radial_lateral
+            + delta_lateral * radial_forward
+        )
+        normalized_distance = (
+            (radial_delta / radial_radius_m) ** 2
+            + (tangential_delta / tangential_radius_m) ** 2
+        )
+        return normalized_distance <= 1.0 + 1e-12
 
     @staticmethod
     def _path_collision_segments(
@@ -1694,21 +1740,25 @@ class RadarSceneEstimator:
         for index, point in enumerate(path.get("points", [])):
             reason = None
             for obstacle in interpolated:
-                _, effective_radius = (
-                    RadarSceneEstimator._obstacle_collision_radii(obstacle)
+                radial_radius, tangential_radius = (
+                    RadarSceneEstimator._obstacle_collision_axes(
+                        obstacle,
+                        include_grid_padding=True,
+                    )
                 )
-                if RadarSceneEstimator._inside_collision_disk(
+                if RadarSceneEstimator._inside_collision_ellipse(
                     float(point[0]),
                     float(point[1]),
                     obstacle,
-                    effective_radius,
+                    radial_radius,
+                    tangential_radius,
                 ):
                     reason = (
                         "near_field_overlap"
                         if math.hypot(
                             float(obstacle["forward_m"]),
                             float(obstacle["lateral_m"]),
-                        ) <= effective_radius
+                        ) <= max(radial_radius, tangential_radius)
                         else "confirmed_obstacle"
                     )
                     break
@@ -1813,9 +1863,13 @@ class RadarSceneEstimator:
         for obstacle in obstacles:
             obstacle_forward = float(obstacle["forward_m"])
             obstacle_lateral = float(obstacle["lateral_m"])
-            _, collision_radius = (
-                RadarSceneEstimator._obstacle_collision_radii(obstacle)
+            radial_radius, tangential_radius = (
+                RadarSceneEstimator._obstacle_collision_axes(
+                    obstacle,
+                    include_grid_padding=True,
+                )
             )
+            collision_radius = max(radial_radius, tangential_radius)
             collision_cell_radius = math.ceil(
                 collision_radius / PATH_COLLISION_GRID_M
             )
@@ -1839,11 +1893,12 @@ class RadarSceneEstimator:
                     cell_lateral = (
                         center_lateral + lateral_offset
                     ) * PATH_COLLISION_GRID_M
-                    if RadarSceneEstimator._inside_collision_disk(
+                    if RadarSceneEstimator._inside_collision_ellipse(
                         cell_forward,
                         cell_lateral,
                         obstacle,
-                        collision_radius,
+                        radial_radius,
+                        tangential_radius,
                     ):
                         blocked_collision_cells.add(
                             (
@@ -1860,13 +1915,19 @@ class RadarSceneEstimator:
                 forward = float(obstacle["forward_m"])
                 lateral = float(obstacle["lateral_m"])
                 distance = math.hypot(forward, lateral)
-                physical_radius, _ = (
-                    RadarSceneEstimator._obstacle_collision_radii(obstacle)
+                _, physical_tangential_radius = (
+                    RadarSceneEstimator._obstacle_collision_axes(
+                        obstacle,
+                        include_grid_padding=False,
+                    )
                 )
                 azimuth = math.degrees(math.atan2(lateral, forward))
                 half_width = math.degrees(
                     math.asin(
-                        min(0.95, physical_radius / max(distance, 1e-9))
+                        min(
+                            0.95,
+                            physical_tangential_radius / max(distance, 1e-9),
+                        )
                     )
                 )
                 occupied.append(
@@ -2202,10 +2263,15 @@ class RadarSceneEstimator:
         )
 
         near_field_blocked = any(
-            math.hypot(
-                float(obstacle["forward_m"]),
-                float(obstacle["lateral_m"]),
-            ) <= RadarSceneEstimator._obstacle_collision_radii(obstacle)[1]
+            RadarSceneEstimator._inside_collision_ellipse(
+                0.0,
+                0.0,
+                obstacle,
+                *RadarSceneEstimator._obstacle_collision_axes(
+                    obstacle,
+                    include_grid_padding=True,
+                ),
+            )
             for obstacle in obstacles
         )
         if near_field_blocked:
@@ -2325,6 +2391,26 @@ class RadarSceneEstimator:
             ),
             default=base_clearance + collision_grid_padding,
         )
+        maximum_collision_radial = max(
+            (
+                RadarSceneEstimator._obstacle_collision_axes(
+                    obstacle,
+                    include_grid_padding=True,
+                )[0]
+                for obstacle in obstacles
+            ),
+            default=base_clearance + collision_grid_padding,
+        )
+        maximum_collision_tangential = max(
+            (
+                RadarSceneEstimator._obstacle_collision_axes(
+                    obstacle,
+                    include_grid_padding=True,
+                )[1]
+                for obstacle in obstacles
+            ),
+            default=base_clearance + collision_grid_padding,
+        )
         return {
             "status": (
                 "blocked_near_field"
@@ -2376,6 +2462,8 @@ class RadarSceneEstimator:
             "obstacle_support_radius_m": maximum_support,
             "collision_grid_padding_m": collision_grid_padding,
             "maximum_collision_radius_m": maximum_collision_radius,
+            "maximum_collision_radial_m": maximum_collision_radial,
+            "maximum_collision_tangential_m": maximum_collision_tangential,
             "goal_forward_m": round(goal_forward_m, 3),
             "goal_lateral_m": round(goal_lateral_m, 3),
             "goal_angle_deg": round(goal_angle_deg, 1),
@@ -2511,24 +2599,11 @@ class RadarSceneEstimator:
                 cell["lateral_m"] * weight
                 for cell, weight in zip(cells, weights)
             ) / total_weight
-            cluster_spread_m = max(
-                math.hypot(
-                    cell["forward_m"] - forward_m,
-                    cell["lateral_m"] - lateral_m,
-                )
-                for cell in cells
-            )
             clusters.append(
                 {
                     "forward_m": forward_m,
                     "lateral_m": lateral_m,
-                    "range_uncertainty_m": max(
-                        heatmap.range_step_m,
-                        min(
-                            HEATMAP_MAX_RANGE_UNCERTAINTY_M,
-                            cluster_spread_m,
-                        ),
-                    ),
+                    "range_uncertainty_m": heatmap.range_step_m,
                     "strength_confidence": max(
                         0.05,
                         min(1.0, peak_residual_db / 24.0),

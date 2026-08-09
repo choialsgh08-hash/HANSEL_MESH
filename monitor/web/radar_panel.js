@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260810-reflectivity-r34";
+  const UI_BUILD_ID = "20260810-corridor-r35";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -1772,6 +1772,10 @@
         : "--";
       setDiagnosticValue("#raw-point-value", "raw_point_count");
       setDiagnosticValue("#ground-rejected-value", "ground_rejected_count");
+      setDiagnosticValue(
+        "#ground-fringe-rejected-value",
+        "ground_fringe_rejected_count",
+      );
       setDiagnosticValue(
         "#reflectivity-cell-value",
         "reflectivity_surface_cell_count",

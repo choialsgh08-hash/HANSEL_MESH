@@ -16,6 +16,7 @@
   const ADDITIVE_DIAGNOSTIC_KEYS = Object.freeze([
     "raw_point_count",
     "ground_rejected_count",
+    "ground_fringe_rejected_count",
     "reflectivity_surface_cell_count",
     "self_clutter_rejected_count",
     "quality_gate_rejected_count",
@@ -303,6 +304,8 @@
       "sensor_height_m",
       "sensor_pitch_deg",
       "ground_rejection_height_m",
+      "ground_uncertainty_m",
+      "effective_rejection_height_m",
       "filter_range_m",
     ];
     if (numericKeys.some((key) =>
@@ -310,8 +313,14 @@
       !Number.isFinite(groundFilter[key])) ||
         groundFilter.sensor_height_m < 0 ||
         groundFilter.ground_rejection_height_m < 0 ||
+        groundFilter.ground_uncertainty_m < 0 ||
         groundFilter.filter_range_m <= 0 ||
-        groundFilter.ground_rejection_height_m >= groundFilter.sensor_height_m ||
+        groundFilter.effective_rejection_height_m >= groundFilter.sensor_height_m ||
+        Math.abs(
+          groundFilter.effective_rejection_height_m -
+          groundFilter.ground_rejection_height_m -
+          groundFilter.ground_uncertainty_m
+        ) > 1e-9 ||
         groundFilter.pitch_convention !== "positive_up" ||
         groundFilter.status !== "configured") {
       throw new Error("invalid ground filter contract");
@@ -320,6 +329,8 @@
       sensorHeightM: groundFilter.sensor_height_m,
       sensorPitchDeg: groundFilter.sensor_pitch_deg,
       groundRejectionHeightM: groundFilter.ground_rejection_height_m,
+      groundUncertaintyM: groundFilter.ground_uncertainty_m,
+      effectiveRejectionHeightM: groundFilter.effective_rejection_height_m,
       filterRangeM: groundFilter.filter_range_m,
       pitchConvention: groundFilter.pitch_convention,
       status: groundFilter.status,

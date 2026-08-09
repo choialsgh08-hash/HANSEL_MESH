@@ -52,7 +52,7 @@ from sensors.radar_parent_lease import (  # noqa: E402
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
-UI_BUILD_ID = "20260810-reflectivity-r34"
+UI_BUILD_ID = "20260810-corridor-r35"
 RADAR_VALID_MIN_RANGE_M = 0.07
 SUPERVISOR_BLOCKED_WARNING = "RADAR RECONNECTING \u00b7 DRIVE STOP"
 
@@ -1187,6 +1187,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum ground-relative height hidden as traversable floor",
     )
     parser.add_argument(
+        "--ground-uncertainty-m",
+        type=float,
+        default=0.015,
+        help="extra ground-height uncertainty fringe hidden from driving evidence",
+    )
+    parser.add_argument(
         "--forward-axis",
         choices=("x", "y"),
         default="y",
@@ -1277,6 +1283,7 @@ def parse_args(
             sensor_height_m=args.sensor_height_m,
             sensor_pitch_deg=args.sensor_pitch_deg,
             ground_rejection_height_m=args.ground_rejection_height_m,
+            ground_uncertainty_m=args.ground_uncertainty_m,
         )
     except (TypeError, ValueError) as exc:
         parser.error(f"invalid radar mount geometry: {exc}")
@@ -1317,6 +1324,7 @@ def run(args: argparse.Namespace) -> int:
             sensor_height_m=args.sensor_height_m,
             sensor_pitch_deg=args.sensor_pitch_deg,
             ground_rejection_height_m=args.ground_rejection_height_m,
+            ground_uncertainty_m=args.ground_uncertainty_m,
         ),
     )
     state = RadarFrontState(

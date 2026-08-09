@@ -765,7 +765,7 @@
             <span class="tag">±60° TRUSTED FOV</span>
             <span class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>
             <span class="tag" id="ground-filter-tag">SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN</span>
-            <span class="tag" id="build-tag">UI R34</span>
+            <span class="tag" id="build-tag">UI R35</span>
             <span class="tag" id="axis-warning">장착축/보정 확인</span>
           </div>
 
@@ -886,6 +886,7 @@
             <dl>
               <dt>Raw point</dt><dd id="raw-point-value">--</dd>
               <dt>Ground 제거</dt><dd id="ground-rejected-value">--</dd>
+              <dt>Ground fringe</dt><dd id="ground-fringe-rejected-value">--</dd>
               <dt>Reflectivity surface</dt><dd id="reflectivity-cell-value">--</dd>
               <dt>확인 track</dt><dd id="confirmed-track-value">--</dd>
               <dt>Clutter 제거</dt><dd id="clutter-rejected-value">--</dd>
@@ -930,8 +931,8 @@
       </footer>
     </main>
 
-    <script src="/radar_scene.js?v=20260810-reflectivity-r34"></script>
-    <script src="/radar_panel.js?v=20260810-reflectivity-r34"></script>
+    <script src="/radar_scene.js?v=20260810-corridor-r35"></script>
+    <script src="/radar_panel.js?v=20260810-corridor-r35"></script>
     <script>
       const panel = new window.HanselRadarPanel(
         document.querySelector("#radar-panel"),

@@ -357,6 +357,8 @@ class RadarSceneEstimatorTests(unittest.TestCase):
                 "sensor_height_m": 0.065,
                 "sensor_pitch_deg": 0.0,
                 "ground_rejection_height_m": 0.035,
+                "ground_uncertainty_m": 0.015,
+                "effective_rejection_height_m": 0.05,
                 "filter_range_m": 0.60,
                 "pitch_convention": "positive_up",
                 "status": "configured",
@@ -380,6 +382,26 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertTrue(scene["tracks"][0]["point_confirmed"])
         self.assertEqual(scene["hazard"]["level"], "DANGER")
         self.assertAlmostEqual(scene["hazard"]["nearest_confirmed_m"], 0.08)
+
+    def test_ground_uncertainty_fringe_never_enters_driving_evidence(self):
+        estimator = calibrated_estimator()
+        fringe_point = RadarPoint(0.0, 0.08, -0.024, 0.0, 30.0)
+        for frame_number in range(1, 4):
+            estimator.ingest(
+                radar_frame((fringe_point,), frame_number=frame_number),
+                received_at=1.0 + frame_number * 0.125,
+            )
+
+        scene = estimator.snapshot(now=1.375)
+
+        self.assertEqual(scene["diagnostics"]["ground_rejected_count"], 0)
+        self.assertEqual(
+            scene["diagnostics"]["ground_fringe_rejected_count"], 1,
+        )
+        self.assertEqual(scene["diagnostics"]["scene_point_count"], 0)
+        self.assertEqual(scene["tracks"], [])
+        self.assertEqual(scene["probabilistic_local_map"]["cells"], [])
+        self.assertNotEqual(scene["planned_path"]["status"], "blocked_near_field")
 
     def test_floor_gate_does_not_hide_return_outside_local_filter_range(self):
         estimator = calibrated_estimator()
@@ -821,6 +843,32 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertAlmostEqual(track["range_uncertainty_m"], 0.09765625)
         self.assertGreaterEqual(track["lateral_uncertainty_m"], 0.05)
 
+    def test_wide_heatmap_surface_keeps_radial_uncertainty_to_one_range_bin(self):
+        data = bytearray(RANGE_BINS * AZIMUTH_BINS)
+        for range_index in range(1, 6):
+            start = range_index * AZIMUTH_BINS
+            data[start : start + AZIMUTH_BINS] = b"\xff" * AZIMUTH_BINS
+        frame = radar_frame(
+            heatmap=RadarHeatmap(
+                data=bytes(data),
+                range_bins=RANGE_BINS,
+                azimuth_bins=AZIMUTH_BINS,
+                range_step_m=RANGE_STEP_M,
+                tlv_type=304,
+                motion_mode="major",
+                floor_db=10.0,
+                ceiling_db=110.0,
+            ),
+        )
+
+        clusters, _, _ = calibrated_estimator()._heatmap_clusters(frame)
+
+        self.assertTrue(clusters)
+        self.assertTrue(all(
+            cluster["range_uncertainty_m"] == RANGE_STEP_M
+            for cluster in clusters
+        ))
+
     def test_point_elevation_is_preserved_but_not_used_for_2d_projection(self):
         estimator = calibrated_estimator()
         frame = radar_frame(
@@ -1080,6 +1128,62 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             path["maximum_collision_radius_m"],
             0.15 / 2 + 0.03 + 0.08 + 0.025 / math.sqrt(2),
         )
+        self.assertAlmostEqual(
+            path["maximum_collision_radial_m"],
+            0.15 / 2 + 0.03 + 0.04 + 0.025 / math.sqrt(2),
+        )
+        self.assertAlmostEqual(
+            path["maximum_collision_tangential_m"],
+            0.15 / 2 + 0.03 + 0.08 + 0.025 / math.sqrt(2),
+        )
+
+    def test_range_uncertainty_is_radial_not_a_sideways_collision_disk(self):
+        obstacle = {
+            "forward_m": 0.30, "lateral_m": 0.0,
+            "range_uncertainty_m": 0.20, "lateral_uncertainty_m": 0.02,
+            "support_radius_m": 0.0, "evidence_kind": "direct",
+            "source": "heatmap",
+        }
+        radial, tangential = RadarSceneEstimator._obstacle_collision_axes(
+            obstacle,
+            include_grid_padding=True,
+        )
+
+        self.assertGreater(radial, tangential)
+        self.assertTrue(RadarSceneEstimator._inside_collision_ellipse(
+            0.30 + radial, 0.0, obstacle, radial, tangential,
+        ))
+        self.assertFalse(RadarSceneEstimator._inside_collision_ellipse(
+            0.30, 0.20, obstacle, radial, tangential,
+        ))
+
+    def test_collision_ellipse_rotates_with_obstacle_bearing(self):
+        obstacle = {
+            "forward_m": 0.30, "lateral_m": 0.30,
+            "range_uncertainty_m": 0.12, "lateral_uncertainty_m": 0.01,
+            "support_radius_m": 0.0, "evidence_kind": "direct",
+            "source": "point",
+        }
+        radial, tangential = RadarSceneEstimator._obstacle_collision_axes(
+            obstacle,
+            include_grid_padding=False,
+        )
+        unit = 1.0 / math.sqrt(2.0)
+
+        self.assertTrue(RadarSceneEstimator._inside_collision_ellipse(
+            0.30 + unit * radial,
+            0.30 + unit * radial,
+            obstacle,
+            radial,
+            tangential,
+        ))
+        self.assertFalse(RadarSceneEstimator._inside_collision_ellipse(
+            0.30 - unit * 0.16,
+            0.30 + unit * 0.16,
+            obstacle,
+            radial,
+            tangential,
+        ))
 
     def test_probability_cell_adds_its_half_diagonal_support(self):
         obstacle = {
@@ -1163,7 +1267,7 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             "support_radius_m": 0.0, "evidence_kind": "direct", "source": "point",
         }
         inflated = dict(
-            base, range_uncertainty_m=0.08, support_radius_m=0.02,
+            base, lateral_uncertainty_m=0.08, support_radius_m=0.02,
         )
         base_path = RadarSceneEstimator._plan_path([base])
         inflated_path = RadarSceneEstimator._plan_path([inflated])
@@ -1514,6 +1618,31 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             path["goal_selection_mode"],
             "widest_motion_relative_corridor",
         )
+
+    def test_diagonal_corridor_produces_a_visible_right_curving_route(self):
+        walls = []
+        for index in range(8):
+            forward_m = 0.12 + index * 0.05
+            walls.extend((
+                {
+                    "forward_m": forward_m,
+                    "lateral_m": -0.14 + index * 0.017,
+                    "source": "point",
+                },
+                {
+                    "forward_m": forward_m,
+                    "lateral_m": 0.18 + index * 0.017,
+                    "source": "point",
+                },
+            ))
+
+        path = RadarSceneEstimator._plan_path(walls)
+
+        self.assertEqual(path["status"], "clear")
+        self.assertGreater(path["goal_angle_deg"], 10.0)
+        self.assertGreater(path["goal_lateral_m"], 0.10)
+        self.assertGreater(path["points"][-1][1], 0.10)
+        self.assertGreaterEqual(path["obstacle_wall_segments"], 12)
 
     def test_planner_uses_curved_local_avoidance(self):
         path = RadarSceneEstimator._plan_path(

@@ -223,6 +223,7 @@ function makeHarness() {
     "raw-point-value",
     "ground-rejected-value",
     "reflectivity-cell-value",
+    "ground-fringe-rejected-value",
     "confirmed-track-value",
     "clutter-rejected-value",
     "heatmap-candidate-value",
@@ -990,6 +991,7 @@ test("validated diagnostics and blocked-near-field status drive existing rows", 
   presentation.diagnostics = {
     raw_point_count: 7,
     ground_rejected_count: 13,
+    ground_fringe_rejected_count: 6,
     reflectivity_surface_cell_count: 11,
     self_clutter_rejected_count: 2,
     quality_gate_rejected_count: 1,
@@ -1014,6 +1016,7 @@ test("validated diagnostics and blocked-near-field status drive existing rows", 
   panel.updateDiagnostics(presentation);
   assert.equal(elements.get("#raw-point-value").textContent, "7");
   assert.equal(elements.get("#ground-rejected-value").textContent, "13");
+  assert.equal(elements.get("#ground-fringe-rejected-value").textContent, "6");
   assert.equal(elements.get("#reflectivity-cell-value").textContent, "11");
   assert.equal(
     elements.get("#ground-filter-tag").textContent,

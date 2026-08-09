@@ -1322,7 +1322,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260810-reflectivity-r34",
+                "20260810-corridor-r35",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1337,11 +1337,11 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
             self.assertIn(
-                "/radar_scene.js?v=20260810-reflectivity-r34",
+                "/radar_scene.js?v=20260810-corridor-r35",
                 html,
             )
             self.assertIn(
-                "/radar_panel.js?v=20260810-reflectivity-r34",
+                "/radar_panel.js?v=20260810-corridor-r35",
                 html,
             )
             self.assertIn(
@@ -1352,7 +1352,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 '#radar-status[data-status="http_lost"]',
                 html,
             )
-            self.assertIn('id="build-tag">UI R34</span>', html)
+            self.assertIn('id="build-tag">UI R35</span>', html)
             self.assertIn('class="tag">WHITE = STABLE REFLECTIVITY</span>', html)
             self.assertIn(
                 'id="ground-filter-tag">SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN</span>',
@@ -1377,7 +1377,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html,
             )
             self.assertIn(
-                'const UI_BUILD_ID = "20260810-reflectivity-r34";',
+                'const UI_BUILD_ID = "20260810-corridor-r35";',
                 javascript,
             )
             self.assertIn(
@@ -1405,6 +1405,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 self.assertIn(height_label, html)
             self.assertIn('id="heatmap-candidate-value"', html)
             self.assertIn('id="reflectivity-cell-value"', html)
+            self.assertIn('id="ground-fringe-rejected-value"', html)
             self.assertIn('id="heatmap-cluster-value"', html)
             self.assertIn('id="reflection-value"', html)
             for diagnostic_id in (
@@ -1534,6 +1535,7 @@ class RadarFrontHttpTests(unittest.TestCase):
         self.assertEqual(args.sensor_height_m, 0.065)
         self.assertEqual(args.sensor_pitch_deg, 0.0)
         self.assertEqual(args.ground_rejection_height_m, 0.035)
+        self.assertEqual(args.ground_uncertainty_m, 0.015)
 
     def test_cli_accepts_future_head_pitch_and_mount_override(self):
         args = parse_args(
@@ -1545,12 +1547,15 @@ class RadarFrontHttpTests(unittest.TestCase):
                 "25",
                 "--ground-rejection-height-m",
                 "0.04",
+                "--ground-uncertainty-m",
+                "0.01",
             ]
         )
 
         self.assertEqual(args.sensor_height_m, 0.08)
         self.assertEqual(args.sensor_pitch_deg, 25.0)
         self.assertEqual(args.ground_rejection_height_m, 0.04)
+        self.assertEqual(args.ground_uncertainty_m, 0.01)
 
     def test_cli_rejects_invalid_ground_geometry(self):
         cases = (
@@ -1563,6 +1568,9 @@ class RadarFrontHttpTests(unittest.TestCase):
             ("--ground-rejection-height-m", "-0.01"),
             ("--ground-rejection-height-m", "0.065"),
             ("--ground-rejection-height-m", "0.07"),
+            ("--ground-uncertainty-m", "nan"),
+            ("--ground-uncertainty-m", "-0.01"),
+            ("--ground-uncertainty-m", "0.03"),
         )
         for option, value in cases:
             with self.subTest(option=option, value=value):

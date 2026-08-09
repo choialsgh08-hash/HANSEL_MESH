@@ -38,6 +38,22 @@ class RadarMountGeometryTests(unittest.TestCase):
         self.assertTrue(geometry.is_ground(0.08, 0.0, -0.03))
         self.assertFalse(geometry.is_ground(0.08, 0.0, 0.0))
 
+    def test_ground_uncertainty_fringe_is_hidden_without_widening_the_fov(self):
+        geometry = RadarMountGeometry()
+
+        self.assertEqual(
+            geometry.ground_classification(0.08, 0.0, -0.030),
+            "ground",
+        )
+        self.assertEqual(
+            geometry.ground_classification(0.08, 0.0, -0.024),
+            "ground_fringe",
+        )
+        self.assertIsNone(
+            geometry.ground_classification(0.08, 0.0, -0.014),
+        )
+        self.assertTrue(geometry.is_ground(0.08, 0.0, -0.024))
+
     def test_ground_gate_does_not_hide_returns_outside_local_forward_window(self):
         geometry = RadarMountGeometry()
 
@@ -60,6 +76,8 @@ class RadarMountGeometryTests(unittest.TestCase):
                 "sensor_height_m": 0.065,
                 "sensor_pitch_deg": 0.0,
                 "ground_rejection_height_m": 0.035,
+                "ground_uncertainty_m": 0.015,
+                "effective_rejection_height_m": 0.05,
                 "filter_range_m": 0.60,
                 "pitch_convention": "positive_up",
                 "status": "configured",
@@ -80,6 +98,10 @@ class RadarMountGeometryTests(unittest.TestCase):
             {"ground_rejection_height_m": math.inf},
             {"ground_rejection_height_m": 0.065},
             {"ground_rejection_height_m": 0.066},
+            {"ground_uncertainty_m": True},
+            {"ground_uncertainty_m": -0.01},
+            {"ground_uncertainty_m": math.inf},
+            {"ground_uncertainty_m": 0.03},
             {"filter_range_m": False},
             {"filter_range_m": 0.0},
             {"filter_range_m": -0.01},
