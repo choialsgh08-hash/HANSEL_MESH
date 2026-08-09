@@ -15,6 +15,7 @@ from monitor.radar_local_map import ProbabilisticRollingGrid
 from monitor.radar_motion import RadarMotionEstimator
 from monitor.radar_path import PathSelectionHysteresis
 from monitor.radar_ground import RadarMountGeometry
+from monitor.radar_corridor import ReflectivityCorridorEstimator
 from monitor.radar_reflectivity import RadarReflectivitySurface
 from monitor.radar_tracking import (
     DEFAULT_RANGE_STEP_M,
@@ -60,6 +61,7 @@ PATH_CURVATURES = (
 )
 PATH_LOCAL_MAX_RANGE_M = 0.60
 PATH_FOV_AZIMUTH_DEG = 60.0
+PATH_PREFERRED_GOAL_MAX_DEG = 55.0
 PATH_SEARCH_MAX_ARC_M = 1.20
 PATH_SEARCH_MAX_EXPANSIONS = 12_000
 PATH_GOAL_FORWARD_M = 0.55
@@ -287,6 +289,7 @@ class RadarSceneEstimator:
             maximum_probability=0.97,
         )
         self._reflectivity_surface = RadarReflectivitySurface()
+        self._reflectivity_corridor = ReflectivityCorridorEstimator()
         self._scene_epoch = 0
         self._travel_trail: List[Tuple[float, float]] = [(0.0, 0.0)]
         self._path_selector = PathSelectionHysteresis(confirm_frames=3)
@@ -321,6 +324,7 @@ class RadarSceneEstimator:
         self._near_cells = {}
         self._probability_grid.clear()
         self._reflectivity_surface.reset()
+        self._reflectivity_corridor.reset()
         self._travel_trail = [(0.0, 0.0)]
         self._path_selector.reset()
         self._planned_path = self._neutral_planned_path("reset")
@@ -617,6 +621,10 @@ class RadarSceneEstimator:
             now,
             elapsed_frame_windows=heatmap_elapsed_frame_windows,
         )
+        self._reflectivity_corridor.ingest(
+            self._reflectivity_surface.payload(now)["cells"],
+            elapsed_frame_windows=heatmap_elapsed_frame_windows,
+        )
 
         self._update_probability_map(now)
         self._scene_point_count = point_count
@@ -710,6 +718,7 @@ class RadarSceneEstimator:
         ]
         stable_obstacles = self._stable_obstacle_payload(observed_at)
         reflectivity_surface = self._reflectivity_surface.payload(observed_at)
+        reflectivity_corridor = self._reflectivity_corridor.payload()
         probability_map = self._probability_grid.payload(observed_at)
         occupied_probability_cells = self._probability_grid.occupied_cells(
             observed_at
@@ -785,6 +794,7 @@ class RadarSceneEstimator:
             "accumulated_obstacles": accumulated_obstacles,
             "persistent_near_obstacles": persistent_near_obstacles,
             "reflectivity_surface": reflectivity_surface,
+            "reflectivity_corridor": reflectivity_corridor,
             "probabilistic_local_map": probability_map,
             "rolling_local_map": {
                 "radius_m": 0.50,
@@ -1406,7 +1416,16 @@ class RadarSceneEstimator:
 
     def _update_stable_path(self, now: float) -> None:
         obstacles = self._planning_obstacle_payload(now)
-        candidate = self._plan_path(obstacles)
+        corridor = self._reflectivity_corridor.payload()
+        preferred_goal_angle_deg = (
+            corridor["guidance_heading_deg"]
+            if corridor["status"] == "confirmed"
+            else None
+        )
+        candidate = self._plan_path(
+            obstacles,
+            preferred_goal_angle_deg=preferred_goal_angle_deg,
+        )
         motion_factor = {
             "ok": 1.0,
             "stabilizing": 0.85,
@@ -1808,7 +1827,21 @@ class RadarSceneEstimator:
     def _plan_path(
         obstacle_tracks: Sequence[Dict[str, object]],
         curvatures: Sequence[float] = PATH_CURVATURES,
+        preferred_goal_angle_deg: Optional[float] = None,
     ) -> Dict[str, object]:
+        if preferred_goal_angle_deg is not None:
+            if isinstance(preferred_goal_angle_deg, bool) or not isinstance(
+                preferred_goal_angle_deg,
+                (int, float),
+            ):
+                raise TypeError("preferred_goal_angle_deg must be numeric")
+            preferred_goal_angle_deg = float(preferred_goal_angle_deg)
+            if not math.isfinite(preferred_goal_angle_deg):
+                raise ValueError("preferred_goal_angle_deg must be finite")
+            preferred_goal_angle_deg = max(
+                -PATH_PREFERRED_GOAL_MAX_DEG,
+                min(PATH_PREFERRED_GOAL_MAX_DEG, preferred_goal_angle_deg),
+            )
         base_clearance = PATH_ROBOT_WIDTH_M / 2.0 + PATH_SAFETY_MARGIN_M
         collision_grid_padding = PATH_COLLISION_GRID_M / math.sqrt(2.0)
         normalized_obstacles = [
@@ -1907,9 +1940,24 @@ class RadarSceneEstimator:
                             )
                         )
 
+        def goal_from_angle(
+            angle_deg: float,
+            corridor_width_deg: float,
+        ) -> Tuple[float, float, float, float]:
+            angle_rad = math.radians(angle_deg)
+            return (
+                PATH_DYNAMIC_GOAL_RANGE_M * math.cos(angle_rad),
+                PATH_DYNAMIC_GOAL_RANGE_M * math.sin(angle_rad),
+                angle_deg,
+                corridor_width_deg,
+            )
+
         def select_dynamic_goal() -> Tuple[float, float, float, float]:
             if not observed_obstacles:
-                return PATH_DYNAMIC_GOAL_RANGE_M, 0.0, 0.0, 120.0
+                return goal_from_angle(
+                    preferred_goal_angle_deg or 0.0,
+                    PATH_FOV_AZIMUTH_DEG * 2.0,
+                )
             occupied: List[Tuple[float, float]] = []
             for obstacle in observed_obstacles:
                 forward = float(obstacle["forward_m"])
@@ -1954,20 +2002,43 @@ class RadarSceneEstimator:
             if cursor < PATH_FOV_AZIMUTH_DEG:
                 free_intervals.append((cursor, PATH_FOV_AZIMUTH_DEG))
             if not free_intervals:
-                return PATH_DYNAMIC_GOAL_RANGE_M, 0.0, 0.0, 0.0
-            best_interval = max(
-                free_intervals,
-                key=lambda interval: (
-                    (interval[1] - interval[0])
-                    - abs((interval[0] + interval[1]) * 0.5) * 0.15,
-                    -abs((interval[0] + interval[1]) * 0.5),
-                ),
-            )
-            goal_angle_deg = (best_interval[0] + best_interval[1]) * 0.5
-            goal_angle_rad = math.radians(goal_angle_deg)
-            return (
-                PATH_DYNAMIC_GOAL_RANGE_M * math.cos(goal_angle_rad),
-                PATH_DYNAMIC_GOAL_RANGE_M * math.sin(goal_angle_rad),
+                return goal_from_angle(
+                    preferred_goal_angle_deg or 0.0,
+                    0.0,
+                )
+            if preferred_goal_angle_deg is None:
+                best_interval = max(
+                    free_intervals,
+                    key=lambda interval: (
+                        (interval[1] - interval[0])
+                        - abs((interval[0] + interval[1]) * 0.5) * 0.15,
+                        -abs((interval[0] + interval[1]) * 0.5),
+                    ),
+                )
+                goal_angle_deg = (
+                    best_interval[0] + best_interval[1]
+                ) * 0.5
+            else:
+                def guided_angle(interval: Tuple[float, float]) -> float:
+                    width = interval[1] - interval[0]
+                    inset = min(0.5, width * 0.5)
+                    lower = interval[0] + inset
+                    upper = interval[1] - inset
+                    return max(
+                        lower,
+                        min(upper, preferred_goal_angle_deg),
+                    )
+
+                best_interval = min(
+                    free_intervals,
+                    key=lambda interval: (
+                        abs(guided_angle(interval) - preferred_goal_angle_deg),
+                        -(interval[1] - interval[0]),
+                        abs(guided_angle(interval)),
+                    ),
+                )
+                goal_angle_deg = guided_angle(best_interval)
+            return goal_from_angle(
                 goal_angle_deg,
                 best_interval[1] - best_interval[0],
             )
@@ -2470,7 +2541,11 @@ class RadarSceneEstimator:
             "goal_corridor_width_deg": round(
                 goal_corridor_width_deg, 1
             ),
-            "goal_selection_mode": "widest_motion_relative_corridor",
+            "goal_selection_mode": (
+                "reflectivity_corridor_guided"
+                if preferred_goal_angle_deg is not None
+                else "widest_motion_relative_corridor"
+            ),
             "persistent_obstacles_used": len(obstacle_tracks),
             "points": points,
         }

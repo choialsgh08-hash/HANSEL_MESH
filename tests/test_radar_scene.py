@@ -32,6 +32,26 @@ REAL_FIXTURE = (
     / "fixtures"
     / "radar_clutter_20260728_f2286_f2291.jsonl"
 )
+RECORDED_RIGHT_CORRIDOR_REFLECTIVITY = (
+    (0.150, -0.250, 0.503),
+    (0.200, -0.225, 0.526),
+    (0.225, -0.175, 0.519),
+    (0.250, -0.150, 0.474),
+    (0.275, -0.100, 0.520),
+    (0.275, -0.075, 0.541),
+    (0.300, -0.025, 0.557),
+    (0.300, 0.000, 0.543),
+    (0.300, 0.025, 0.467),
+    (0.350, 0.150, 0.682),
+    (0.375, 0.100, 0.768),
+    (0.425, 0.250, 0.447),
+    (0.325, -0.375, 0.422),
+    (0.375, -0.300, 0.535),
+    (0.450, -0.175, 0.640),
+    (0.475, -0.125, 0.739),
+    (0.475, -0.050, 0.808),
+    (0.500, 0.000, 0.806),
+)
 
 
 def load_real_fixture() -> tuple[RadarFrame, ...]:
@@ -1618,6 +1638,72 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             path["goal_selection_mode"],
             "widest_motion_relative_corridor",
         )
+
+    def test_confirmed_reflectivity_heading_guides_empty_local_path_right(self):
+        path = RadarSceneEstimator._plan_path(
+            [],
+            preferred_goal_angle_deg=55.0,
+        )
+
+        self.assertGreater(path["goal_angle_deg"], 40.0)
+        self.assertGreater(path["goal_lateral_m"], 0.0)
+        self.assertTrue(any(point[1] > 0.05 for point in path["points"]))
+        self.assertEqual(
+            path["goal_selection_mode"],
+            "reflectivity_corridor_guided",
+        )
+
+    def test_reflectivity_hint_cannot_override_central_collision_stop(self):
+        path = RadarSceneEstimator._plan_path(
+            [
+                {
+                    "forward_m": 0.10,
+                    "lateral_m": 0.0,
+                    "source": "point",
+                    "range_uncertainty_m": 0.049,
+                    "lateral_uncertainty_m": 0.050,
+                    "support_radius_m": 0.035,
+                }
+            ],
+            preferred_goal_angle_deg=55.0,
+        )
+
+        self.assertGreater(path["goal_angle_deg"], 40.0)
+        self.assertGreater(path["goal_lateral_m"], 0.0)
+        self.assertEqual(path["status"], "blocked_near_field")
+        self.assertEqual(path["points"], [[0.0, 0.0]])
+
+    def test_scene_confirms_right_corridor_without_creating_obstacles(self):
+        estimator = calibrated_estimator()
+        with patch.object(
+            estimator,
+            "_heatmap_clusters",
+            return_value=(
+                [],
+                len(RECORDED_RIGHT_CORRIDOR_REFLECTIVITY),
+                list(RECORDED_RIGHT_CORRIDOR_REFLECTIVITY),
+            ),
+        ):
+            for frame_number in range(1, 8):
+                estimator.ingest(
+                    heatmap_only_frame(4, 8, frame_number=frame_number),
+                    received_at=5.0 + frame_number * 0.125,
+                )
+
+        scene = estimator.snapshot(now=5.875)
+
+        self.assertEqual(scene["reflectivity_corridor"]["status"], "confirmed")
+        self.assertEqual(len(scene["reflectivity_corridor"]["walls"]), 2)
+        self.assertGreater(
+            scene["reflectivity_corridor"]["guidance_heading_deg"],
+            40.0,
+        )
+        self.assertGreater(scene["planned_path"]["goal_angle_deg"], 40.0)
+        self.assertGreater(scene["planned_path"]["goal_lateral_m"], 0.0)
+        self.assertFalse(scene["obstacle_tracks"])
+        self.assertEqual(scene["probabilistic_local_map"]["cells"], [])
+        self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
+        self.assertEqual(scene["planned_path"]["persistent_obstacles_used"], 0)
 
     def test_diagonal_corridor_produces_a_visible_right_curving_route(self):
         walls = []

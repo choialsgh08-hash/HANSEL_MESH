@@ -124,6 +124,50 @@ class PathSelectionHysteresisTests(unittest.TestCase):
         self.assertEqual(two["pending_switch_frames"], 2)
         self.assertEqual(three["path"]["status"], "clear")
 
+    def test_repeated_stop_refreshes_guidance_without_counting_a_route_switch(self):
+        selector = PathSelectionHysteresis(confirm_frames=3)
+        selector.select(path(0.0), False, [], 1_000_000_000)
+        stopped_straight = dict(
+            path(0.0),
+            status="blocked_near_field",
+            points=[[0.0, 0.0]],
+            length_m=0.0,
+            goal_angle_deg=0.0,
+            goal_lateral_m=0.0,
+        )
+        first = selector.select(
+            stopped_straight,
+            True,
+            [{"start_index": 0, "end_index": 0, "reason": "near_field_overlap"}],
+            1_125_000_000,
+        )
+        stopped_right = dict(
+            stopped_straight,
+            goal_angle_deg=55.0,
+            goal_lateral_m=0.41,
+            goal_selection_mode="reflectivity_corridor_guided",
+        )
+
+        refreshed = selector.select(
+            stopped_right,
+            True,
+            [{"start_index": 0, "end_index": 0, "reason": "near_field_overlap"}],
+            1_250_000_000,
+        )
+
+        self.assertEqual(refreshed["path"]["goal_angle_deg"], 55.0)
+        self.assertEqual(refreshed["path"]["goal_lateral_m"], 0.41)
+        self.assertFalse(refreshed["switch_accepted"])
+        self.assertEqual(
+            refreshed["selected_since_ns"], first["selected_since_ns"]
+        )
+        self.assertEqual(
+            selector.diagnostics()["path_switch_accepted_count"], 1
+        )
+        self.assertEqual(
+            refreshed["blocked_previous_path"], first["blocked_previous_path"]
+        )
+
     def test_reset_clears_selected_pending_overlay_and_epoch_counters(self):
         selector = PathSelectionHysteresis(confirm_frames=3)
         selector.select(path(0.0), False, [], 1_000_000_000)

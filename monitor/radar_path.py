@@ -59,6 +59,10 @@ class PathSelectionHysteresis:
             and self._same_route(self._selected, candidate)
         )
         if repeated_stop:
+            # A stopped route has no traversed geometry to switch, but its
+            # current sensing guidance still matters to the operator.  Refresh
+            # that metadata without turning it into another accepted switch.
+            self._selected = candidate
             self._pending = None
             self._pending_frames = 0
             return self._result("stable", False)
