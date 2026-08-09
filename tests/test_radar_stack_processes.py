@@ -126,7 +126,7 @@ class RadarStackProcessesTests(unittest.TestCase):
                 "--raw-output", str(self.paths.raw), "--raw-index",
                 str(self.paths.raw_index), "--mission-id",
                 "radar-board-live", "--profile-id",
-                "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1",
+                "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2",
                 "--calibration-id", "radar-clutter-live-test",
             ],
         )
@@ -971,7 +971,7 @@ class RadarStackLauncherTests(unittest.TestCase):
         launcher = load_launcher()
         stable_id = (
             "lsdk-05.05.04.02-presence-near-"
-            "heatmap16-elev8-cfar15-8hz-v1"
+            "heatmap16-elev8-cfar12-8hz-v2"
         )
         experimental_id = (
             "lsdk-05.05.04.02-presence-near-"
@@ -1142,7 +1142,7 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(
             config.profile_id,
             "lsdk-05.05.04.02-presence-near-"
-            "heatmap16-elev8-cfar15-8hz-v1",
+            "heatmap16-elev8-cfar12-8hz-v2",
         )
         self.assertEqual(config.data_baud, 1_250_000)
         self.assertEqual(config.http_bind, "127.0.0.1")

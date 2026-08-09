@@ -52,6 +52,16 @@ RECORDED_RIGHT_CORRIDOR_REFLECTIVITY = (
     (0.475, -0.050, 0.808),
     (0.500, 0.000, 0.806),
 )
+PHOTO_LAYOUT_REFLECTIVITY = (
+    (0.100, -0.100, 0.74),
+    (0.200, -0.136, 0.77),
+    (0.300, -0.173, 0.72),
+    (0.400, -0.209, 0.70),
+    (0.100, -0.047, 0.82),
+    (0.200, -0.083, 0.84),
+    (0.300, -0.119, 0.80),
+    (0.400, -0.156, 0.81),
+)
 
 
 def load_real_fixture() -> tuple[RadarFrame, ...]:
@@ -1673,37 +1683,47 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(path["status"], "blocked_near_field")
         self.assertEqual(path["points"], [[0.0, 0.0]])
 
-    def test_scene_confirms_right_corridor_without_creating_obstacles(self):
+    def test_scene_seeds_corridor_from_current_points_not_heatmap_arc(self):
         estimator = calibrated_estimator()
         with patch.object(
             estimator,
-            "_heatmap_clusters",
-            return_value=(
-                [],
-                len(RECORDED_RIGHT_CORRIDOR_REFLECTIVITY),
-                list(RECORDED_RIGHT_CORRIDOR_REFLECTIVITY),
-            ),
+            "_reflectivity_surface",
         ):
-            for frame_number in range(1, 8):
+            estimator._reflectivity_surface.payload.return_value = {
+                "cells": [
+                    {
+                        "forward_m": forward_m,
+                        "lateral_m": lateral_m,
+                        "intensity": intensity,
+                    }
+                    for forward_m, lateral_m, intensity
+                    in PHOTO_LAYOUT_REFLECTIVITY
+                ]
+            }
+            points = (
+                RadarPoint(-0.027, 0.243, 0.063, 0.0, 13.25),
+                RadarPoint(-0.071, 0.363, 0.095, 0.0, 13.25),
+                RadarPoint(-1.004, 2.248, 0.0, 0.0, 30.0),
+                RadarPoint(-1.046, 2.351, 0.0, 0.0, 30.0),
+            )
+            for frame_number in range(1, 4):
                 estimator.ingest(
-                    heatmap_only_frame(4, 8, frame_number=frame_number),
+                    radar_frame(points, frame_number=frame_number),
                     received_at=5.0 + frame_number * 0.125,
                 )
 
-        scene = estimator.snapshot(now=5.875)
+        scene = estimator.snapshot(now=5.375)
 
         self.assertEqual(scene["reflectivity_corridor"]["status"], "confirmed")
         self.assertEqual(len(scene["reflectivity_corridor"]["walls"]), 2)
-        self.assertGreater(
+        self.assertLess(
             scene["reflectivity_corridor"]["guidance_heading_deg"],
-            40.0,
+            -10.0,
         )
-        self.assertGreater(scene["planned_path"]["goal_angle_deg"], 40.0)
-        self.assertGreater(scene["planned_path"]["goal_lateral_m"], 0.0)
-        self.assertFalse(scene["obstacle_tracks"])
-        self.assertEqual(scene["probabilistic_local_map"]["cells"], [])
-        self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
-        self.assertEqual(scene["planned_path"]["persistent_obstacles_used"], 0)
+        self.assertGreater(scene["reflectivity_corridor"]["width_m"], 0.10)
+        self.assertLess(scene["reflectivity_corridor"]["width_m"], 0.16)
+        for wall in scene["reflectivity_corridor"]["walls"]:
+            self.assertAlmostEqual(wall["start"][0], 0.0, places=6)
 
     def test_diagonal_corridor_produces_a_visible_right_curving_route(self):
         walls = []

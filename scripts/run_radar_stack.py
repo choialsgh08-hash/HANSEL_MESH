@@ -47,7 +47,7 @@ DEFAULT_PROFILE = (
 )
 DEFAULT_PROFILE_ID = (
     "lsdk-05.05.04.02-presence-near-"
-    "heatmap16-elev8-cfar15-8hz-v1"
+    "heatmap16-elev8-cfar12-8hz-v2"
 )
 EXPERIMENTAL_10HZ_PROFILE = (
     REPOSITORY_ROOT

@@ -89,7 +89,7 @@ class RadarSupervisorConfig:
     mission_id: str = "radar-board-live"
     profile_id: str = (
         "lsdk-05.05.04.02-presence-near-"
-        "heatmap16-elev8-cfar15-8hz-v1"
+        "heatmap16-elev8-cfar12-8hz-v2"
     )
     explicit_port: str | None = None
     xds_serial: str | None = None

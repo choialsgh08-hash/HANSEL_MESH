@@ -273,7 +273,7 @@
             -55, Math.min(55, corridor.measured_heading_deg),
           )
         ) > 1e-6 || !Number.isFinite(corridor.width_m) ||
-        corridor.width_m < 0.14 || corridor.width_m > 0.55 ||
+        corridor.width_m < 0.06 || corridor.width_m > 0.55 ||
         corridor.walls.length !== 2) {
       return invalid();
     }
@@ -283,8 +283,8 @@
           !Number.isFinite(wall.heading_deg) ||
           Math.abs(wall.heading_deg) > 75 ||
           !Number.isFinite(wall.normal_offset_m) ||
-          !Number.isInteger(wall.support_cells) || wall.support_cells < 4 ||
-          !Number.isFinite(wall.span_m) || wall.span_m < 0.14 ||
+          !Number.isInteger(wall.support_cells) || wall.support_cells < 2 ||
+          !Number.isFinite(wall.span_m) || wall.span_m < 0.08 ||
           !Number.isFinite(wall.mean_intensity) ||
           wall.mean_intensity < 0.30 || wall.mean_intensity > 1 ||
           !validPointPair(wall.start) || !validPointPair(wall.end) ||
@@ -295,7 +295,7 @@
       const deltaLateral = wall.end[1] - wall.start[1];
       const endpointSpan = Math.hypot(deltaForward, deltaLateral);
       const endpointHeading = Math.atan2(deltaLateral, deltaForward) * 180 / Math.PI;
-      if (Math.abs(endpointSpan - wall.span_m) > 2e-5 ||
+      if (endpointSpan + 2e-5 < wall.span_m ||
           Math.abs(endpointHeading - wall.heading_deg) > 2e-4) {
         return invalid();
       }

@@ -81,6 +81,7 @@ OBSTACLE_CLUSTER_MAX_RANGE_DELTA_M = 0.10
 STABLE_OCCUPANCY_MIN_HITS = 2
 STABLE_OCCUPANCY_TTL_NS = 5_000_000_000
 SHORT_MEMORY_RADIUS_M = 0.50
+CORRIDOR_POINT_MIN_QUALITY = 0.40
 TRAVEL_TRAIL_RESOLUTION_M = 0.01
 ACCUMULATED_OBSTACLE_TTL_S = 5.0
 ACCUMULATED_OBSTACLE_TTL_NS = 5_000_000_000
@@ -383,6 +384,7 @@ class RadarSceneEstimator:
             synthetic=self.synthetic,
         )
         accepted_points: List[Tuple[object, float, float, float, float]] = []
+        corridor_point_observations: List[Dict[str, float]] = []
         rejected = 0
         for point in frame.points:
             forward_m, lateral_m = self.axes.map_point(point)
@@ -411,7 +413,19 @@ class RadarSceneEstimator:
                 rejected += 1
                 continue
             quality_score = point_quality_score(point.snr_db, point.noise_db)
-            if range_step_m is None or quality_score < POINT_MIN_QUALITY:
+            if range_step_m is None:
+                self._quality_gate_rejected_count += 1
+                continue
+            if (
+                quality_score >= CORRIDOR_POINT_MIN_QUALITY
+                and math.hypot(forward_m, lateral_m) <= SHORT_MEMORY_RADIUS_M
+            ):
+                corridor_point_observations.append({
+                    "forward_m": forward_m,
+                    "lateral_m": lateral_m,
+                    "intensity": quality_score,
+                })
+            if quality_score < POINT_MIN_QUALITY:
                 self._quality_gate_rejected_count += 1
                 continue
             accepted_points.append(
@@ -624,6 +638,7 @@ class RadarSceneEstimator:
         self._reflectivity_corridor.ingest(
             self._reflectivity_surface.payload(now)["cells"],
             elapsed_frame_windows=heatmap_elapsed_frame_windows,
+            point_observations=corridor_point_observations,
         )
 
         self._update_probability_map(now)

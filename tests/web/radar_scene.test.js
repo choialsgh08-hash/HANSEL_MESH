@@ -412,6 +412,50 @@ test("validates and detaches the measured two-wall reflectivity corridor", () =>
   assert.equal(parsed.reflectivityCorridor.walls[0].start[0], 0.340976);
 });
 
+test("accepts point-seeded walls extrapolated back to the sensor body", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_parallel_ransac",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 5,
+    measured_heading_deg: -19.25732,
+    guidance_heading_deg: -19.25732,
+    width_m: 0.139151,
+    confidence: 0.435099,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: -19.25732,
+        normal_offset_m: -0.084609,
+        support_cells: 2,
+        span_m: 0.087294,
+        mean_intensity: 0.46205,
+        start: [0.0, -0.089623],
+        end: [0.425, -0.238101],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -19.25732,
+        normal_offset_m: 0.054542,
+        support_cells: 2,
+        span_m: 0.126455,
+        mean_intensity: 0.4375,
+        start: [0.0, 0.057771],
+        end: [0.362396, -0.068835],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.status, "confirmed");
+  assert.equal(parsed.widthM, 0.139151);
+  assert.equal(parsed.walls[0].supportCells, 2);
+  assert.deepEqual(parsed.walls[0].start, [0.0, -0.089623]);
+});
+
 test("accepts only canonical unavailable and candidate corridor states", () => {
   const unavailable = makeSnapshot();
   unavailable.scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
@@ -450,7 +494,7 @@ test("rejects every strict reflectivity-corridor metadata violation", async (t) 
     ["guidance nonfinite", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = NaN; }],
     ["guidance over clamp", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = 56; }],
     ["guidance wrong clamp", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = 54; }],
-    ["width too narrow", (scene) => { scene.reflectivity_corridor.width_m = 0.139; }],
+    ["width too narrow", (scene) => { scene.reflectivity_corridor.width_m = 0.059; }],
     ["width too wide", (scene) => { scene.reflectivity_corridor.width_m = 0.551; }],
     ["confidence negative", (scene) => { scene.reflectivity_corridor.confidence = -0.01; }],
     ["confidence nonfinite", (scene) => { scene.reflectivity_corridor.confidence = Infinity; }],
@@ -484,9 +528,9 @@ test("rejects malformed measured wall geometry and inconsistent pairs", async (t
     ["heading nonfinite", (corridor) => { corridor.walls[0].heading_deg = NaN; }],
     ["heading out of range", (corridor) => { corridor.walls[0].heading_deg = 76; }],
     ["normal nonfinite", (corridor) => { corridor.walls[0].normal_offset_m = Infinity; }],
-    ["support too low", (corridor) => { corridor.walls[0].support_cells = 3; }],
-    ["support fractional", (corridor) => { corridor.walls[0].support_cells = 4.5; }],
-    ["span too short", (corridor) => { corridor.walls[0].span_m = 0.139; }],
+    ["support too low", (corridor) => { corridor.walls[0].support_cells = 1; }],
+    ["support fractional", (corridor) => { corridor.walls[0].support_cells = 2.5; }],
+    ["span too short", (corridor) => { corridor.walls[0].span_m = 0.079; }],
     ["intensity too low", (corridor) => { corridor.walls[0].mean_intensity = 0.299; }],
     ["intensity too high", (corridor) => { corridor.walls[0].mean_intensity = 1.01; }],
     ["start arity", (corridor) => { corridor.walls[0].start = [0.1]; }],

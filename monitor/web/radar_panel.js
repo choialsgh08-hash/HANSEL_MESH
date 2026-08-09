@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260810-wall-corridor-r37";
+  const UI_BUILD_ID = "20260810-point-seeded-wall-r38";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;

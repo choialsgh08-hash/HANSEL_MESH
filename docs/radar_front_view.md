@@ -76,7 +76,7 @@ python -m sensors radar-live `
   --output missions\radar-empty-scene.jsonl `
   --raw-output captures\radar-empty-scene.bin `
   --mission-id radar-empty-scene `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2 `
   --calibration-id uncalibrated `
   --duration 10
 ```
@@ -127,8 +127,8 @@ python -m sensors radar-live `
   --output missions\radar-board-live.jsonl `
   --raw-output captures\radar-board-live.bin `
   --mission-id radar-board-live `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
-  --calibration-id radar-clutter-adc304fbea2c1e4f
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2 `
+  --calibration-id radar-clutter-56430af388abb134
 ```
 
 이 PowerShell은 캡처가 끝날 때까지 닫지 않는다. 출력 요약의
@@ -345,7 +345,7 @@ Each JSONL has a sibling `*.radar-bench.json` with no duplicate or extra keys:
   "schema_version": 1,
   "log_file": "front-targets.jsonl",
   "log_sha256": "64 lowercase hex characters",
-  "profile_id": "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1",
+  "profile_id": "lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2",
   "calibration_id": "radar-clutter-...",
   "provenance": {
     "board_serial": "manual serial",

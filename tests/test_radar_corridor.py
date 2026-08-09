@@ -73,6 +73,25 @@ LIVE_CLUTTERED_RIGHT_CORRIDOR = [
     (0.500, 0.000, 0.8027),
 ]
 
+PHOTO_LAYOUT_POINT_WALL = [
+    (0.243, -0.027, 0.95),
+    (0.363, -0.071, 0.95),
+]
+
+PHOTO_LAYOUT_HEATMAP_WALL = [
+    (0.100, -0.100, 0.74),
+    (0.200, -0.136, 0.77),
+    (0.300, -0.173, 0.72),
+    (0.400, -0.209, 0.70),
+]
+
+PHOTO_LAYOUT_CENTER_ARC = [
+    (0.100, -0.047, 0.82),
+    (0.200, -0.083, 0.84),
+    (0.300, -0.119, 0.80),
+    (0.400, -0.156, 0.81),
+]
+
 
 def cells(rows):
     return [
@@ -86,27 +105,25 @@ def cells(rows):
 
 
 class ReflectivityCorridorEstimatorTests(unittest.TestCase):
-    def test_live_extra_reflections_do_not_displace_the_diagonal_wall_pair(self):
+    def test_heatmap_only_live_reflections_cannot_invent_a_far_diagonal_pair(self):
         estimator = ReflectivityCorridorEstimator()
 
         estimator.ingest(cells(LIVE_CLUTTERED_RIGHT_CORRIDOR))
         payload = estimator.payload()
 
-        self.assertEqual(payload["status"], "candidate")
-        self.assertGreater(payload["measured_heading_deg"], 60.0)
-        self.assertEqual(payload["guidance_heading_deg"], 55.0)
-        self.assertAlmostEqual(payload["width_m"], 0.19321, places=4)
-        self.assertEqual(len(payload["walls"]), 2)
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(payload["walls"], [])
 
-    def test_recorded_diagonal_pair_confirms_after_three_frames(self):
+    def test_point_seeded_photo_layout_confirms_after_three_frames(self):
         estimator = ReflectivityCorridorEstimator()
-        observed = cells(WALL_ONE + WALL_TWO)
+        observed = cells(PHOTO_LAYOUT_HEATMAP_WALL + PHOTO_LAYOUT_CENTER_ARC)
+        point_observations = cells(PHOTO_LAYOUT_POINT_WALL)
 
-        estimator.ingest(observed)
+        estimator.ingest(observed, point_observations=point_observations)
         first = estimator.payload()
-        estimator.ingest(observed)
+        estimator.ingest(observed, point_observations=point_observations)
         second = estimator.payload()
-        estimator.ingest(observed)
+        estimator.ingest(observed, point_observations=point_observations)
         confirmed = estimator.payload()
 
         self.assertEqual(first["status"], "candidate")
@@ -115,41 +132,90 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         self.assertEqual(second["hits"], 2)
         self.assertEqual(confirmed["status"], "confirmed")
         self.assertEqual(confirmed["hits"], 3)
-        self.assertEqual(confirmed["guidance_heading_deg"], 55.0)
-        self.assertGreater(confirmed["measured_heading_deg"], 60.0)
-        self.assertLess(confirmed["measured_heading_deg"], 70.0)
-        self.assertGreater(confirmed["width_m"], 0.16)
-        self.assertLess(confirmed["width_m"], 0.23)
-        self.assertGreater(confirmed["confidence"], 0.5)
+        self.assertLess(confirmed["guidance_heading_deg"], -10.0)
+        self.assertGreater(confirmed["measured_heading_deg"], -25.0)
+        self.assertLess(confirmed["measured_heading_deg"], -10.0)
+        self.assertGreater(confirmed["width_m"], 0.10)
+        self.assertLess(confirmed["width_m"], 0.16)
+        self.assertGreater(confirmed["confidence"], 0.4)
         self.assertEqual(
             [wall["wall_id"] for wall in confirmed["walls"]],
             ["wall_1", "wall_2"],
         )
+        offsets = [wall["normal_offset_m"] for wall in confirmed["walls"]]
+        self.assertLess(offsets[0], 0.0)
+        self.assertGreater(offsets[1], 0.0)
+        self.assertTrue(all(abs(offset) >= 0.03 for offset in offsets))
         for wall in confirmed["walls"]:
-            self.assertGreaterEqual(wall["support_cells"], 4)
-            self.assertGreaterEqual(wall["span_m"], 0.14)
+            self.assertGreaterEqual(wall["support_cells"], 2)
+            self.assertGreaterEqual(wall["span_m"], 0.08)
             self.assertGreater(wall["mean_intensity"], 0.30)
             self.assertEqual(len(wall["start"]), 2)
             self.assertEqual(len(wall["end"]), 2)
+            self.assertAlmostEqual(wall["start"][0], 0.0, places=6)
             self.assertTrue(all(math.isfinite(value) for value in wall["start"]))
             self.assertTrue(all(math.isfinite(value) for value in wall["end"]))
 
     def test_input_order_cannot_change_the_confirmed_payload(self):
         forward = ReflectivityCorridorEstimator()
         reverse = ReflectivityCorridorEstimator()
-        observed = cells(WALL_ONE + WALL_TWO)
+        observed = cells(PHOTO_LAYOUT_HEATMAP_WALL + PHOTO_LAYOUT_CENTER_ARC)
+        point_observations = cells(PHOTO_LAYOUT_POINT_WALL)
 
         for _ in range(3):
-            forward.ingest(observed)
-            reverse.ingest(list(reversed(observed)))
+            forward.ingest(observed, point_observations=point_observations)
+            reverse.ingest(
+                list(reversed(observed)),
+                point_observations=list(reversed(point_observations)),
+            )
 
         self.assertEqual(forward.payload(), reverse.payload())
 
+    def test_temporal_medians_keep_serialized_wall_geometry_consistent(self):
+        estimator = ReflectivityCorridorEstimator()
+        for left_clearance, right_clearance in (
+            (0.03, 0.09),
+            (0.08, 0.08),
+            (0.09, 0.03),
+        ):
+            walls = []
+            for offset in (-left_clearance, right_clearance):
+                walls.append({
+                    "heading_deg": -20.0,
+                    "normal_offset_m": offset,
+                    "support_cells": 2,
+                    "span_m": 0.10,
+                    "mean_intensity": 0.60,
+                    "start": [0.0, offset / math.cos(math.radians(-20.0))],
+                    "end": [0.4, 0.4 * math.tan(math.radians(-20.0))],
+                })
+            estimator._history.append({
+                "measured_heading_deg": -20.0,
+                "width_m": left_clearance + right_clearance,
+                "confidence": 0.60,
+                "walls": walls,
+            })
+
+        payload = estimator.payload()
+        wall_one, wall_two = payload["walls"]
+
+        self.assertEqual(
+            payload["width_m"],
+            round(
+                abs(
+                    wall_one["normal_offset_m"]
+                    - wall_two["normal_offset_m"]
+                ),
+                6,
+            ),
+        )
+
     def test_dropped_windows_remove_confirmation_and_reset_removes_geometry(self):
         estimator = ReflectivityCorridorEstimator()
-        observed = cells(WALL_ONE + WALL_TWO)
+        observed = cells(PHOTO_LAYOUT_HEATMAP_WALL + PHOTO_LAYOUT_CENTER_ARC)
+        point_observations = cells(PHOTO_LAYOUT_POINT_WALL)
         for _ in range(3):
-            estimator.ingest(observed)
+            estimator.ingest(observed, point_observations=point_observations)
         self.assertEqual(estimator.payload()["status"], "confirmed")
 
         estimator.ingest([], elapsed_frame_windows=3)
@@ -159,7 +225,7 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         estimator.ingest([], elapsed_frame_windows=2)
         self.assertEqual(estimator.payload()["status"], "unavailable")
 
-        estimator.ingest(observed)
+        estimator.ingest(observed, point_observations=point_observations)
         self.assertEqual(estimator.payload()["status"], "candidate")
         estimator.reset()
         self.assertEqual(estimator.payload(), {
@@ -178,7 +244,10 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
     def test_single_wall_and_scatter_do_not_invent_a_corridor(self):
         estimator = ReflectivityCorridorEstimator()
         for _ in range(3):
-            estimator.ingest(cells(WALL_ONE))
+            estimator.ingest(
+                cells(PHOTO_LAYOUT_HEATMAP_WALL),
+                point_observations=[],
+            )
         self.assertEqual(estimator.payload()["status"], "unavailable")
 
         scatter = cells([
@@ -191,6 +260,22 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         ])
         for _ in range(3):
             estimator.ingest(scatter)
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+
+    def test_outer_range_arc_without_point_support_is_not_a_wall(self):
+        estimator = ReflectivityCorridorEstimator()
+        outer_arc = cells([
+            (
+                0.49 * math.cos(math.radians(angle)),
+                0.49 * math.sin(math.radians(angle)),
+                0.9,
+            )
+            for angle in range(-55, 56, 10)
+        ])
+
+        for _ in range(3):
+            estimator.ingest(outer_arc)
+
         self.assertEqual(estimator.payload()["status"], "unavailable")
 
     def test_elapsed_frame_windows_must_be_a_positive_integer(self):

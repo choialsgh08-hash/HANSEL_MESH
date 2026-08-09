@@ -70,7 +70,7 @@ python scripts\run_radar_stack.py `
   --xds-serial RI32RI32 `
   --cfg configs\radar\iwrl6432_3d_operator_near_8hz.cfg `
   --profile-id `
-    lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
+    lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2 `
   --clutter-calibration `
     configs\radar\calibrations\head-near-8hz.json
 ```
@@ -83,7 +83,7 @@ supervisor가 `RUNNING`이 되면 브라우저에서
 | 항목 | 기본값 |
 | --- | --- |
 | active profile | `configs\radar\iwrl6432_3d_operator_near_8hz.cfg` |
-| profile ID | `lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1` |
+| profile ID | `lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2` |
 | frame rate/period | 8Hz / 125ms |
 | 첫 프레임 제한 | `--first-frame-timeout 3.0`초 |
 | RUNNING 프레임 제한 | `--frame-timeout 2.5`초 |

@@ -9,7 +9,7 @@ from typing import Optional, Sequence, Tuple
 DEFAULT_RANGE_STEP_M = 0.09765625
 VERIFIED_NEAR_8HZ_PROFILE_ID = (
     "lsdk-05.05.04.02-presence-near-"
-    "heatmap16-elev8-cfar15-8hz-v1"
+    "heatmap16-elev8-cfar12-8hz-v2"
 )
 POINT_HISTORY_FRAMES = 5
 POINT_MAP_CONFIRM_HITS = 3

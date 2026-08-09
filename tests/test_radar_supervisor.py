@@ -81,7 +81,7 @@ class RadarSupervisorContractTests(unittest.TestCase):
         self.assertEqual(
             config.profile_id,
             "lsdk-05.05.04.02-presence-near-"
-            "heatmap16-elev8-cfar15-8hz-v1",
+            "heatmap16-elev8-cfar12-8hz-v2",
         )
         self.assertIsNone(config.explicit_port)
         self.assertIsNone(config.xds_serial)

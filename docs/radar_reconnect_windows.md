@@ -54,7 +54,7 @@ python -m sensors radar-live `
   --output missions\radar-empty-scene.jsonl `
   --raw-output captures\radar-empty-scene.bin `
   --mission-id radar-empty-scene `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2 `
   --calibration-id uncalibrated `
   --duration 10
 ```
@@ -88,7 +88,7 @@ python -m sensors radar-live `
   --output missions\radar-board-live.jsonl `
   --raw-output captures\radar-board-live.bin `
   --mission-id radar-board-live `
-  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar15-8hz-v1 `
+  --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2 `
   --calibration-id uncalibrated
 ```
 

@@ -6,14 +6,14 @@ from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 MIN_CELL_INTENSITY = 0.30
 LINE_TOLERANCE_M = 0.026
-MIN_WALL_SUPPORT_CELLS = 4
-MIN_WALL_SPAN_M = 0.14
+MIN_POINT_WALL_SUPPORT = 2
+MIN_POINT_WALL_SPAN_M = 0.08
+MIN_HEATMAP_WALL_SUPPORT = 2
+MIN_HEATMAP_WALL_SPAN_M = 0.08
 MAX_ABS_WALL_HEADING_DEG = 75.0
-MAX_PARALLEL_HEADING_DIFFERENCE_DEG = 10.0
-MIN_CORRIDOR_WIDTH_M = 0.14
+MIN_CORRIDOR_WIDTH_M = 0.06
 MAX_CORRIDOR_WIDTH_M = 0.55
-MAX_SHARED_SUPPORT_CELLS = 1
-MAX_LINE_CANDIDATES = 128
+MIN_WALL_CLEARANCE_FROM_SENSOR_M = 0.03
 COMPATIBLE_HEADING_DEG = 5.0
 COMPATIBLE_WIDTH_M = 0.05
 MAX_GUIDANCE_HEADING_DEG = 55.0
@@ -54,6 +54,8 @@ class ReflectivityCorridorEstimator:
         self,
         cells: Sequence[Mapping[str, object]],
         elapsed_frame_windows: int = 1,
+        *,
+        point_observations: Sequence[Mapping[str, object]] = (),
     ) -> None:
         if (
             isinstance(elapsed_frame_windows, bool)
@@ -64,7 +66,7 @@ class ReflectivityCorridorEstimator:
             raise ValueError("elapsed_frame_windows must be positive")
         for _ in range(min(self._history_frames, elapsed_frame_windows) - 1):
             self._history.append(None)
-        self._history.append(self._fit_pair(cells))
+        self._history.append(self._fit_pair(cells, point_observations))
 
     def payload(self) -> Dict[str, object]:
         fits = [fit for fit in self._history if fit is not None]
@@ -102,16 +104,28 @@ class ReflectivityCorridorEstimator:
                 fit["walls"][wall_index]
                 for fit in cluster
             ]
+            wall_heading = _median([
+                float(wall["heading_deg"])
+                for wall in source_walls
+            ])
+            normal_offset = _median([
+                float(wall["normal_offset_m"])
+                for wall in source_walls
+            ])
+            start_forward = _median([
+                float(wall["start"][0])
+                for wall in source_walls
+            ])
+            end_forward = _median([
+                float(wall["end"][0])
+                for wall in source_walls
+            ])
+            heading_rad = math.radians(wall_heading)
+            lateral_at_origin = normal_offset / math.cos(heading_rad)
             walls.append({
                 "wall_id": f"wall_{wall_index + 1}",
-                "heading_deg": _rounded(_median([
-                    float(wall["heading_deg"])
-                    for wall in source_walls
-                ])),
-                "normal_offset_m": _rounded(_median([
-                    float(wall["normal_offset_m"])
-                    for wall in source_walls
-                ])),
+                "heading_deg": _rounded(wall_heading),
+                "normal_offset_m": _rounded(normal_offset),
                 "support_cells": int(round(_median([
                     float(wall["support_cells"])
                     for wall in source_walls
@@ -125,24 +139,28 @@ class ReflectivityCorridorEstimator:
                     for wall in source_walls
                 ])),
                 "start": [
-                    _rounded(_median([
-                        float(wall["start"][axis])
-                        for wall in source_walls
-                    ]))
-                    for axis in range(2)
+                    _rounded(start_forward),
+                    _rounded(
+                        lateral_at_origin
+                        + math.tan(heading_rad) * start_forward
+                    ),
                 ],
                 "end": [
-                    _rounded(_median([
-                        float(wall["end"][axis])
-                        for wall in source_walls
-                    ]))
-                    for axis in range(2)
+                    _rounded(end_forward),
+                    _rounded(
+                        lateral_at_origin
+                        + math.tan(heading_rad) * end_forward
+                    ),
                 ],
             })
         measured_heading = _median([
             float(fit["measured_heading_deg"])
             for fit in cluster
         ])
+        serialized_width = abs(
+            float(walls[0]["normal_offset_m"])
+            - float(walls[1]["normal_offset_m"])
+        )
         return {
             "status": (
                 "confirmed" if hits >= self._required_hits else "candidate"
@@ -156,10 +174,7 @@ class ReflectivityCorridorEstimator:
                 -MAX_GUIDANCE_HEADING_DEG,
                 min(MAX_GUIDANCE_HEADING_DEG, measured_heading),
             )),
-            "width_m": _rounded(_median([
-                float(fit["width_m"])
-                for fit in cluster
-            ])),
+            "width_m": _rounded(serialized_width),
             "confidence": _rounded(_median([
                 float(fit["confidence"])
                 for fit in cluster
@@ -212,15 +227,17 @@ class ReflectivityCorridorEstimator:
     def _fit_pair(
         cls,
         cells: Sequence[Mapping[str, object]],
+        point_observations: Sequence[Mapping[str, object]],
     ) -> Optional[Dict[str, object]]:
-        points = cls._points(cells)
-        candidates: Dict[frozenset[int], Dict[str, object]] = {}
-        for left_index, left in enumerate(points):
-            for right in points[left_index + 1:]:
+        heatmap_points = cls._points(cells)
+        point_returns = cls._points(point_observations)
+        pairs: List[Tuple[Tuple[object, ...], Dict[str, object]]] = []
+        for left_index, left in enumerate(point_returns):
+            for right in point_returns[left_index + 1:]:
                 delta_forward = right[0] - left[0]
                 delta_lateral = right[1] - left[1]
                 pair_span = math.hypot(delta_forward, delta_lateral)
-                if pair_span < 0.10:
+                if pair_span < MIN_POINT_WALL_SPAN_M:
                     continue
                 heading = math.degrees(math.atan2(
                     delta_lateral,
@@ -241,143 +258,143 @@ class ReflectivityCorridorEstimator:
                     normal_forward * left[0]
                     + normal_lateral * left[1]
                 )
-                inliers = frozenset(
+                point_inliers = tuple(
                     index
-                    for index, point in enumerate(points)
+                    for index, point in enumerate(point_returns)
                     if abs(
                         normal_forward * point[0]
                         + normal_lateral * point[1]
                         - normal_offset
                     ) <= LINE_TOLERANCE_M + 1e-12
                 )
-                if len(inliers) < MIN_WALL_SUPPORT_CELLS:
+                if len(point_inliers) < MIN_POINT_WALL_SUPPORT:
                     continue
-                projections = [
-                    unit_forward * points[index][0]
-                    + unit_lateral * points[index][1]
-                    for index in inliers
+                point_projections = [
+                    unit_forward * point_returns[index][0]
+                    + unit_lateral * point_returns[index][1]
+                    for index in point_inliers
                 ]
-                span = max(projections) - min(projections)
-                if span < MIN_WALL_SPAN_M:
+                point_span = max(point_projections) - min(point_projections)
+                if point_span < MIN_POINT_WALL_SPAN_M:
                     continue
-                intensity_sum = sum(points[index][2] for index in inliers)
-                candidate = {
-                    "heading_deg": heading,
-                    "normal_offset_m": normal_offset,
-                    "support": inliers,
-                    "support_cells": len(inliers),
-                    "span_m": span,
-                    "mean_intensity": intensity_sum / len(inliers),
-                    "score": intensity_sum + span * 2.0,
-                    "start": [
-                        unit_forward * min(projections)
-                        + normal_forward * normal_offset,
-                        unit_lateral * min(projections)
-                        + normal_lateral * normal_offset,
-                    ],
-                    "end": [
-                        unit_forward * max(projections)
-                        + normal_forward * normal_offset,
-                        unit_lateral * max(projections)
-                        + normal_lateral * normal_offset,
-                    ],
-                }
-                existing = candidates.get(inliers)
-                if existing is None or cls._line_sort_key(candidate) < (
-                    cls._line_sort_key(existing)
-                ):
-                    candidates[inliers] = candidate
-        ordered = sorted(
-            candidates.values(),
-            key=cls._line_sort_key,
-        )[:MAX_LINE_CANDIDATES]
-        pairs: List[Tuple[Tuple[object, ...], Dict[str, object], Dict[str, object]]] = []
-        for left_index, left in enumerate(ordered):
-            for right in ordered[left_index + 1:]:
-                if abs(
-                    float(left["heading_deg"])
-                    - float(right["heading_deg"])
-                ) > MAX_PARALLEL_HEADING_DIFFERENCE_DEG:
+                normal_offset = _median([
+                    normal_forward * point_returns[index][0]
+                    + normal_lateral * point_returns[index][1]
+                    for index in point_inliers
+                ])
+                if abs(normal_offset) < MIN_WALL_CLEARANCE_FROM_SENSOR_M:
                     continue
-                width = abs(
-                    float(left["normal_offset_m"])
-                    - float(right["normal_offset_m"])
+                primary = cls._wall_payload(
+                    heading,
+                    normal_offset,
+                    [point_returns[index] for index in point_inliers],
                 )
-                if not MIN_CORRIDOR_WIDTH_M <= width <= MAX_CORRIDOR_WIDTH_M:
-                    continue
-                shared = len(left["support"] & right["support"])
-                if shared > MAX_SHARED_SUPPORT_CELLS:
-                    continue
-                unique_support = left["support"] | right["support"]
-                unique_intensity = sum(
-                    points[index][2]
-                    for index in unique_support
-                )
-                combined_score = (
-                    unique_intensity
-                    + float(left["span_m"]) * 2.0
-                    + float(right["span_m"]) * 2.0
-                )
-                pair_key = (
-                    -combined_score,
-                    -len(unique_support),
-                    -min(float(left["span_m"]), float(right["span_m"])),
-                    abs((
-                        float(left["heading_deg"])
-                        + float(right["heading_deg"])
-                    ) / 2.0),
-                    width,
-                    float(left["normal_offset_m"]),
-                    float(right["normal_offset_m"]),
-                )
-                pairs.append((pair_key, left, right))
+                heatmap_offsets = [
+                    normal_forward * point[0] + normal_lateral * point[1]
+                    for point in heatmap_points
+                ]
+                seen_support = set()
+                for seed_offset in heatmap_offsets:
+                    heatmap_inliers = tuple(
+                        index
+                        for index, offset in enumerate(heatmap_offsets)
+                        if abs(offset - seed_offset) <= LINE_TOLERANCE_M + 1e-12
+                    )
+                    if heatmap_inliers in seen_support:
+                        continue
+                    seen_support.add(heatmap_inliers)
+                    if len(heatmap_inliers) < MIN_HEATMAP_WALL_SUPPORT:
+                        continue
+                    heatmap_projections = [
+                        unit_forward * heatmap_points[index][0]
+                        + unit_lateral * heatmap_points[index][1]
+                        for index in heatmap_inliers
+                    ]
+                    heatmap_span = max(heatmap_projections) - min(
+                        heatmap_projections
+                    )
+                    if heatmap_span < MIN_HEATMAP_WALL_SPAN_M:
+                        continue
+                    secondary_offset = _median([
+                        heatmap_offsets[index] for index in heatmap_inliers
+                    ])
+                    if (
+                        abs(secondary_offset)
+                        < MIN_WALL_CLEARANCE_FROM_SENSOR_M
+                    ):
+                        continue
+                    offsets = sorted((normal_offset, secondary_offset))
+                    if not offsets[0] < 0.0 < offsets[1]:
+                        continue
+                    width = offsets[1] - offsets[0]
+                    if not MIN_CORRIDOR_WIDTH_M <= width <= MAX_CORRIDOR_WIDTH_M:
+                        continue
+                    secondary = cls._wall_payload(
+                        heading,
+                        secondary_offset,
+                        [heatmap_points[index] for index in heatmap_inliers],
+                    )
+                    walls = sorted(
+                        (primary, secondary),
+                        key=lambda wall: float(wall["normal_offset_m"]),
+                    )
+                    support_total = sum(
+                        int(wall["support_cells"]) for wall in walls
+                    )
+                    minimum_span = min(
+                        float(wall["span_m"]) for wall in walls
+                    )
+                    mean_intensity = sum(
+                        float(wall["mean_intensity"]) for wall in walls
+                    ) / 2.0
+                    confidence = min(
+                        1.0,
+                        min(1.0, support_total / 8.0) * 0.50
+                        + min(1.0, minimum_span / 0.30) * 0.25
+                        + mean_intensity * 0.25,
+                    )
+                    pair_key = (
+                        width,
+                        -support_total,
+                        -minimum_span,
+                        abs(heading),
+                        offsets[0],
+                    )
+                    pairs.append((pair_key, {
+                        "measured_heading_deg": heading,
+                        "width_m": width,
+                        "confidence": confidence,
+                        "walls": walls,
+                    }))
         if not pairs:
             return None
-        _, first, second = min(pairs, key=lambda value: value[0])
-        walls = sorted(
-            [first, second],
-            key=lambda wall: float(wall["normal_offset_m"]),
-        )
-        measured_heading = (
-            float(walls[0]["heading_deg"])
-            + float(walls[1]["heading_deg"])
-        ) / 2.0
-        width = abs(
-            float(walls[1]["normal_offset_m"])
-            - float(walls[0]["normal_offset_m"])
-        )
-        support_total = sum(int(wall["support_cells"]) for wall in walls)
-        minimum_span = min(float(wall["span_m"]) for wall in walls)
-        mean_intensity = sum(
-            float(wall["mean_intensity"]) for wall in walls
-        ) / 2.0
-        confidence = min(
-            1.0,
-            min(1.0, support_total / 12.0) * 0.50
-            + min(1.0, minimum_span / 0.40) * 0.25
-            + mean_intensity * 0.25,
-        )
-        return {
-            "measured_heading_deg": measured_heading,
-            "width_m": width,
-            "confidence": confidence,
-            "walls": [
-                {
-                    key: value
-                    for key, value in wall.items()
-                    if key not in {"support", "score"}
-                }
-                for wall in walls
-            ],
-        }
+        return min(pairs, key=lambda value: value[0])[1]
 
     @staticmethod
-    def _line_sort_key(candidate: Mapping[str, object]) -> Tuple[object, ...]:
-        return (
-            -float(candidate["score"]),
-            -int(candidate["support_cells"]),
-            -float(candidate["span_m"]),
-            abs(float(candidate["heading_deg"])),
-            float(candidate["heading_deg"]),
-            float(candidate["normal_offset_m"]),
+    def _wall_payload(
+        heading_deg: float,
+        normal_offset_m: float,
+        support: Sequence[Point],
+    ) -> Dict[str, object]:
+        heading_rad = math.radians(heading_deg)
+        normal_lateral = math.cos(heading_rad)
+        lateral_at_origin = normal_offset_m / normal_lateral
+        end_forward = max(point[0] for point in support)
+        end_lateral = (
+            lateral_at_origin + math.tan(heading_rad) * end_forward
         )
+        unit_forward = math.cos(heading_rad)
+        unit_lateral = math.sin(heading_rad)
+        projections = [
+            unit_forward * point[0] + unit_lateral * point[1]
+            for point in support
+        ]
+        return {
+            "heading_deg": heading_deg,
+            "normal_offset_m": normal_offset_m,
+            "support_cells": len(support),
+            "span_m": max(projections) - min(projections),
+            "mean_intensity": sum(point[2] for point in support) / len(support),
+            "start": [0.0, lateral_at_origin],
+            "end": [end_forward, end_lateral],
+        }
