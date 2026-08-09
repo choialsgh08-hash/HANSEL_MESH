@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260810-direction-r36";
+  const UI_BUILD_ID = "20260810-wall-corridor-r37";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -405,6 +405,11 @@
         scene.reflectivitySurface,
         { clipShape: "circle" },
       );
+      this.drawReflectivityCorridor(
+        ctx,
+        transform,
+        scene.reflectivityCorridor,
+      );
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
           clipShape: "circle",
@@ -470,6 +475,11 @@
         transform,
         scene.reflectivitySurface,
         { clipShape: "radial" },
+      );
+      this.drawReflectivityCorridor(
+        ctx,
+        transform,
+        scene.reflectivityCorridor,
       );
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
@@ -568,6 +578,78 @@
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
+    }
+
+    drawReflectivityCorridor(ctx, transform, corridor) {
+      const walls = corridor && Array.isArray(corridor.walls)
+        ? corridor.walls : [];
+      if (!corridor || corridor.status === "unavailable" || walls.length !== 2) {
+        return;
+      }
+      const projectedWalls = walls.map((wall) => ({
+        start: window.HanselRadarScene.projectMapPoint(
+          transform,
+          wall.start[0],
+          wall.start[1],
+        ),
+        end: window.HanselRadarScene.projectMapPoint(
+          transform,
+          wall.end[0],
+          wall.end[1],
+        ),
+      }));
+      const candidate = corridor.status === "candidate";
+      ctx.save();
+
+      ctx.fillStyle = "rgba(92, 228, 208, 0.08)";
+      ctx.beginPath();
+      ctx.moveTo(projectedWalls[0].start.x, projectedWalls[0].start.y);
+      ctx.lineTo(projectedWalls[0].end.x, projectedWalls[0].end.y);
+      ctx.lineTo(projectedWalls[1].end.x, projectedWalls[1].end.y);
+      ctx.lineTo(projectedWalls[1].start.x, projectedWalls[1].start.y);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.setLineDash(candidate ? [7, 5] : []);
+      const strokeWalls = (color, width) => {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.lineCap = "round";
+        for (const wall of projectedWalls) {
+          ctx.beginPath();
+          ctx.moveTo(wall.start.x, wall.start.y);
+          ctx.lineTo(wall.end.x, wall.end.y);
+          ctx.stroke();
+        }
+      };
+      strokeWalls("rgba(1, 8, 12, 0.88)", 5.4);
+      strokeWalls("rgba(177, 247, 242, 0.96)", 2.4);
+      ctx.setLineDash([]);
+
+      const labelX = (
+        projectedWalls[0].start.x + projectedWalls[0].end.x +
+        projectedWalls[1].start.x + projectedWalls[1].end.x
+      ) / 4;
+      const labelY = (
+        projectedWalls[0].start.y + projectedWalls[0].end.y +
+        projectedWalls[1].start.y + projectedWalls[1].end.y
+      ) / 4;
+      const widthM = Number(corridor.widthM);
+      const widthLabel = Number.isFinite(widthM)
+        ? `${Math.round(widthM * 100)}cm`
+        : "--cm";
+      const narrowLabel = Number.isFinite(widthM) && widthM < 0.21
+        ? " · NARROW" : "";
+      ctx.fillStyle = "rgba(205, 255, 249, 0.96)";
+      ctx.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(
+        `${candidate ? "CANDIDATE" : "CONFIRMED"} · ${widthLabel}${narrowLabel}`,
+        labelX,
+        labelY - 6,
+      );
+      ctx.restore();
     }
 
     drawProbabilisticLocalMap(ctx, transform, localMap, options) {

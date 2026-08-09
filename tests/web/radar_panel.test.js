@@ -95,6 +95,7 @@ function makeContext() {
     ellipseCalls: [],
     strokeCalls: [],
     fillCalls: [],
+    lineDashCalls: [],
     globalAlphaValues: [],
     shadowBlur: 0,
     setTransform() {},
@@ -104,7 +105,9 @@ function makeContext() {
     rect() {},
     clip() {},
     translate() {},
-    setLineDash() {},
+    setLineDash(pattern) {
+      this.lineDashCalls.push([...pattern]);
+    },
     beginPath() {
       currentPath = [];
     },
@@ -363,6 +366,7 @@ function makeHarness() {
       "ellipseCalls",
       "strokeCalls",
       "fillCalls",
+      "lineDashCalls",
       "globalAlphaValues",
     ]) {
       drawContext[key].length = 0;
@@ -398,6 +402,31 @@ function livePresentationWithProbabilityMap() {
       poseMode: "sensor_relative_short_memory",
       source: "calibrated_heatmap_residual",
       cells: [],
+    },
+    reflectivityCorridor: {
+      status: "confirmed",
+      method: "deterministic_parallel_ransac",
+      historyFrames: 5,
+      requiredHits: 3,
+      hits: 3,
+      measuredHeadingDeg: 65.407542,
+      guidanceHeadingDeg: 55,
+      widthM: 0.19321,
+      confidence: 0.90049,
+      walls: [
+        {
+          wallId: "wall_1", headingDeg: 67.380135,
+          normalOffsetM: -0.461538, supportCells: 6,
+          spanM: 0.413462, meanIntensity: 0.658333,
+          start: [0.340976, -0.381657], end: [0.5, 0.0],
+        },
+        {
+          wallId: "wall_2", headingDeg: 63.434949,
+          normalOffsetM: -0.268328, supportCells: 12,
+          spanM: 0.570197, meanIntensity: 0.545583,
+          start: [0.17, -0.26], end: [0.425, 0.25],
+        },
+      ],
     },
     probabilisticLocalMap: {
       sourceField: "probabilistic_local_map",
@@ -541,7 +570,7 @@ test("null probability map preserves both legacy layers in both map views", () =
   assert.equal(legacyCircleCalls, 2);
 });
 
-test("both map views invoke reflectivity probability and robot-footprint renderers", () => {
+test("both map views invoke reflectivity corridor probability and robot-footprint renderers", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -551,18 +580,21 @@ test("both map views invoke reflectivity probability and robot-footprint rendere
   };
   let probabilityCalls = 0;
   let reflectivityCalls = 0;
+  let corridorCalls = 0;
   let footprintCalls = 0;
   panel.drawReflectivitySurface = () => { reflectivityCalls += 1; };
+  panel.drawReflectivityCorridor = () => { corridorCalls += 1; };
   panel.drawProbabilisticLocalMap = () => { probabilityCalls += 1; };
   panel.drawRobotFootprint = () => { footprintCalls += 1; };
   panel.drawLidarTopView(contexts[0], transform, presentation);
   panel.drawCollisionInset(contexts[1], transform, presentation);
   assert.equal(reflectivityCalls, 2);
+  assert.equal(corridorCalls, 2);
   assert.equal(probabilityCalls, 2);
   assert.equal(footprintCalls, 2);
 });
 
-test("both map views draw reflectivity then probability before every track layer", () => {
+test("both map views draw surface corridor probability path then every track layer", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -570,20 +602,89 @@ test("both map views draw reflectivity then probability before every track layer
     width: 500, height: 500, forwardMaxM: 0.5,
     halfWidthM: 0.5, centeredCircle: true,
   };
-  for (const [context, render] of [
-    [contexts[0], () => panel.drawLidarTopView(contexts[0], transform, presentation)],
-    [contexts[1], () => panel.drawCollisionInset(contexts[1], transform, presentation)],
+  for (const [context, expected, render] of [
+    [contexts[0], ["reflectivity", "corridor", "probability", "path", "tracks", "tracks"],
+      () => panel.drawLidarTopView(contexts[0], transform, presentation)],
+    [contexts[1], ["reflectivity", "corridor", "probability", "path", "tracks"],
+      () => panel.drawCollisionInset(contexts[1], transform, presentation)],
   ]) {
     const order = [];
     panel.drawReflectivitySurface = () => { order.push("reflectivity"); };
+    panel.drawReflectivityCorridor = () => { order.push("corridor"); };
     panel.drawProbabilisticLocalMap = () => { order.push("probability"); };
+    panel.drawPlannedPath = () => { order.push("path"); };
     panel.drawTracks = () => { order.push("tracks"); };
     render();
-    assert.deepEqual(order.slice(0, 2), ["reflectivity", "probability"]);
-    assert.ok(order.includes("tracks"));
-    assert.ok(order.slice(2).every((entry) => entry === "tracks"));
+    assert.deepEqual(order, expected);
     assert.ok(context);
   }
+});
+
+test("confirmed two-wall corridor draws measured walls region width and narrow label", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+
+  panel.drawReflectivityCorridor(
+    contexts[0], transform, presentation.reflectivityCorridor,
+  );
+
+  const measuredStrokes = contexts[0].strokeCalls.filter(
+    (call) => call.strokeStyle === "rgba(177, 247, 242, 0.96)",
+  );
+  const underlayStrokes = contexts[0].strokeCalls.filter(
+    (call) => call.strokeStyle === "rgba(1, 8, 12, 0.88)",
+  );
+  assert.equal(measuredStrokes.length, 2);
+  assert.equal(underlayStrokes.length, 2);
+  assert.ok(contexts[0].fillCalls.some(
+    (call) => call.fillStyle === "rgba(92, 228, 208, 0.08)" &&
+      call.path.filter((entry) => entry[0] === "lineTo").length === 3,
+  ));
+  assert.ok(contexts[0].fillTextCalls.some(
+    ([label]) => label === "CONFIRMED · 19cm · NARROW",
+  ));
+});
+
+test("candidate walls are dashed and unavailable geometry draws nothing", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  const candidate = {
+    ...presentation.reflectivityCorridor,
+    status: "candidate",
+    hits: 2,
+  };
+
+  panel.drawReflectivityCorridor(contexts[0], transform, candidate);
+  assert.ok(contexts[0].lineDashCalls.some(
+    (pattern) => JSON.stringify(pattern) === JSON.stringify([7, 5]),
+  ));
+  assert.ok(contexts[0].fillTextCalls.some(
+    ([label]) => String(label).startsWith("CANDIDATE · 19cm"),
+  ));
+
+  const before = {
+    strokes: contexts[1].strokeCalls.length,
+    fills: contexts[1].fillCalls.length,
+    labels: contexts[1].fillTextCalls.length,
+  };
+  panel.drawReflectivityCorridor(contexts[1], transform, {
+    status: "unavailable", walls: [],
+  });
+  assert.deepEqual({
+    strokes: contexts[1].strokeCalls.length,
+    fills: contexts[1].fillCalls.length,
+    labels: contexts[1].fillTextCalls.length,
+  }, before);
 });
 
 test("reflectivity surface fills cells and outlines only exposed edges", () => {
