@@ -28,6 +28,51 @@ WALL_TWO = [
     (0.500, 0.000, 0.806),
 ]
 
+LIVE_CLUTTERED_RIGHT_CORRIDOR = [
+    (0.100, -0.275, 0.4973),
+    (0.150, -0.250, 0.5007),
+    (0.150, -0.125, 0.3440),
+    (0.150, 0.250, 0.4805),
+    (0.175, -0.100, 0.2681),
+    (0.200, -0.350, 0.2296),
+    (0.200, -0.225, 0.4649),
+    (0.200, 0.225, 0.4279),
+    (0.225, -0.175, 0.4009),
+    (0.225, 0.175, 0.3400),
+    (0.250, -0.300, 0.3580),
+    (0.250, -0.150, 0.6087),
+    (0.250, 0.150, 0.3287),
+    (0.275, -0.100, 0.6226),
+    (0.275, -0.075, 0.6131),
+    (0.275, 0.075, 0.4792),
+    (0.275, 0.100, 0.4514),
+    (0.300, -0.250, 0.5296),
+    (0.300, -0.025, 0.5925),
+    (0.300, 0.000, 0.5144),
+    (0.300, 0.025, 0.4049),
+    (0.325, -0.375, 0.4474),
+    (0.350, -0.200, 0.5126),
+    (0.350, -0.150, 0.4442),
+    (0.350, 0.150, 0.7119),
+    (0.350, 0.200, 0.4035),
+    (0.375, -0.300, 0.5717),
+    (0.375, -0.100, 0.3545),
+    (0.375, 0.100, 0.8133),
+    (0.375, 0.300, 0.2870),
+    (0.400, -0.050, 0.5588),
+    (0.400, 0.000, 0.7211),
+    (0.400, 0.050, 0.7988),
+    (0.425, -0.250, 0.5250),
+    (0.425, 0.250, 0.4889),
+    (0.450, -0.175, 0.5073),
+    (0.450, 0.175, 0.6966),
+    (0.475, -0.125, 0.6347),
+    (0.475, -0.050, 0.7607),
+    (0.475, 0.050, 0.8020),
+    (0.475, 0.125, 0.7900),
+    (0.500, 0.000, 0.8027),
+]
+
 
 def cells(rows):
     return [
@@ -41,6 +86,18 @@ def cells(rows):
 
 
 class ReflectivityCorridorEstimatorTests(unittest.TestCase):
+    def test_live_extra_reflections_do_not_displace_the_diagonal_wall_pair(self):
+        estimator = ReflectivityCorridorEstimator()
+
+        estimator.ingest(cells(LIVE_CLUTTERED_RIGHT_CORRIDOR))
+        payload = estimator.payload()
+
+        self.assertEqual(payload["status"], "candidate")
+        self.assertGreater(payload["measured_heading_deg"], 60.0)
+        self.assertEqual(payload["guidance_heading_deg"], 55.0)
+        self.assertAlmostEqual(payload["width_m"], 0.19321, places=4)
+        self.assertEqual(len(payload["walls"]), 2)
+
     def test_recorded_diagonal_pair_confirms_after_three_frames(self):
         estimator = ReflectivityCorridorEstimator()
         observed = cells(WALL_ONE + WALL_TWO)
