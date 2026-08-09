@@ -116,6 +116,58 @@ function makeReflectivityCell(overrides = {}) {
   };
 }
 
+function makeReflectivityCorridor(overrides = {}) {
+  return {
+    status: "confirmed",
+    method: "deterministic_parallel_ransac",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 65.407542,
+    guidance_heading_deg: 55.0,
+    width_m: 0.19321,
+    confidence: 0.90049,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: 67.380135,
+        normal_offset_m: -0.461538,
+        support_cells: 6,
+        span_m: 0.413462,
+        mean_intensity: 0.658333,
+        start: [0.340976, -0.381657],
+        end: [0.5, 0.0],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: 63.434949,
+        normal_offset_m: -0.268328,
+        support_cells: 12,
+        span_m: 0.570197,
+        mean_intensity: 0.545583,
+        start: [0.17, -0.26],
+        end: [0.425, 0.25],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function makeUnavailableReflectivityCorridor() {
+  return {
+    status: "unavailable",
+    method: "deterministic_parallel_ransac",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 0,
+    measured_heading_deg: null,
+    guidance_heading_deg: null,
+    width_m: null,
+    confidence: 0.0,
+    walls: [],
+  };
+}
+
 function makeSnapshot(overrides = {}) {
   const grid = makeGrid(60, 60).payload;
   const diagnostics = Object.fromEntries(
@@ -151,6 +203,7 @@ function makeSnapshot(overrides = {}) {
         source: "calibrated_heatmap_residual",
         cells: [],
       },
+      reflectivity_corridor: makeReflectivityCorridor(),
       probabilistic_local_map: {
         radius_m: 0.50,
         resolution_m: 0.05,
@@ -205,6 +258,7 @@ function makeLegacySnapshot(overrides = {}) {
   const snapshot = makeSnapshot(overrides);
   delete snapshot.scene.probabilistic_local_map;
   delete snapshot.scene.ground_filter;
+  delete snapshot.scene.reflectivity_corridor;
   snapshot.scene.pose_mode = "robot_relative";
   for (const key of ADDITIVE_DIAGNOSTIC_KEYS) {
     delete snapshot.scene.diagnostics[key];
@@ -314,6 +368,147 @@ test("validates and detaches the display-only reflectivity surface", () => {
   });
   snapshot.scene.reflectivity_surface.cells[0].intensity = 0.1;
   assert.equal(parsed.reflectivitySurface.cells[0].intensity, 0.9);
+});
+
+test("validates and detaches the measured two-wall reflectivity corridor", () => {
+  const snapshot = makeSnapshot();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivityCorridor, {
+    status: "confirmed",
+    method: "deterministic_parallel_ransac",
+    historyFrames: 5,
+    requiredHits: 3,
+    hits: 3,
+    measuredHeadingDeg: 65.407542,
+    guidanceHeadingDeg: 55.0,
+    widthM: 0.19321,
+    confidence: 0.90049,
+    walls: [
+      {
+        wallId: "wall_1",
+        headingDeg: 67.380135,
+        normalOffsetM: -0.461538,
+        supportCells: 6,
+        spanM: 0.413462,
+        meanIntensity: 0.658333,
+        start: [0.340976, -0.381657],
+        end: [0.5, 0.0],
+      },
+      {
+        wallId: "wall_2",
+        headingDeg: 63.434949,
+        normalOffsetM: -0.268328,
+        supportCells: 12,
+        spanM: 0.570197,
+        meanIntensity: 0.545583,
+        start: [0.17, -0.26],
+        end: [0.425, 0.25],
+      },
+    ],
+  });
+  snapshot.scene.reflectivity_corridor.walls[0].start[0] = 9.0;
+  assert.equal(parsed.reflectivityCorridor.walls[0].start[0], 0.340976);
+});
+
+test("accepts only canonical unavailable and candidate corridor states", () => {
+  const unavailable = makeSnapshot();
+  unavailable.scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+  assert.equal(
+    sceneApi.parseRadarScene(unavailable).reflectivityCorridor.status,
+    "unavailable",
+  );
+
+  const candidate = makeSnapshot();
+  candidate.scene.reflectivity_corridor.status = "candidate";
+  candidate.scene.reflectivity_corridor.hits = 2;
+  assert.equal(
+    sceneApi.parseRadarScene(candidate).reflectivityCorridor.status,
+    "candidate",
+  );
+});
+
+test("rejects every strict reflectivity-corridor metadata violation", async (t) => {
+  const cases = [
+    ["missing", (scene) => delete scene.reflectivity_corridor],
+    ["null", (scene) => { scene.reflectivity_corridor = null; }],
+    ["array", (scene) => { scene.reflectivity_corridor = []; }],
+    ["status", (scene) => { scene.reflectivity_corridor.status = "stable"; }],
+    ["method", (scene) => { scene.reflectivity_corridor.method = "least_squares"; }],
+    ["history", (scene) => { scene.reflectivity_corridor.history_frames = 4; }],
+    ["required", (scene) => { scene.reflectivity_corridor.required_hits = 2; }],
+    ["fractional hits", (scene) => { scene.reflectivity_corridor.hits = 3.5; }],
+    ["confirmed too few hits", (scene) => { scene.reflectivity_corridor.hits = 2; }],
+    ["candidate too many hits", (scene) => {
+      scene.reflectivity_corridor.status = "candidate";
+      scene.reflectivity_corridor.hits = 3;
+    }],
+    ["measured null", (scene) => { scene.reflectivity_corridor.measured_heading_deg = null; }],
+    ["measured nonfinite", (scene) => { scene.reflectivity_corridor.measured_heading_deg = Infinity; }],
+    ["measured out of range", (scene) => { scene.reflectivity_corridor.measured_heading_deg = 76; }],
+    ["guidance nonfinite", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = NaN; }],
+    ["guidance over clamp", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = 56; }],
+    ["guidance wrong clamp", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = 54; }],
+    ["width too narrow", (scene) => { scene.reflectivity_corridor.width_m = 0.139; }],
+    ["width too wide", (scene) => { scene.reflectivity_corridor.width_m = 0.551; }],
+    ["confidence negative", (scene) => { scene.reflectivity_corridor.confidence = -0.01; }],
+    ["confidence nonfinite", (scene) => { scene.reflectivity_corridor.confidence = Infinity; }],
+    ["wall count", (scene) => { scene.reflectivity_corridor.walls.pop(); }],
+    ["unavailable geometry", (scene) => {
+      scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+      scene.reflectivity_corridor.width_m = 0.2;
+    }],
+    ["unavailable walls", (scene) => {
+      scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+      scene.reflectivity_corridor.walls = makeReflectivityCorridor().walls;
+    }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      mutate(snapshot.scene);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity corridor contract/,
+      );
+    });
+  }
+});
+
+test("rejects malformed measured wall geometry and inconsistent pairs", async (t) => {
+  const cases = [
+    ["wall object", (corridor) => { corridor.walls[0] = null; }],
+    ["wall id", (corridor) => { corridor.walls[0].wall_id = "left"; }],
+    ["duplicate id", (corridor) => { corridor.walls[1].wall_id = "wall_1"; }],
+    ["heading nonfinite", (corridor) => { corridor.walls[0].heading_deg = NaN; }],
+    ["heading out of range", (corridor) => { corridor.walls[0].heading_deg = 76; }],
+    ["normal nonfinite", (corridor) => { corridor.walls[0].normal_offset_m = Infinity; }],
+    ["support too low", (corridor) => { corridor.walls[0].support_cells = 3; }],
+    ["support fractional", (corridor) => { corridor.walls[0].support_cells = 4.5; }],
+    ["span too short", (corridor) => { corridor.walls[0].span_m = 0.139; }],
+    ["intensity too low", (corridor) => { corridor.walls[0].mean_intensity = 0.299; }],
+    ["intensity too high", (corridor) => { corridor.walls[0].mean_intensity = 1.01; }],
+    ["start arity", (corridor) => { corridor.walls[0].start = [0.1]; }],
+    ["end nonfinite", (corridor) => { corridor.walls[0].end[1] = Infinity; }],
+    ["reversed endpoints", (corridor) => {
+      [corridor.walls[0].start, corridor.walls[0].end] =
+        [corridor.walls[0].end, corridor.walls[0].start];
+    }],
+    ["endpoint span mismatch", (corridor) => { corridor.walls[0].end[0] -= 0.1; }],
+    ["nonparallel pair", (corridor) => { corridor.walls[1].heading_deg = 50; }],
+    ["width mismatch", (corridor) => { corridor.walls[1].normal_offset_m += 0.02; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      mutate(snapshot.scene.reflectivity_corridor);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity corridor contract/,
+      );
+    });
+  }
 });
 
 test("rejects every strict reflectivity-surface metadata mismatch", async (t) => {

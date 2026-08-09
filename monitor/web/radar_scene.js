@@ -226,6 +226,115 @@
     };
   }
 
+  function parseReflectivityCorridor(scene) {
+    const corridor = scene.reflectivity_corridor;
+    const invalid = () => {
+      throw new Error("invalid reflectivity corridor contract");
+    };
+    if (!isPlainObject(corridor) ||
+        !["unavailable", "candidate", "confirmed"].includes(corridor.status) ||
+        corridor.method !== "deterministic_parallel_ransac" ||
+        corridor.history_frames !== 5 || corridor.required_hits !== 3 ||
+        !Number.isInteger(corridor.hits) || corridor.hits < 0 ||
+        corridor.hits > corridor.history_frames ||
+        !Number.isFinite(corridor.confidence) || corridor.confidence < 0 ||
+        corridor.confidence > 1 || !Array.isArray(corridor.walls)) {
+      return invalid();
+    }
+    if (corridor.status === "unavailable") {
+      if (corridor.hits !== 0 || corridor.measured_heading_deg !== null ||
+          corridor.guidance_heading_deg !== null || corridor.width_m !== null ||
+          corridor.confidence !== 0 || corridor.walls.length !== 0) {
+        return invalid();
+      }
+      return {
+        status: corridor.status,
+        method: corridor.method,
+        historyFrames: corridor.history_frames,
+        requiredHits: corridor.required_hits,
+        hits: corridor.hits,
+        measuredHeadingDeg: null,
+        guidanceHeadingDeg: null,
+        widthM: null,
+        confidence: corridor.confidence,
+        walls: [],
+      };
+    }
+    if ((corridor.status === "candidate" &&
+          (corridor.hits < 1 || corridor.hits >= corridor.required_hits)) ||
+        (corridor.status === "confirmed" &&
+          corridor.hits < corridor.required_hits) ||
+        !Number.isFinite(corridor.measured_heading_deg) ||
+        Math.abs(corridor.measured_heading_deg) > 75 ||
+        !Number.isFinite(corridor.guidance_heading_deg) ||
+        Math.abs(corridor.guidance_heading_deg) > 55 ||
+        Math.abs(
+          corridor.guidance_heading_deg - Math.max(
+            -55, Math.min(55, corridor.measured_heading_deg),
+          )
+        ) > 1e-6 || !Number.isFinite(corridor.width_m) ||
+        corridor.width_m < 0.14 || corridor.width_m > 0.55 ||
+        corridor.walls.length !== 2) {
+      return invalid();
+    }
+    const walls = corridor.walls.map((wall) => {
+      if (!isPlainObject(wall) ||
+          !["wall_1", "wall_2"].includes(wall.wall_id) ||
+          !Number.isFinite(wall.heading_deg) ||
+          Math.abs(wall.heading_deg) > 75 ||
+          !Number.isFinite(wall.normal_offset_m) ||
+          !Number.isInteger(wall.support_cells) || wall.support_cells < 4 ||
+          !Number.isFinite(wall.span_m) || wall.span_m < 0.14 ||
+          !Number.isFinite(wall.mean_intensity) ||
+          wall.mean_intensity < 0.30 || wall.mean_intensity > 1 ||
+          !validPointPair(wall.start) || !validPointPair(wall.end) ||
+          wall.end[0] < wall.start[0] - 1e-9) {
+        return invalid();
+      }
+      const deltaForward = wall.end[0] - wall.start[0];
+      const deltaLateral = wall.end[1] - wall.start[1];
+      const endpointSpan = Math.hypot(deltaForward, deltaLateral);
+      const endpointHeading = Math.atan2(deltaLateral, deltaForward) * 180 / Math.PI;
+      if (Math.abs(endpointSpan - wall.span_m) > 2e-5 ||
+          Math.abs(endpointHeading - wall.heading_deg) > 2e-4) {
+        return invalid();
+      }
+      return {
+        wallId: wall.wall_id,
+        headingDeg: wall.heading_deg,
+        normalOffsetM: wall.normal_offset_m,
+        supportCells: wall.support_cells,
+        spanM: wall.span_m,
+        meanIntensity: wall.mean_intensity,
+        start: [...wall.start],
+        end: [...wall.end],
+      };
+    });
+    if (new Set(walls.map((wall) => wall.wallId)).size !== 2 ||
+        Math.abs(walls[0].headingDeg - walls[1].headingDeg) > 10 ||
+        Math.abs(
+          Math.abs(walls[0].normalOffsetM - walls[1].normalOffsetM) -
+          corridor.width_m
+        ) > 2e-5 || Math.abs(
+          (walls[0].headingDeg + walls[1].headingDeg) / 2 -
+          corridor.measured_heading_deg
+        ) > 2e-5) {
+      return invalid();
+    }
+    return {
+      status: corridor.status,
+      method: corridor.method,
+      historyFrames: corridor.history_frames,
+      requiredHits: corridor.required_hits,
+      hits: corridor.hits,
+      measuredHeadingDeg: corridor.measured_heading_deg,
+      guidanceHeadingDeg: corridor.guidance_heading_deg,
+      widthM: corridor.width_m,
+      confidence: corridor.confidence,
+      walls,
+    };
+  }
+
   function validateFilteredTrack(track) {
     if (!isPlainObject(track) || !Number.isInteger(track.track_id) ||
         track.track_id <= 0 || !Number.isInteger(track.age_ms) ||
@@ -471,6 +580,8 @@
       ? parseProbabilisticLocalMap(scene) : null;
     const reflectivitySurface = hasProbabilityMap
       ? parseReflectivitySurface(scene) : null;
+    const reflectivityCorridor = hasProbabilityMap
+      ? parseReflectivityCorridor(scene) : null;
     const groundFilter = parseGroundFilter(scene.ground_filter, hasProbabilityMap);
     const diagnostics = parseDiagnostics(scene.diagnostics, hasProbabilityMap);
     const plannedPath = hasProbabilityMap
@@ -572,6 +683,7 @@
       gridMeta: deepClone(scene.grid),
       probabilisticLocalMap,
       reflectivitySurface,
+      reflectivityCorridor,
       groundFilter,
       filteredTracks: deepClone(filteredTracks),
       tracks: deepClone(tracks),
