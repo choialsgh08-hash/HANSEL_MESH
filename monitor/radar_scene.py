@@ -703,6 +703,7 @@ class RadarSceneEstimator:
             for obstacle in self._accumulated_obstacles
         ]
         stable_obstacles = self._stable_obstacle_payload(observed_at)
+        reflectivity_surface = self._reflectivity_surface.payload(observed_at)
         probability_map = self._probability_grid.payload(observed_at)
         occupied_probability_cells = self._probability_grid.occupied_cells(
             observed_at
@@ -777,9 +778,7 @@ class RadarSceneEstimator:
             "reference_tracks": reference_tracks,
             "accumulated_obstacles": accumulated_obstacles,
             "persistent_near_obstacles": persistent_near_obstacles,
-            "reflectivity_surface": self._reflectivity_surface.payload(
-                observed_at
-            ),
+            "reflectivity_surface": reflectivity_surface,
             "probabilistic_local_map": probability_map,
             "rolling_local_map": {
                 "radius_m": 0.50,
@@ -838,6 +837,9 @@ class RadarSceneEstimator:
                     self._quality_gate_rejected_count
                 ),
                 "ground_rejected_count": self._ground_rejected_count,
+                "reflectivity_surface_cell_count": len(
+                    reflectivity_surface["cells"]
+                ),
                 "heatmap_cells_accepted": self._heatmap_cells_accepted,
                 "heatmap_candidate_cells": self._heatmap_candidate_cells,
                 "heatmap_cluster_count": self._heatmap_cluster_count,

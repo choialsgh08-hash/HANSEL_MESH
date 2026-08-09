@@ -11,6 +11,7 @@ const sceneApi = require("../../monitor/web/radar_scene.js");
 const ADDITIVE_DIAGNOSTIC_KEYS = [
   "raw_point_count",
   "ground_rejected_count",
+  "reflectivity_surface_cell_count",
   "self_clutter_rejected_count",
   "quality_gate_rejected_count",
   "tentative_point_track_count",
@@ -102,6 +103,18 @@ function makeProbabilityCell(overrides = {}) {
   };
 }
 
+function makeReflectivityCell(overrides = {}) {
+  return {
+    forward_m: 0.40,
+    lateral_m: 0.05,
+    intensity: 0.9,
+    persistence: 0.6,
+    hits: 3,
+    age_ms: 0,
+    ...overrides,
+  };
+}
+
 function makeSnapshot(overrides = {}) {
   const grid = makeGrid(60, 60).payload;
   const diagnostics = Object.fromEntries(
@@ -125,6 +138,16 @@ function makeSnapshot(overrides = {}) {
       tracks: [],
       obstacle_tracks: [],
       reference_tracks: [],
+      reflectivity_surface: {
+        radius_m: 0.50,
+        resolution_m: 0.025,
+        history_frames: 5,
+        required_hits: 3,
+        retention: "three_of_five_complete_frames",
+        pose_mode: "sensor_relative_short_memory",
+        source: "calibrated_heatmap_residual",
+        cells: [],
+      },
       probabilistic_local_map: {
         radius_m: 0.50,
         resolution_m: 0.05,
@@ -267,6 +290,102 @@ test("prefers probability cells over the rolling compatibility alias", () => {
   assert.equal(parsed.probabilisticLocalMap.ttlMs, 2500);
   assert.equal(parsed.probabilisticLocalMap.retention, "probability_decay_with_ttl");
   assert.equal(parsed.probabilisticLocalMap.poseMode, "robot_relative_short_memory");
+});
+
+test("validates and detaches the display-only reflectivity surface", () => {
+  const snapshot = makeSnapshot();
+  const cell = makeReflectivityCell();
+  snapshot.scene.reflectivity_surface.cells = [cell];
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivitySurface, {
+    radiusM: 0.50,
+    resolutionM: 0.025,
+    historyFrames: 5,
+    requiredHits: 3,
+    retention: "three_of_five_complete_frames",
+    poseMode: "sensor_relative_short_memory",
+    source: "calibrated_heatmap_residual",
+    cells: [cell],
+  });
+  snapshot.scene.reflectivity_surface.cells[0].intensity = 0.1;
+  assert.equal(parsed.reflectivitySurface.cells[0].intensity, 0.9);
+});
+
+test("rejects every strict reflectivity-surface metadata mismatch", async (t) => {
+  const cases = [
+    ["missing", (scene) => delete scene.reflectivity_surface],
+    ["null", (scene) => { scene.reflectivity_surface = null; }],
+    ["radius_m", (scene) => { scene.reflectivity_surface.radius_m = 0.49; }],
+    ["resolution_m", (scene) => { scene.reflectivity_surface.resolution_m = 0.05; }],
+    ["history_frames", (scene) => { scene.reflectivity_surface.history_frames = 4; }],
+    ["required_hits", (scene) => { scene.reflectivity_surface.required_hits = 2; }],
+    ["retention", (scene) => { scene.reflectivity_surface.retention = "ttl"; }],
+    ["pose_mode", (scene) => { scene.reflectivity_surface.pose_mode = "robot_relative"; }],
+    ["source", (scene) => { scene.reflectivity_surface.source = "raw_heatmap"; }],
+    ["cells", (scene) => { scene.reflectivity_surface.cells = null; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      mutate(snapshot.scene);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity surface contract/,
+      );
+    });
+  }
+});
+
+test("rejects every strict reflectivity cell violation", async (t) => {
+  const cases = [
+    ["missing forward", (cell) => delete cell.forward_m],
+    ["non-finite forward", (cell) => { cell.forward_m = Infinity; }],
+    ["behind radar", (cell) => { cell.forward_m = -0.025; }],
+    ["non-finite lateral", (cell) => { cell.lateral_m = NaN; }],
+    ["outside radius", (cell) => { cell.forward_m = 0.40; cell.lateral_m = 0.325; }],
+    ["off-grid forward", (cell) => { cell.forward_m = 0.401; }],
+    ["off-grid lateral", (cell) => { cell.lateral_m = 0.051; }],
+    ["negative intensity", (cell) => { cell.intensity = -0.01; }],
+    ["intensity above one", (cell) => { cell.intensity = 1.01; }],
+    ["non-finite intensity", (cell) => { cell.intensity = Infinity; }],
+    ["zero persistence", (cell) => { cell.persistence = 0; }],
+    ["persistence above one", (cell) => { cell.persistence = 1.01; }],
+    ["non-finite persistence", (cell) => { cell.persistence = NaN; }],
+    ["hits below required", (cell) => { cell.hits = 2; cell.persistence = 0.4; }],
+    ["hits above history", (cell) => { cell.hits = 6; cell.persistence = 1.2; }],
+    ["fractional hits", (cell) => { cell.hits = 3.5; cell.persistence = 0.7; }],
+    ["persistence mismatch", (cell) => { cell.persistence = 0.8; }],
+    ["negative age", (cell) => { cell.age_ms = -1; }],
+    ["fractional age", (cell) => { cell.age_ms = 0.5; }],
+    ["non-finite age", (cell) => { cell.age_ms = Infinity; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      const cell = makeReflectivityCell();
+      mutate(cell);
+      snapshot.scene.reflectivity_surface.cells = [cell];
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity surface contract/,
+      );
+    });
+  }
+});
+
+test("rejects duplicate reflectivity grid coordinates", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_surface.cells = [
+    makeReflectivityCell(),
+    makeReflectivityCell({ intensity: 0.7 }),
+  ];
+
+  assert.throws(
+    () => sceneApi.parseRadarScene(snapshot),
+    /reflectivity surface contract/,
+  );
 });
 
 test("presence selects new mode and invalid present data never falls back", async (t) => {

@@ -16,6 +16,7 @@
   const ADDITIVE_DIAGNOSTIC_KEYS = Object.freeze([
     "raw_point_count",
     "ground_rejected_count",
+    "reflectivity_surface_cell_count",
     "self_clutter_rejected_count",
     "quality_gate_rejected_count",
     "tentative_point_track_count",
@@ -165,6 +166,61 @@
       retention: map.retention,
       poseMode: map.pose_mode,
       sourceField: "probabilistic_local_map",
+      cells,
+    };
+  }
+
+  function parseReflectivitySurface(scene) {
+    const surface = scene.reflectivity_surface;
+    if (!isPlainObject(surface) || surface.radius_m !== 0.50 ||
+        surface.resolution_m !== 0.025 || surface.history_frames !== 5 ||
+        surface.required_hits !== 3 ||
+        surface.retention !== "three_of_five_complete_frames" ||
+        surface.pose_mode !== "sensor_relative_short_memory" ||
+        surface.source !== "calibrated_heatmap_residual" ||
+        !Array.isArray(surface.cells)) {
+      throw new Error("invalid reflectivity surface contract");
+    }
+    const occupiedKeys = new Set();
+    const cells = surface.cells.map((cell) => {
+      if (!isPlainObject(cell) || !Number.isFinite(cell.forward_m) ||
+          !Number.isFinite(cell.lateral_m) || cell.forward_m < 0 ||
+          Math.hypot(cell.forward_m, cell.lateral_m) > surface.radius_m + 1e-9 ||
+          Math.abs(
+            cell.forward_m / surface.resolution_m -
+            Math.round(cell.forward_m / surface.resolution_m)
+          ) > 1e-8 || Math.abs(
+            cell.lateral_m / surface.resolution_m -
+            Math.round(cell.lateral_m / surface.resolution_m)
+          ) > 1e-8 || !Number.isFinite(cell.intensity) ||
+          cell.intensity < 0 || cell.intensity > 1 ||
+          !Number.isFinite(cell.persistence) || cell.persistence <= 0 ||
+          cell.persistence > 1 || !Number.isInteger(cell.hits) ||
+          cell.hits < surface.required_hits ||
+          cell.hits > surface.history_frames ||
+          Math.abs(
+            cell.persistence - cell.hits / surface.history_frames
+          ) > 1e-8 || !Number.isInteger(cell.age_ms) || cell.age_ms < 0) {
+        throw new Error("invalid reflectivity surface contract");
+      }
+      const key = [
+        Math.round(cell.forward_m / surface.resolution_m),
+        Math.round(cell.lateral_m / surface.resolution_m),
+      ].join(":");
+      if (occupiedKeys.has(key)) {
+        throw new Error("invalid reflectivity surface contract");
+      }
+      occupiedKeys.add(key);
+      return deepClone(cell);
+    });
+    return {
+      radiusM: surface.radius_m,
+      resolutionM: surface.resolution_m,
+      historyFrames: surface.history_frames,
+      requiredHits: surface.required_hits,
+      retention: surface.retention,
+      poseMode: surface.pose_mode,
+      source: surface.source,
       cells,
     };
   }
@@ -402,6 +458,8 @@
     }
     const probabilisticLocalMap = hasProbabilityMap
       ? parseProbabilisticLocalMap(scene) : null;
+    const reflectivitySurface = hasProbabilityMap
+      ? parseReflectivitySurface(scene) : null;
     const groundFilter = parseGroundFilter(scene.ground_filter, hasProbabilityMap);
     const diagnostics = parseDiagnostics(scene.diagnostics, hasProbabilityMap);
     const plannedPath = hasProbabilityMap
@@ -502,6 +560,7 @@
       grid: decodeSceneV1Grid(scene.grid),
       gridMeta: deepClone(scene.grid),
       probabilisticLocalMap,
+      reflectivitySurface,
       groundFilter,
       filteredTracks: deepClone(filteredTracks),
       tracks: deepClone(tracks),

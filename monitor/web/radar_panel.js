@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260809-ground-hidden-r33";
+  const UI_BUILD_ID = "20260810-reflectivity-r34";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -399,6 +399,12 @@
       });
       ctx.save();
       this.clipToMapBoundary(ctx, transform, "circle");
+      this.drawReflectivitySurface(
+        ctx,
+        transform,
+        scene.reflectivitySurface,
+        { clipShape: "circle" },
+      );
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
           clipShape: "circle",
@@ -459,6 +465,12 @@
       });
       ctx.save();
       this.clipToMapBoundary(ctx, transform, "radial");
+      this.drawReflectivitySurface(
+        ctx,
+        transform,
+        scene.reflectivitySurface,
+        { clipShape: "radial" },
+      );
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
           clipShape: "radial",
@@ -489,6 +501,73 @@
       ctx.restore();
       this.drawRobotFootprint(ctx, transform);
       this.drawRobot(ctx, transform);
+    }
+
+    drawReflectivitySurface(ctx, transform, surface, options) {
+      const resolution = Number(surface && surface.resolutionM);
+      const cells = surface && Array.isArray(surface.cells)
+        ? surface.cells : [];
+      if (!Number.isFinite(resolution) || resolution <= 0 || cells.length === 0) {
+        ctx.globalAlpha = 1;
+        return;
+      }
+      const size = resolution * transform.scale;
+      const keys = new Set(cells.map((cell) => [
+        Math.round(Number(cell.forward_m) / resolution),
+        Math.round(Number(cell.lateral_m) / resolution),
+      ].join(":")));
+      for (const cell of cells) {
+        const forward = Number(cell && cell.forward_m);
+        const lateral = Number(cell && cell.lateral_m);
+        const intensity = Number(cell && cell.intensity);
+        const persistence = Number(cell && cell.persistence);
+        if (!Number.isFinite(forward) || !Number.isFinite(lateral) ||
+            !Number.isFinite(intensity) || !Number.isFinite(persistence)) {
+          continue;
+        }
+        if (options && options.clipShape === "radial" &&
+            Math.hypot(forward, lateral) > transform.forwardMaxM + resolution) {
+          continue;
+        }
+        const forwardIndex = Math.round(forward / resolution);
+        const lateralIndex = Math.round(lateral / resolution);
+        const point = window.HanselRadarScene.projectMapPoint(
+          transform,
+          forward,
+          lateral,
+        );
+        const left = point.x - size / 2;
+        const right = point.x + size / 2;
+        const top = point.y - size / 2;
+        const bottom = point.y + size / 2;
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "rgb(224, 232, 231)";
+        ctx.globalAlpha = 0.08 + Math.max(0, Math.min(1,
+          0.55 * intensity + 0.45 * persistence)) * 0.52;
+        ctx.fillRect(left, top, size, size);
+        ctx.globalAlpha = 0.72;
+        ctx.strokeStyle = "rgba(245, 250, 248, 0.78)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (!keys.has(`${forwardIndex + 1}:${lateralIndex}`)) {
+          ctx.moveTo(left, top);
+          ctx.lineTo(right, top);
+        }
+        if (!keys.has(`${forwardIndex - 1}:${lateralIndex}`)) {
+          ctx.moveTo(left, bottom);
+          ctx.lineTo(right, bottom);
+        }
+        if (!keys.has(`${forwardIndex}:${lateralIndex - 1}`)) {
+          ctx.moveTo(left, top);
+          ctx.lineTo(left, bottom);
+        }
+        if (!keys.has(`${forwardIndex}:${lateralIndex + 1}`)) {
+          ctx.moveTo(right, top);
+          ctx.lineTo(right, bottom);
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
     }
 
     drawProbabilisticLocalMap(ctx, transform, localMap, options) {
@@ -1693,6 +1772,10 @@
         : "--";
       setDiagnosticValue("#raw-point-value", "raw_point_count");
       setDiagnosticValue("#ground-rejected-value", "ground_rejected_count");
+      setDiagnosticValue(
+        "#reflectivity-cell-value",
+        "reflectivity_surface_cell_count",
+      );
       setDiagnosticValue(
         "#clutter-rejected-value",
         "self_clutter_rejected_count",

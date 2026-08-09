@@ -1724,6 +1724,10 @@ class RadarSceneEstimatorTests(unittest.TestCase):
 
         self.assertEqual(len(scene["reflectivity_surface"]["cells"]), 2)
         self.assertEqual(
+            scene["diagnostics"]["reflectivity_surface_cell_count"],
+            2,
+        )
+        self.assertEqual(
             {
                 (cell["forward_m"], cell["lateral_m"])
                 for cell in scene["reflectivity_surface"]["cells"]

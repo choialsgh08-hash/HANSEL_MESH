@@ -1322,7 +1322,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260809-ground-hidden-r33",
+                "20260810-reflectivity-r34",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1337,11 +1337,11 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
             self.assertIn(
-                "/radar_scene.js?v=20260809-ground-hidden-r33",
+                "/radar_scene.js?v=20260810-reflectivity-r34",
                 html,
             )
             self.assertIn(
-                "/radar_panel.js?v=20260809-ground-hidden-r33",
+                "/radar_panel.js?v=20260810-reflectivity-r34",
                 html,
             )
             self.assertIn(
@@ -1352,7 +1352,8 @@ class RadarFrontHttpTests(unittest.TestCase):
                 '#radar-status[data-status="http_lost"]',
                 html,
             )
-            self.assertIn('id="build-tag">UI R33</span>', html)
+            self.assertIn('id="build-tag">UI R34</span>', html)
+            self.assertIn('class="tag">WHITE = STABLE REFLECTIVITY</span>', html)
             self.assertIn(
                 'id="ground-filter-tag">SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN</span>',
                 html,
@@ -1376,7 +1377,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html,
             )
             self.assertIn(
-                'const UI_BUILD_ID = "20260809-ground-hidden-r33";',
+                'const UI_BUILD_ID = "20260810-reflectivity-r34";',
                 javascript,
             )
             self.assertIn(
@@ -1403,6 +1404,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             for height_label in ("BELOW", "SENSOR LEVEL", "ABOVE", "Z UNKNOWN"):
                 self.assertIn(height_label, html)
             self.assertIn('id="heatmap-candidate-value"', html)
+            self.assertIn('id="reflectivity-cell-value"', html)
             self.assertIn('id="heatmap-cluster-value"', html)
             self.assertIn('id="reflection-value"', html)
             for diagnostic_id in (

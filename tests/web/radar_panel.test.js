@@ -222,6 +222,7 @@ function makeHarness() {
     "gap-value",
     "raw-point-value",
     "ground-rejected-value",
+    "reflectivity-cell-value",
     "confirmed-track-value",
     "clutter-rejected-value",
     "heatmap-candidate-value",
@@ -387,6 +388,16 @@ function livePresentationWithProbabilityMap() {
       pitchConvention: "positive_up",
       status: "configured",
     },
+    reflectivitySurface: {
+      radiusM: 0.50,
+      resolutionM: 0.025,
+      historyFrames: 5,
+      requiredHits: 3,
+      retention: "three_of_five_complete_frames",
+      poseMode: "sensor_relative_short_memory",
+      source: "calibrated_heatmap_residual",
+      cells: [],
+    },
     probabilisticLocalMap: {
       sourceField: "probabilistic_local_map",
       radiusM: 0.50,
@@ -529,7 +540,7 @@ test("null probability map preserves both legacy layers in both map views", () =
   assert.equal(legacyCircleCalls, 2);
 });
 
-test("both map views invoke probability and robot-footprint renderers", () => {
+test("both map views invoke reflectivity probability and robot-footprint renderers", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -538,16 +549,19 @@ test("both map views invoke probability and robot-footprint renderers", () => {
     halfWidthM: 0.5, centeredCircle: true,
   };
   let probabilityCalls = 0;
+  let reflectivityCalls = 0;
   let footprintCalls = 0;
+  panel.drawReflectivitySurface = () => { reflectivityCalls += 1; };
   panel.drawProbabilisticLocalMap = () => { probabilityCalls += 1; };
   panel.drawRobotFootprint = () => { footprintCalls += 1; };
   panel.drawLidarTopView(contexts[0], transform, presentation);
   panel.drawCollisionInset(contexts[1], transform, presentation);
+  assert.equal(reflectivityCalls, 2);
   assert.equal(probabilityCalls, 2);
   assert.equal(footprintCalls, 2);
 });
 
-test("both map views draw probability evidence before every track layer", () => {
+test("both map views draw reflectivity then probability before every track layer", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -560,14 +574,72 @@ test("both map views draw probability evidence before every track layer", () => 
     [contexts[1], () => panel.drawCollisionInset(contexts[1], transform, presentation)],
   ]) {
     const order = [];
+    panel.drawReflectivitySurface = () => { order.push("reflectivity"); };
     panel.drawProbabilisticLocalMap = () => { order.push("probability"); };
     panel.drawTracks = () => { order.push("tracks"); };
     render();
-    assert.equal(order[0], "probability");
+    assert.deepEqual(order.slice(0, 2), ["reflectivity", "probability"]);
     assert.ok(order.includes("tracks"));
-    assert.ok(order.slice(1).every((entry) => entry === "tracks"));
+    assert.ok(order.slice(2).every((entry) => entry === "tracks"));
     assert.ok(context);
   }
+});
+
+test("reflectivity surface fills cells and outlines only exposed edges", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[0];
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  panel.drawReflectivitySurface(context, transform, {
+    resolutionM: 0.025,
+    cells: [
+      { forward_m: 0.20, lateral_m: 0.0, intensity: 0.9, persistence: 1.0 },
+      { forward_m: 0.20, lateral_m: 0.025, intensity: 0.8, persistence: 0.8 },
+      { forward_m: 0.30, lateral_m: 0.10, intensity: 0.7, persistence: 0.6 },
+    ],
+  }, { clipShape: "circle" });
+
+  assert.equal(context.fillRectCalls.length, 3);
+  assert.deepEqual(context.fillRectCalls[0], [245, 165, 10, 10]);
+  const boundarySegments = context.strokeCalls.flatMap(
+    (call) => call.path.filter((command) => command[0] === "lineTo"),
+  );
+  assert.equal(boundarySegments.length, 10);
+  assert.ok(context.fillRectStyles.every(
+    (call) => call.fillStyle === "rgb(224, 232, 231)" &&
+      call.globalAlpha > 0 && call.globalAlpha < 1,
+  ));
+  assert.equal(context.shadowBlur, 0);
+  assert.equal(context.globalAlphaValues.at(-1), 1);
+});
+
+test("display-only reflectivity cells never enter track drawing", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.reflectivitySurface.cells = [{
+    forward_m: 0.40,
+    lateral_m: 0.05,
+    intensity: 0.9,
+    persistence: 1.0,
+    hits: 5,
+    age_ms: 0,
+  }];
+  const transform = {
+    originX: 250, originY: 250, scale: 500,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  const trackInputs = [];
+  panel.drawTracks = (_ctx, _transform, tracks) => { trackInputs.push(tracks); };
+
+  panel.drawLidarTopView(contexts[0], transform, presentation);
+  panel.drawCollisionInset(contexts[1], transform, presentation);
+
+  assert.ok(trackInputs.length > 0);
+  assert.ok(trackInputs.every((tracks) => Array.isArray(tracks) && tracks.length === 0));
 });
 
 test("live point tracks render their distance label without a rendering error", () => {
@@ -918,6 +990,7 @@ test("validated diagnostics and blocked-near-field status drive existing rows", 
   presentation.diagnostics = {
     raw_point_count: 7,
     ground_rejected_count: 13,
+    reflectivity_surface_cell_count: 11,
     self_clutter_rejected_count: 2,
     quality_gate_rejected_count: 1,
     tentative_point_track_count: 3,
@@ -941,6 +1014,7 @@ test("validated diagnostics and blocked-near-field status drive existing rows", 
   panel.updateDiagnostics(presentation);
   assert.equal(elements.get("#raw-point-value").textContent, "7");
   assert.equal(elements.get("#ground-rejected-value").textContent, "13");
+  assert.equal(elements.get("#reflectivity-cell-value").textContent, "11");
   assert.equal(
     elements.get("#ground-filter-tag").textContent,
     "SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN",
