@@ -369,7 +369,8 @@ def _initial_report():
         "records_seen": 0, "frames_processed": 0,
         "non_radar_records_skipped": 0, "incomplete_frames_skipped": 0,
         "producer_reported_drops_total": 0, "raw_points_total": 0,
-        "self_clutter_rejected_total": 0, "quality_gate_rejected_total": 0,
+        "ground_rejected_total": 0, "self_clutter_rejected_total": 0,
+        "quality_gate_rejected_total": 0,
         "heatmap_reflections_total": 0, "tentative_point_tracks_max": 0,
         "confirmed_point_tracks_max": 0, "confirmed_heatmap_tracks_max": 0,
         "probability_cells_max": 0, "occupied_cells_max": 0,
@@ -460,11 +461,12 @@ def analyze_records(records, estimator, max_frames=None, timer=time.perf_counter
         report["producer_reported_drops_total"] += record.dropped_frames_since_previous
         for source, target in (
             ("raw_point_count", "raw_points_total"),
+            ("ground_rejected_count", "ground_rejected_total"),
             ("self_clutter_rejected_count", "self_clutter_rejected_total"),
             ("quality_gate_rejected_count", "quality_gate_rejected_total"),
             ("heatmap_reflection_count", "heatmap_reflections_total"),
         ):
-            report[target] += int(diagnostics[source])
+            report[target] += _nonnegative_int(diagnostics[source], source)
         for source, target in (
             ("tentative_point_track_count", "tentative_point_tracks_max"),
             ("confirmed_point_track_count", "confirmed_point_tracks_max"),

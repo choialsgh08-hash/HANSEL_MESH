@@ -66,6 +66,42 @@ class RadarReplayReportTests(unittest.TestCase):
             [], RadarSceneEstimator(RadarAxes(), synthetic=True), max_frames=10,
         )
         self.assertEqual(report["frames_processed"], 0)
+        self.assertEqual(report["ground_rejected_total"], 0)
+        json.dumps(report, allow_nan=False)
+
+    def test_real_estimator_reports_hidden_ground_without_losing_raised_point(self):
+        ground = RadarPoint(
+            x_m=0.0,
+            y_m=0.08,
+            z_m=-0.045,
+            radial_velocity_mps=0.0,
+            snr_db=24.0,
+        )
+        raised = RadarPoint(
+            x_m=0.0,
+            y_m=0.08,
+            z_m=0.015,
+            radial_velocity_mps=0.0,
+            snr_db=24.0,
+        )
+        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        report = analyze_records(
+            [
+                radar_frame((ground,), frame_number=1),
+                radar_frame((raised,), frame_number=2),
+            ],
+            estimator,
+        )
+        scene = estimator.snapshot(now=0.2)
+
+        self.assertEqual(report["raw_points_total"], 2)
+        self.assertEqual(report["ground_rejected_total"], 1)
+        self.assertEqual(report["tentative_point_tracks_max"], 1)
+        self.assertEqual(report["confirmed_point_tracks_max"], 0)
+        self.assertEqual(report["danger_frames"], 0)
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertAlmostEqual(scene["tracks"][0]["forward_m"], 0.08)
+        self.assertEqual(scene["tracks"][0]["classification"], "point_candidate")
         json.dumps(report, allow_nan=False)
 
     def test_counter_deltas_survive_scene_counter_reset(self):
@@ -1001,6 +1037,7 @@ def _scene(
     epoch=0,
     *,
     raw=0,
+    ground=0,
     clutter=0,
     quality=0,
     reflections=0,
@@ -1042,6 +1079,7 @@ def _scene(
         "hazard": {"level": "NORMAL", "nearest_confirmed_m": None},
         "diagnostics": {
             "raw_point_count": raw,
+            "ground_rejected_count": ground,
             "self_clutter_rejected_count": clutter,
             "quality_gate_rejected_count": quality,
             "tentative_point_track_count": tentative,

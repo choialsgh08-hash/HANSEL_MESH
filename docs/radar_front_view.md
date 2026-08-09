@@ -253,6 +253,29 @@ interpreted as verified floor clearance. Its pose mode is `robot_relative_short_
 This is neither SLAM nor Doppler odometry; old evidence is decayed locally and no globally
 consistent pose or free-space map is inferred.
 
+### Hidden-ground mount contract
+
+The current head mount is configured at a 6.5 cm radar-center height and 0.0 degree
+pitch. Host pitch is positive when the radar looks upward. Within 0.60 m, a point whose
+mount-corrected height is at or below 3.5 cm above the robot ground plane is classified as
+traversable ground. It is removed before tracking, heatmap confirmation, probability-map
+updates, path planning, and the 10/13 cm hazard latch. The main map, collision inset, and
+2.5D view also hide unconfirmed heatmap reflections because heatmap-only evidence has no
+height with which to prove that it is above the floor. A heatmap obstacle is displayed only
+after point evidence confirms it.
+
+Raw radar points are still retained in canonical recordings and remain available through
+the explicitly enabled `RAW DEBUG · 표시 전용` view. This preserves evidence for later
+tuning without allowing floor points to steer the robot. `ground_rejected_count` reports
+the current frame's rejected points and the replay analyzer accumulates them as
+`ground_rejected_total`. Neither an empty display nor ground rejection proves free space.
+
+The current fixed mount can be overridden with `--sensor-height-m`,
+`--sensor-pitch-deg`, and `--ground-rejection-height-m`. When the head servo angle is
+integrated later, its synchronized upward-positive pitch must replace the fixed pitch input
+for each radar frame; the servo transport and timestamp alignment are not implemented in
+this release.
+
 ## 11. Replay analyzer
 
 Analyze a canonical recording without changing it:
@@ -275,7 +298,8 @@ The core report fields are:
 - Input accounting: `records_seen`, `frames_processed`,
   `non_radar_records_skipped`, `incomplete_frames_skipped`, and
   `producer_reported_drops_total`.
-- Filter stages: `raw_points_total`, `self_clutter_rejected_total`,
+- Filter stages: `raw_points_total`, `ground_rejected_total`,
+  `self_clutter_rejected_total`,
   `quality_gate_rejected_total`, `heatmap_reflections_total`,
   `tentative_point_tracks_max`, `confirmed_point_tracks_max`, and
   `confirmed_heatmap_tracks_max`.
