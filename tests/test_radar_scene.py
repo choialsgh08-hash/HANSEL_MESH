@@ -1708,6 +1708,82 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(heatmap_track["classification"], "reflection_evidence")
         self.assertFalse(scene["obstacle_tracks"])
 
+    def test_stable_unconfirmed_heatmap_publishes_only_display_surface(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 4):
+            estimator.ingest(
+                clustered_heatmap_frame(
+                    4,
+                    frame_number=frame_number,
+                    with_point=False,
+                ),
+                received_at=5.0 + frame_number * 0.1,
+            )
+
+        scene = estimator.snapshot(now=5.3)
+
+        self.assertEqual(len(scene["reflectivity_surface"]["cells"]), 2)
+        self.assertEqual(
+            {
+                (cell["forward_m"], cell["lateral_m"])
+                for cell in scene["reflectivity_surface"]["cells"]
+            },
+            {(0.4, 0.0), (0.4, 0.05)},
+        )
+        self.assertFalse(scene["obstacle_tracks"])
+        self.assertEqual(scene["probabilistic_local_map"]["cells"], [])
+        self.assertEqual(scene["hazard"]["level"], "UNKNOWN")
+        self.assertEqual(scene["planned_path"]["persistent_obstacles_used"], 0)
+
+    def test_reflectivity_surface_counts_dropped_frames_as_misses(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(
+            clustered_heatmap_frame(
+                4,
+                frame_number=1,
+                with_point=False,
+            ),
+            received_at=5.1,
+        )
+        estimator.ingest(
+            replace(
+                clustered_heatmap_frame(
+                    4,
+                    frame_number=4,
+                    with_point=False,
+                ),
+                dropped_frames_since_previous=2,
+            ),
+            received_at=5.4,
+        )
+
+        self.assertEqual(
+            estimator.snapshot(now=5.4)["reflectivity_surface"]["cells"],
+            [],
+        )
+
+    def test_reset_clears_reflectivity_surface(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 4):
+            estimator.ingest(
+                clustered_heatmap_frame(
+                    4,
+                    frame_number=frame_number,
+                    with_point=False,
+                ),
+                received_at=5.0 + frame_number * 0.1,
+            )
+        self.assertTrue(
+            estimator.snapshot(now=5.3)["reflectivity_surface"]["cells"]
+        )
+
+        estimator.reset("operator_reset")
+
+        self.assertEqual(
+            estimator.snapshot(now=5.3)["reflectivity_surface"]["cells"],
+            [],
+        )
+
     def test_heatmap_exit_threshold_holds_existing_cluster_without_flicker(self):
         estimator = calibrated_estimator()
         estimator.ingest(

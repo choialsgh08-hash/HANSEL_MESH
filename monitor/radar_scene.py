@@ -15,6 +15,7 @@ from monitor.radar_local_map import ProbabilisticRollingGrid
 from monitor.radar_motion import RadarMotionEstimator
 from monitor.radar_path import PathSelectionHysteresis
 from monitor.radar_ground import RadarMountGeometry
+from monitor.radar_reflectivity import RadarReflectivitySurface
 from monitor.radar_tracking import (
     DEFAULT_RANGE_STEP_M,
     POINT_HAZARD_CONFIRM_HITS,
@@ -285,6 +286,7 @@ class RadarSceneEstimator:
             hit_probability=0.80,
             maximum_probability=0.97,
         )
+        self._reflectivity_surface = RadarReflectivitySurface()
         self._scene_epoch = 0
         self._travel_trail: List[Tuple[float, float]] = [(0.0, 0.0)]
         self._path_selector = PathSelectionHysteresis(confirm_frames=3)
@@ -317,6 +319,7 @@ class RadarSceneEstimator:
         self._stable_cells = {}
         self._near_cells = {}
         self._probability_grid.clear()
+        self._reflectivity_surface.reset()
         self._travel_trail = [(0.0, 0.0)]
         self._path_selector.reset()
         self._planned_path = self._neutral_planned_path("reset")
@@ -541,15 +544,18 @@ class RadarSceneEstimator:
             accepted_point_positions.append((forward_m, lateral_m))
             point_count += 1
 
+        reflectivity_observations: List[Tuple[float, float, float]] = []
         if (
             frame.heatmap is not None
             and self.clutter_model is not None
             and self._calibration_status == "ok"
             and self.axes.signature() == RadarAxes().signature()
         ):
-            clusters, candidate_cell_count = self._heatmap_clusters(
-                frame,
-            )
+            (
+                clusters,
+                candidate_cell_count,
+                reflectivity_observations,
+            ) = self._heatmap_clusters(frame)
             point_supported_clusters = set()
             for point_forward, point_lateral in accepted_point_positions:
                 nearest_cluster_index = min(
@@ -599,6 +605,12 @@ class RadarSceneEstimator:
         else:
             self._heatmap_candidate_cells = 0
             self._heatmap_cluster_count = 0
+
+        self._reflectivity_surface.ingest(
+            reflectivity_observations,
+            now,
+            elapsed_frame_windows=heatmap_elapsed_frame_windows,
+        )
 
         self._update_probability_map(now)
         self._scene_point_count = point_count
@@ -765,6 +777,9 @@ class RadarSceneEstimator:
             "reference_tracks": reference_tracks,
             "accumulated_obstacles": accumulated_obstacles,
             "persistent_near_obstacles": persistent_near_obstacles,
+            "reflectivity_surface": self._reflectivity_surface.payload(
+                observed_at
+            ),
             "probabilistic_local_map": probability_map,
             "rolling_local_map": {
                 "radius_m": 0.50,
@@ -2373,12 +2388,16 @@ class RadarSceneEstimator:
     def _heatmap_clusters(
         self,
         frame: RadarFrame,
-    ) -> Tuple[List[Dict[str, float]], int]:
+    ) -> Tuple[
+        List[Dict[str, float]],
+        int,
+        List[Tuple[float, float, float]],
+    ]:
         """Return spatial clusters of calibrated heatmap residual cells."""
         heatmap = frame.heatmap
         model = self.clutter_model
         if heatmap is None or model is None:
-            return [], 0
+            return [], 0, []
         span_db = heatmap.ceiling_db - heatmap.floor_db
         candidates: Dict[
             Tuple[int, int], Dict[str, float]
@@ -2523,7 +2542,19 @@ class RadarSceneEstimator:
             ),
             reverse=True,
         )
-        return clusters[:HEATMAP_MAX_CLUSTERS_PER_FRAME], len(candidates)
+        reflectivity_observations = [
+            (
+                float(cell["forward_m"]),
+                float(cell["lateral_m"]),
+                min(1.0, max(0.0, float(cell["residual_db"]) / 24.0)),
+            )
+            for cell in candidates.values()
+        ]
+        return (
+            clusters[:HEATMAP_MAX_CLUSTERS_PER_FRAME],
+            len(candidates),
+            reflectivity_observations,
+        )
 
     @staticmethod
     def _heatmap_cell_position(
