@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260807-probability-25d-r32";
+  const UI_BUILD_ID = "20260809-ground-hidden-r33";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -416,7 +416,9 @@
       this.drawPlannedPath(ctx, transform, scene.plannedPath);
       for (const track of Array.isArray(scene.filteredTracks)
         ? scene.filteredTracks : []) {
-        this.drawUncertaintyOutline(ctx, transform, track);
+        if (this.operatorVisibleTrack(track)) {
+          this.drawUncertaintyOutline(ctx, transform, track);
+        }
       }
       this.drawTracks(ctx, transform, scene.referenceTracks, {
         scene,
@@ -473,7 +475,9 @@
       this.drawPlannedPath(ctx, transform, scene.plannedPath);
       for (const track of Array.isArray(scene.filteredTracks)
         ? scene.filteredTracks : []) {
-        this.drawUncertaintyOutline(ctx, transform, track);
+        if (this.operatorVisibleTrack(track)) {
+          this.drawUncertaintyOutline(ctx, transform, track);
+        }
       }
       this.drawTracks(ctx, transform, scene.tracks, {
         scene,
@@ -591,6 +595,9 @@
       const azimuthLimit = Math.PI / 3;
       const tracks = (Array.isArray(filteredTracks) ? filteredTracks : [])
         .filter((track) => {
+          if (!this.operatorVisibleTrack(track)) {
+            return false;
+          }
           const forward = Number(track && track.forward_m);
           const lateral = Number(track && track.lateral_m);
           const distance = Number.isFinite(track && track.distance_m)
@@ -1220,6 +1227,7 @@
     drawTracks(ctx, transform, tracks, options) {
       const freshTracks = (Array.isArray(tracks) ? tracks : [])
         .filter((track) =>
+          this.operatorVisibleTrack(track) &&
           Number.isFinite(track.forward_m) &&
           Number.isFinite(track.lateral_m) &&
           this.trackInsideMapBounds(track, transform, options))
@@ -1275,6 +1283,12 @@
           );
         }
       });
+    }
+
+    operatorVisibleTrack(track) {
+      return Boolean(track) && (
+        track.source !== "heatmap" || track.heatmap_confirmed === true
+      );
     }
 
     trackInsideMapBounds(track, transform, options) {
@@ -1678,6 +1692,7 @@
           )
         : "--";
       setDiagnosticValue("#raw-point-value", "raw_point_count");
+      setDiagnosticValue("#ground-rejected-value", "ground_rejected_count");
       setDiagnosticValue(
         "#clutter-rejected-value",
         "self_clutter_rejected_count",
@@ -1702,6 +1717,17 @@
         ["#path-accepted-value", "path_switch_accepted_count"],
       ]) {
         setDiagnosticValue(selector, key);
+      }
+      const groundFilterTag = document.querySelector("#ground-filter-tag");
+      if (groundFilterTag) {
+        const filter = visible && presentation && presentation.groundFilter;
+        groundFilterTag.textContent = filter &&
+            Number.isFinite(filter.sensorHeightM) &&
+            Number.isFinite(filter.sensorPitchDeg) &&
+            filter.status === "configured"
+          ? `SENSOR ${(filter.sensorHeightM * 100).toFixed(1)}cm / ` +
+            `PITCH ${filter.sensorPitchDeg.toFixed(1)}deg / GROUND HIDDEN`
+          : "GROUND FILTER --";
       }
       const heatmapCandidateElement = document.querySelector(
         "#heatmap-candidate-value",

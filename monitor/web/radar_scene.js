@@ -15,6 +15,7 @@
   ]);
   const ADDITIVE_DIAGNOSTIC_KEYS = Object.freeze([
     "raw_point_count",
+    "ground_rejected_count",
     "self_clutter_rejected_count",
     "quality_gate_rejected_count",
     "tentative_point_track_count",
@@ -235,6 +236,40 @@
     return parsed;
   }
 
+  function parseGroundFilter(groundFilter, required) {
+    if (!required && (groundFilter === undefined || groundFilter === null)) {
+      return null;
+    }
+    if (!isPlainObject(groundFilter)) {
+      throw new Error("invalid ground filter contract");
+    }
+    const numericKeys = [
+      "sensor_height_m",
+      "sensor_pitch_deg",
+      "ground_rejection_height_m",
+      "filter_range_m",
+    ];
+    if (numericKeys.some((key) =>
+      typeof groundFilter[key] !== "number" ||
+      !Number.isFinite(groundFilter[key])) ||
+        groundFilter.sensor_height_m < 0 ||
+        groundFilter.ground_rejection_height_m < 0 ||
+        groundFilter.filter_range_m <= 0 ||
+        groundFilter.ground_rejection_height_m >= groundFilter.sensor_height_m ||
+        groundFilter.pitch_convention !== "positive_up" ||
+        groundFilter.status !== "configured") {
+      throw new Error("invalid ground filter contract");
+    }
+    return {
+      sensorHeightM: groundFilter.sensor_height_m,
+      sensorPitchDeg: groundFilter.sensor_pitch_deg,
+      groundRejectionHeightM: groundFilter.ground_rejection_height_m,
+      filterRangeM: groundFilter.filter_range_m,
+      pitchConvention: groundFilter.pitch_convention,
+      status: groundFilter.status,
+    };
+  }
+
   function validPointPair(point) {
     return Array.isArray(point) && point.length === 2 &&
       Number.isFinite(point[0]) && Number.isFinite(point[1]);
@@ -367,6 +402,7 @@
     }
     const probabilisticLocalMap = hasProbabilityMap
       ? parseProbabilisticLocalMap(scene) : null;
+    const groundFilter = parseGroundFilter(scene.ground_filter, hasProbabilityMap);
     const diagnostics = parseDiagnostics(scene.diagnostics, hasProbabilityMap);
     const plannedPath = hasProbabilityMap
       ? parseNewPlannedPath(scene.planned_path, diagnostics)
@@ -466,6 +502,7 @@
       grid: decodeSceneV1Grid(scene.grid),
       gridMeta: deepClone(scene.grid),
       probabilisticLocalMap,
+      groundFilter,
       filteredTracks: deepClone(filteredTracks),
       tracks: deepClone(tracks),
       referenceTracks: deepClone(referenceTracks),

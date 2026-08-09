@@ -10,6 +10,7 @@ const sceneApi = require("../../monitor/web/radar_scene.js");
 
 const ADDITIVE_DIAGNOSTIC_KEYS = [
   "raw_point_count",
+  "ground_rejected_count",
   "self_clutter_rejected_count",
   "quality_gate_rejected_count",
   "tentative_point_track_count",
@@ -112,6 +113,14 @@ function makeSnapshot(overrides = {}) {
       schema_version: 1,
       pose_mode: "robot_relative_short_memory",
       calibration_status: "ok",
+      ground_filter: {
+        sensor_height_m: 0.065,
+        sensor_pitch_deg: 0.0,
+        ground_rejection_height_m: 0.035,
+        filter_range_m: 0.60,
+        pitch_convention: "positive_up",
+        status: "configured",
+      },
       grid,
       tracks: [],
       obstacle_tracks: [],
@@ -169,6 +178,7 @@ function makeSnapshot(overrides = {}) {
 function makeLegacySnapshot(overrides = {}) {
   const snapshot = makeSnapshot(overrides);
   delete snapshot.scene.probabilistic_local_map;
+  delete snapshot.scene.ground_filter;
   snapshot.scene.pose_mode = "robot_relative";
   for (const key of ADDITIVE_DIAGNOSTIC_KEYS) {
     delete snapshot.scene.diagnostics[key];
@@ -462,6 +472,74 @@ test("requires every additive diagnostic to be a non-negative integer", async (t
       });
     }
   }
+});
+
+test("parses a detached configured ground filter for probability scenes", () => {
+  const snapshot = makeSnapshot();
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.deepEqual(parsed.groundFilter, {
+    sensorHeightM: 0.065,
+    sensorPitchDeg: 0.0,
+    groundRejectionHeightM: 0.035,
+    filterRangeM: 0.60,
+    pitchConvention: "positive_up",
+    status: "configured",
+  });
+  snapshot.scene.ground_filter.sensor_height_m = 0.5;
+  assert.equal(parsed.groundFilter.sensorHeightM, 0.065);
+});
+
+test("rejects malformed probability-scene ground filter contracts", async (t) => {
+  const remove = Symbol("delete");
+  const cases = [
+    ["object missing", "ground_filter", remove],
+    ["height missing", "sensor_height_m", remove],
+    ["height string", "sensor_height_m", "0.065"],
+    ["height boolean", "sensor_height_m", true],
+    ["height nan", "sensor_height_m", NaN],
+    ["height infinity", "sensor_height_m", Infinity],
+    ["height negative", "sensor_height_m", -0.001],
+    ["pitch missing", "sensor_pitch_deg", remove],
+    ["pitch boolean", "sensor_pitch_deg", false],
+    ["pitch nan", "sensor_pitch_deg", NaN],
+    ["rejection missing", "ground_rejection_height_m", remove],
+    ["rejection string", "ground_rejection_height_m", "0.035"],
+    ["rejection boolean", "ground_rejection_height_m", true],
+    ["rejection negative", "ground_rejection_height_m", -0.001],
+    ["rejection equals height", "ground_rejection_height_m", 0.065],
+    ["rejection above height", "ground_rejection_height_m", 0.07],
+    ["range missing", "filter_range_m", remove],
+    ["range string", "filter_range_m", "0.60"],
+    ["range boolean", "filter_range_m", true],
+    ["range zero", "filter_range_m", 0],
+    ["range negative", "filter_range_m", -0.1],
+    ["range infinity", "filter_range_m", Infinity],
+    ["convention missing", "pitch_convention", remove],
+    ["convention wrong", "pitch_convention", "positive_down"],
+    ["status missing", "status", remove],
+    ["status wrong", "status", "disabled"],
+  ];
+  for (const [label, key, invalid] of cases) {
+    await t.test(label, () => {
+      const snapshot = makeSnapshot();
+      if (key === "ground_filter") {
+        delete snapshot.scene.ground_filter;
+      } else if (typeof invalid === "symbol") {
+        delete snapshot.scene.ground_filter[key];
+      } else {
+        snapshot.scene.ground_filter[key] = invalid;
+      }
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /ground filter contract/,
+      );
+    });
+  }
+});
+
+test("legacy scenes remain compatible without a ground filter", () => {
+  const parsed = sceneApi.parseRadarScene(makeLegacySnapshot());
+  assert.equal(parsed.groundFilter, null);
 });
 
 test("returns validated diagnostics and recursively detached presentation data", () => {

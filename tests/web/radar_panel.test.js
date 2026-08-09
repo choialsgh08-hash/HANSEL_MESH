@@ -221,6 +221,7 @@ function makeHarness() {
     "frame-value",
     "gap-value",
     "raw-point-value",
+    "ground-rejected-value",
     "confirmed-track-value",
     "clutter-rejected-value",
     "heatmap-candidate-value",
@@ -241,6 +242,7 @@ function makeHarness() {
     "grid-status-value",
     "scene-hazard-value",
     "axis-warning",
+    "ground-filter-tag",
   ]) {
     if (!elements.has(`#${id}`)) {
       elements.set(`#${id}`, makeElement());
@@ -377,6 +379,14 @@ function livePresentationWithProbabilityMap() {
     reason: null,
     hazard: { level: "NORMAL", threshold_m: 0.10 },
     poseMode: "robot_relative_short_memory",
+    groundFilter: {
+      sensorHeightM: 0.065,
+      sensorPitchDeg: 0.0,
+      groundRejectionHeightM: 0.035,
+      filterRangeM: 0.60,
+      pitchConvention: "positive_up",
+      status: "configured",
+    },
     probabilisticLocalMap: {
       sourceField: "probabilistic_local_map",
       radiusM: 0.50,
@@ -610,7 +620,8 @@ test("2.5d view renders filtered height bands and unknown heatmap height", () =>
       height_band: "above_sensor",
       height_reference: "sensor_relative_uncalibrated",
       confidence: 0.8, age_ms: 0 },
-    { source: "heatmap", classification: "reflection_evidence", forward_m: 0.35,
+    { source: "heatmap", classification: "confirmed_obstacle",
+      heatmap_confirmed: true, forward_m: 0.35,
       lateral_m: -0.05, distance_m: 0.354, height_m: null,
       height_band: "unknown", height_reference: "unavailable",
       confidence: 0.5, age_ms: 0 },
@@ -694,7 +705,7 @@ test("normal map rendering invokes uncertainty outlines for map and track", () =
   presentation.filteredTracks = [{
     forward_m: 0.30, lateral_m: 0.02,
     range_uncertainty_m: 0.04, lateral_uncertainty_m: 0.07,
-    source: "heatmap", age_ms: 0,
+    source: "heatmap", heatmap_confirmed: true, age_ms: 0,
   }];
   const outlined = [];
   panel.drawUncertaintyOutline = (_ctx, _transform, evidence) => {
@@ -830,8 +841,8 @@ test("2.5d markers distinguish confirmed tentative heatmap and raw geometry", ()
       point_confirmed: false, forward_m: 0.30, lateral_m: 0.04,
       distance_m: 0.303, height_m: 0.12, height_band: "above_sensor",
       height_reference: "sensor_relative_uncalibrated", confidence: 0.6, age_ms: 0 },
-    { source: "heatmap", classification: "reflection_evidence",
-      heatmap_confirmed: false, forward_m: 0.40, lateral_m: 0.0,
+    { source: "heatmap", classification: "confirmed_obstacle",
+      heatmap_confirmed: true, forward_m: 0.40, lateral_m: 0.0,
       distance_m: 0.40, height_m: null, height_band: "unknown",
       height_reference: "unavailable", confidence: 0.5, age_ms: 0 },
     { source: "point", classification: "confirmed_obstacle",
@@ -906,6 +917,7 @@ test("validated diagnostics and blocked-near-field status drive existing rows", 
   const presentation = livePresentationWithProbabilityMap();
   presentation.diagnostics = {
     raw_point_count: 7,
+    ground_rejected_count: 13,
     self_clutter_rejected_count: 2,
     quality_gate_rejected_count: 1,
     tentative_point_track_count: 3,
@@ -928,6 +940,11 @@ test("validated diagnostics and blocked-near-field status drive existing rows", 
   };
   panel.updateDiagnostics(presentation);
   assert.equal(elements.get("#raw-point-value").textContent, "7");
+  assert.equal(elements.get("#ground-rejected-value").textContent, "13");
+  assert.equal(
+    elements.get("#ground-filter-tag").textContent,
+    "SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN",
+  );
   assert.equal(elements.get("#clutter-rejected-value").textContent, "2");
   assert.equal(elements.get("#reflection-value").textContent, "5");
   assert.equal(elements.get("#confirmed-track-value").textContent, "10");
@@ -1073,6 +1090,7 @@ test("every blocked reason replaces stale live metrics and sectors with sensor f
         "#frame-value",
         "#gap-value",
         "#raw-point-value",
+        "#ground-rejected-value",
         "#confirmed-track-value",
         "#clutter-rejected-value",
         "#heatmap-candidate-value",
@@ -1110,6 +1128,7 @@ test("blocked diagnostics clear all new and legacy count rows after live data", 
   const live = livePresentationWithProbabilityMap();
   live.diagnostics = {
     raw_point_count: 11,
+    ground_rejected_count: 13,
     self_clutter_rejected_count: 2,
     quality_gate_rejected_count: 3,
     confirmed_point_track_count: 4,
@@ -1126,6 +1145,7 @@ test("blocked diagnostics clear all new and legacy count rows after live data", 
   panel.updateDiagnostics(staleBlockedPresentation("sensor_fault"));
   for (const selector of [
     "#raw-point-value",
+    "#ground-rejected-value",
     "#clutter-rejected-value",
     "#reflection-value",
     "#confirmed-track-value",
@@ -1139,6 +1159,99 @@ test("blocked diagnostics clear all new and legacy count rows after live data", 
   ]) {
     assert.equal(elements.get(selector).textContent, "--", selector);
   }
+  assert.equal(elements.get("#ground-filter-tag").textContent, "GROUND FILTER --");
+});
+
+test("operator views hide unconfirmed heatmap geometry but retain confirmed evidence", () => {
+  const { panel, contexts } = makeHarness();
+  const unconfirmed = {
+    track_id: 1,
+    source: "heatmap",
+    heatmap_confirmed: false,
+    forward_m: 0.20,
+    lateral_m: 0.01,
+    distance_m: 0.20,
+    age_ms: 0,
+  };
+  const confirmed = {
+    ...unconfirmed,
+    track_id: 2,
+    heatmap_confirmed: true,
+    classification: "confirmed_obstacle",
+  };
+  const point = {
+    track_id: 3,
+    source: "point",
+    point_confirmed: true,
+    forward_m: 0.25,
+    lateral_m: -0.01,
+    distance_m: 0.25,
+    age_ms: 0,
+  };
+  const scene = livePresentationWithProbabilityMap();
+  scene.filteredTracks = [unconfirmed, confirmed, point];
+  scene.referenceTracks = [unconfirmed];
+  scene.tracks = [unconfirmed, confirmed, point];
+  const outlines = [];
+  const heatmaps = [];
+  const points = [];
+  panel.drawMetricGrid = () => {};
+  panel.clipToMapBoundary = () => {};
+  panel.drawProbabilisticLocalMap = () => {};
+  panel.drawTravelTrail = () => {};
+  panel.drawPlannedPath = () => {};
+  panel.drawRobotFootprint = () => {};
+  panel.drawRobot = () => {};
+  panel.drawUncertaintyOutline = (_ctx, _transform, track) => {
+    outlines.push(track.track_id);
+  };
+  panel.drawHeatmapUncertainty = (_ctx, _transform, track) => {
+    heatmaps.push(track.track_id);
+  };
+  panel.drawPointMarker = (_ctx, _point, track) => {
+    points.push(track.track_id);
+  };
+  panel.drawTrackLabel = () => {};
+  const mainTransform = panel.makeCircularViewportTransform(
+    640, 360, 0.50, { top: 0, right: 0, bottom: 0, left: 0 },
+  );
+  const collisionTransform = panel.makeViewportTransform(
+    320, 180, 0.50, 0.50, { top: 0, right: 0, bottom: 0, left: 0 },
+  );
+  panel.drawLidarTopView(contexts[0], mainTransform, scene);
+  panel.drawCollisionInset(contexts[1], collisionTransform, scene);
+  assert.deepEqual(outlines, [2, 3, 2, 3]);
+  assert.deepEqual(heatmaps, [2, 2]);
+  assert.deepEqual(points, [3, 3]);
+  assert.equal(outlines.includes(1), false);
+  assert.equal(heatmaps.includes(1), false);
+});
+
+test("2.5d view hides unconfirmed heatmap reflection evidence", () => {
+  const { panel, contexts, elements } = makeHarness();
+  const tracks = [
+    { source: "heatmap", heatmap_confirmed: false, forward_m: 0.20,
+      lateral_m: 0.01, distance_m: 0.20, age_ms: 0 },
+    { source: "heatmap", heatmap_confirmed: true, forward_m: 0.25,
+      lateral_m: 0.02, distance_m: 0.25, age_ms: 0 },
+    { source: "point", point_confirmed: true, forward_m: 0.30,
+      lateral_m: -0.02, distance_m: 0.30, height_m: 0.01,
+      height_band: "sensor_level", age_ms: 0 },
+  ];
+  panel.drawPointCloud25d(contexts[2], 420, 300, tracks, [], false);
+  assert.equal(
+    elements.get("#pointcloud-3d-status").textContent,
+    "2 FILTERED · SENSOR-RELATIVE Z",
+  );
+  assert.equal(contexts[2].fillTextCalls.some(
+    ([value]) => String(value).startsWith("0.20m"),
+  ), false);
+  assert.equal(contexts[2].fillTextCalls.some(
+    ([value]) => String(value).startsWith("0.25m"),
+  ), true);
+  assert.equal(contexts[2].fillTextCalls.some(
+    ([value]) => String(value).startsWith("0.30m"),
+  ), true);
 });
 
 test("blocked draw clears short-memory pose and marks 2.5d sensor fault", () => {
