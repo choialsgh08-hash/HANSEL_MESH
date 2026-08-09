@@ -1521,6 +1521,47 @@ class RadarFrontHttpTests(unittest.TestCase):
         args = parse_args(["--demo"])
         self.assertEqual(args.max_range_m, 3.0)
 
+    def test_cli_defaults_to_current_front_mount_geometry(self):
+        args = parse_args(["--demo"])
+
+        self.assertEqual(args.sensor_height_m, 0.065)
+        self.assertEqual(args.sensor_pitch_deg, 0.0)
+        self.assertEqual(args.ground_rejection_height_m, 0.035)
+
+    def test_cli_accepts_future_head_pitch_and_mount_override(self):
+        args = parse_args(
+            [
+                "--demo",
+                "--sensor-height-m",
+                "0.08",
+                "--sensor-pitch-deg",
+                "25",
+                "--ground-rejection-height-m",
+                "0.04",
+            ]
+        )
+
+        self.assertEqual(args.sensor_height_m, 0.08)
+        self.assertEqual(args.sensor_pitch_deg, 25.0)
+        self.assertEqual(args.ground_rejection_height_m, 0.04)
+
+    def test_cli_rejects_invalid_ground_geometry(self):
+        cases = (
+            ("--sensor-height-m", "nan"),
+            ("--sensor-height-m", "inf"),
+            ("--sensor-height-m", "-0.01"),
+            ("--sensor-pitch-deg", "nan"),
+            ("--sensor-pitch-deg", "inf"),
+            ("--ground-rejection-height-m", "nan"),
+            ("--ground-rejection-height-m", "-0.01"),
+            ("--ground-rejection-height-m", "0.065"),
+            ("--ground-rejection-height-m", "0.07"),
+        )
+        for option, value in cases:
+            with self.subTest(option=option, value=value):
+                with self.assertRaises(SystemExit):
+                    parse_args(["--demo", option, value])
+
     def test_corrupt_clutter_model_fails_through_cli_error_path(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "corrupt.json"

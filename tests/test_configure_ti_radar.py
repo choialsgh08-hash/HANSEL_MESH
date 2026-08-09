@@ -132,6 +132,9 @@ class ConfigureTiRadarTest(unittest.TestCase):
                 "aoaFovCfg -70 70 -60 60": (
                     "aoaFovCfg -60 60 -40 40"
                 ),
+                "sensorPosition 0 0 1.5 0 0": (
+                    "sensorPosition 0 0 0.065 0 0"
+                ),
             }.get(command, command)
             for command in experimental.before_baud
         )
@@ -141,6 +144,7 @@ class ConfigureTiRadarTest(unittest.TestCase):
         self.assertEqual(stable.after_baud, experimental.after_baud)
         self.assertIn("lowPowerCfg 0", stable.before_baud)
         self.assertIn("aoaFovCfg -60 60 -40 40", stable.before_baud)
+        self.assertIn("sensorPosition 0 0 0.065 0 0", stable.before_baud)
         self.assertIn(
             "sigProcChainCfg 16 8 1 2 8 4 0 0.3 0",
             stable.before_baud,

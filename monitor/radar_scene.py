@@ -14,6 +14,7 @@ from sensors.radar_calibration import RadarClutterModel
 from monitor.radar_local_map import ProbabilisticRollingGrid
 from monitor.radar_motion import RadarMotionEstimator
 from monitor.radar_path import PathSelectionHysteresis
+from monitor.radar_ground import RadarMountGeometry
 from monitor.radar_tracking import (
     DEFAULT_RANGE_STEP_M,
     POINT_HAZARD_CONFIRM_HITS,
@@ -236,11 +237,13 @@ class RadarSceneEstimator:
         require_calibration: bool = True,
         clock: Callable[[], float] = time.monotonic,
         synthetic: bool = False,
+        mount_geometry: Optional[RadarMountGeometry] = None,
     ) -> None:
         self.axes = axes
         self.clutter_model = clutter_model
         self.require_calibration = require_calibration
         self.synthetic = synthetic
+        self.mount_geometry = mount_geometry or RadarMountGeometry()
         self._clock = clock
         self._tracks: List[Dict[str, object]] = []
         self._next_track_id = 1
@@ -258,6 +261,7 @@ class RadarSceneEstimator:
         self._raw_point_count = 0
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
+        self._ground_rejected_count = 0
         self._heatmap_cells_accepted = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
@@ -300,6 +304,7 @@ class RadarSceneEstimator:
         self._raw_point_count = 0
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
+        self._ground_rejected_count = 0
         self._heatmap_cells_accepted = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
@@ -342,6 +347,7 @@ class RadarSceneEstimator:
         self._scene_point_count = 0
         self._clutter_points_rejected = 0
         self._quality_gate_rejected_count = 0
+        self._ground_rejected_count = 0
         self._calibration_status = self._binding_status(frame)
         if self._calibration_status not in TRUSTED_CALIBRATION_STATUSES:
             self._clear_evidence(self._calibration_status)
@@ -372,6 +378,13 @@ class RadarSceneEstimator:
         for point in frame.points:
             forward_m, lateral_m = self.axes.map_point(point)
             if not self._in_scene(forward_m, lateral_m):
+                continue
+            if self.mount_geometry.is_ground(
+                forward_m,
+                lateral_m,
+                point.z_m,
+            ):
+                self._ground_rejected_count += 1
                 continue
             if (
                 self.clutter_model is not None
@@ -735,6 +748,7 @@ class RadarSceneEstimator:
             "projection_mode": SCENE_PROJECTION_MODE,
             "elevation_used": False,
             "calibration_status": self._calibration_status,
+            "ground_filter": self.mount_geometry.payload(),
             "grid": {
                 "resolution_m": GRID_RESOLUTION_M,
                 "forward_cells": GRID_FORWARD_CELLS,
@@ -808,6 +822,7 @@ class RadarSceneEstimator:
                 "quality_gate_rejected_count": (
                     self._quality_gate_rejected_count
                 ),
+                "ground_rejected_count": self._ground_rejected_count,
                 "heatmap_cells_accepted": self._heatmap_cells_accepted,
                 "heatmap_candidate_cells": self._heatmap_candidate_cells,
                 "heatmap_cluster_count": self._heatmap_cluster_count,

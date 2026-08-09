@@ -12,6 +12,7 @@ from common.sensor_contract import (
     RadarPoint,
     SensorHeader,
 )
+from monitor.radar_ground import RadarMountGeometry
 from monitor.radar_scene import RadarHazardEvaluator, RadarSceneEstimator
 from sensors.mission_log import iter_replay
 from sensors.radar_calibration import (
@@ -324,6 +325,134 @@ def saturated_near_heatmap_frame(frame_index: int) -> RadarFrame:
 
 
 class RadarSceneEstimatorTests(unittest.TestCase):
+    def test_floor_return_stays_raw_but_never_enters_driving_evidence(self):
+        estimator = calibrated_estimator()
+        floor_point = RadarPoint(0.0, 0.08, -0.05, 0.0, 30.0)
+        last_frame = None
+        for frame_number in range(1, 4):
+            last_frame = radar_frame(
+                (floor_point,),
+                frame_number=frame_number,
+            )
+            estimator.ingest(
+                last_frame,
+                received_at=1.0 + frame_number * 0.125,
+            )
+
+        scene = estimator.snapshot(now=1.375)
+
+        self.assertEqual(last_frame.points, (floor_point,))
+        self.assertEqual(scene["diagnostics"]["raw_point_count"], 1)
+        self.assertEqual(scene["diagnostics"]["ground_rejected_count"], 1)
+        self.assertEqual(scene["diagnostics"]["scene_point_count"], 0)
+        self.assertEqual(scene["tracks"], [])
+        self.assertEqual(scene["near_occupancy"]["cells"], [])
+        self.assertEqual(scene["probabilistic_local_map"]["cells"], [])
+        self.assertEqual(scene["accumulated_obstacles"], [])
+        self.assertNotEqual(scene["planned_path"]["status"], "blocked_near_field")
+        self.assertNotEqual(scene["hazard"]["level"], "DANGER")
+        self.assertEqual(
+            scene["ground_filter"],
+            {
+                "sensor_height_m": 0.065,
+                "sensor_pitch_deg": 0.0,
+                "ground_rejection_height_m": 0.035,
+                "filter_range_m": 0.60,
+                "pitch_convention": "positive_up",
+                "status": "configured",
+            },
+        )
+
+    def test_raised_return_at_floor_distance_still_triggers_ten_centimeter_hazard(self):
+        estimator = calibrated_estimator()
+        raised_point = RadarPoint(0.0, 0.08, 0.0, 0.0, 30.0)
+        for frame_number in range(1, 4):
+            estimator.ingest(
+                radar_frame((raised_point,), frame_number=frame_number),
+                received_at=1.0 + frame_number * 0.125,
+            )
+
+        scene = estimator.snapshot(now=1.375)
+
+        self.assertEqual(scene["diagnostics"]["ground_rejected_count"], 0)
+        self.assertEqual(scene["diagnostics"]["scene_point_count"], 1)
+        self.assertEqual(len(scene["tracks"]), 1)
+        self.assertTrue(scene["tracks"][0]["point_confirmed"])
+        self.assertEqual(scene["hazard"]["level"], "DANGER")
+        self.assertAlmostEqual(scene["hazard"]["nearest_confirmed_m"], 0.08)
+
+    def test_floor_gate_does_not_hide_return_outside_local_filter_range(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(
+            radar_frame((RadarPoint(0.0, 0.61, -0.065, 0.0, 30.0),)),
+            received_at=1.0,
+        )
+
+        scene = estimator.snapshot(now=1.0)
+
+        self.assertEqual(scene["diagnostics"]["ground_rejected_count"], 0)
+        self.assertEqual(scene["diagnostics"]["scene_point_count"], 1)
+        self.assertEqual(len(scene["tracks"]), 1)
+
+    def test_ground_point_cannot_confirm_heatmap_reflection(self):
+        estimator = calibrated_estimator()
+        for frame_number in range(1, 4):
+            heatmap_frame = heatmap_only_frame(
+                range_index=1,
+                azimuth_index=8,
+                frame_number=frame_number,
+            )
+            frame = replace(
+                heatmap_frame,
+                points=(RadarPoint(0.0, RANGE_STEP_M, -0.05, 0.0, 30.0),),
+            )
+            estimator.ingest(
+                frame,
+                received_at=1.0 + frame_number * 0.125,
+            )
+
+        scene = estimator.snapshot(now=1.375)
+        heatmap_tracks = [
+            track for track in scene["tracks"] if track["source"] == "heatmap"
+        ]
+
+        self.assertTrue(heatmap_tracks)
+        self.assertTrue(all(
+            track["point_correlated"] is False for track in heatmap_tracks
+        ))
+        self.assertTrue(all(
+            track["heatmap_confirmed"] is False for track in heatmap_tracks
+        ))
+        self.assertEqual(scene["diagnostics"]["ground_rejected_count"], 1)
+        self.assertEqual(scene["probabilistic_local_map"]["cells"], [])
+
+    def test_ground_counter_resets_on_next_frame_and_calibration_failure(self):
+        estimator = calibrated_estimator()
+        estimator.ingest(
+            radar_frame((RadarPoint(0.0, 0.08, -0.05, 0.0, 30.0),)),
+            received_at=1.0,
+        )
+        self.assertEqual(
+            estimator.snapshot(now=1.0)["diagnostics"]["ground_rejected_count"],
+            1,
+        )
+
+        estimator.ingest(empty_frame(frame_number=2), received_at=1.125)
+        self.assertEqual(
+            estimator.snapshot(now=1.125)["diagnostics"]["ground_rejected_count"],
+            0,
+        )
+
+        mismatched = mismatched_estimator()
+        mismatched.ingest(
+            radar_frame((RadarPoint(0.0, 0.08, -0.05, 0.0, 30.0),)),
+            received_at=1.0,
+        )
+        self.assertEqual(
+            mismatched.snapshot(now=1.0)["diagnostics"]["ground_rejected_count"],
+            0,
+        )
+
     def test_existing_positional_clock_argument_remains_compatible(self):
         clock = lambda: 4.0
         estimator = RadarSceneEstimator(RadarAxes(), None, True, clock)
@@ -849,7 +978,11 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(after, before)
 
     def test_only_stable_five_match_motion_transforms_short_memory_map(self):
-        estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+        estimator = RadarSceneEstimator(
+            RadarAxes(),
+            synthetic=True,
+            mount_geometry=RadarMountGeometry(sensor_height_m=1.0),
+        )
         for frame_number in range(1, 4):
             estimator.ingest(five_point_scan(0.0, frame_number),
                              received_at=1.0 + frame_number * 0.125)

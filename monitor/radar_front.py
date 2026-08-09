@@ -36,6 +36,7 @@ from common.sensor_contract import (  # noqa: E402
     SensorHeader,
     SensorHealth,
 )
+from monitor.radar_ground import RadarMountGeometry  # noqa: E402
 from monitor.radar_scene import RadarSceneEstimator  # noqa: E402
 from sensors.mission_log import (  # noqa: E402
     DEFAULT_MAX_LINE_BYTES,
@@ -1168,6 +1169,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stale-after", type=float, default=0.75)
     parser.add_argument("--fault-after", type=float, default=2.0)
     parser.add_argument(
+        "--sensor-height-m",
+        type=float,
+        default=0.065,
+        help="radar center height above the robot ground plane",
+    )
+    parser.add_argument(
+        "--sensor-pitch-deg",
+        type=float,
+        default=0.0,
+        help="radar elevation pitch; positive values look upward",
+    )
+    parser.add_argument(
+        "--ground-rejection-height-m",
+        type=float,
+        default=0.035,
+        help="maximum ground-relative height hidden as traversable floor",
+    )
+    parser.add_argument(
         "--forward-axis",
         choices=("x", "y"),
         default="y",
@@ -1253,6 +1272,14 @@ def parse_args(
         parser.error("--speed must be finite and non-negative")
     if args.forward_axis == args.lateral_axis:
         parser.error("--forward-axis and --lateral-axis must differ")
+    try:
+        RadarMountGeometry(
+            sensor_height_m=args.sensor_height_m,
+            sensor_pitch_deg=args.sensor_pitch_deg,
+            ground_rejection_height_m=args.ground_rejection_height_m,
+        )
+    except (TypeError, ValueError) as exc:
+        parser.error(f"invalid radar mount geometry: {exc}")
     if args.loop and not args.replay:
         parser.error("--loop is only valid with --replay")
     return args
@@ -1286,6 +1313,11 @@ def run(args: argparse.Namespace) -> int:
         clutter_model=clutter_model,
         require_calibration=(mode != "demo"),
         synthetic=(mode == "demo"),
+        mount_geometry=RadarMountGeometry(
+            sensor_height_m=args.sensor_height_m,
+            sensor_pitch_deg=args.sensor_pitch_deg,
+            ground_rejection_height_m=args.ground_rejection_height_m,
+        ),
     )
     state = RadarFrontState(
         source_mode=mode,
