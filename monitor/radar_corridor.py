@@ -10,6 +10,9 @@ MIN_POINT_WALL_SUPPORT = 2
 MIN_POINT_WALL_SPAN_M = 0.04
 MIN_HEATMAP_WALL_SUPPORT = 2
 MIN_HEATMAP_WALL_SPAN_M = 0.08
+HEATMAP_ONLY_MIN_WALL_SUPPORT = 5
+HEATMAP_ONLY_MIN_WALL_SPAN_M = 0.20
+HEATMAP_ONLY_MIN_MEAN_INTENSITY = 0.60
 MAX_ABS_WALL_HEADING_DEG = 75.0
 MIN_CORRIDOR_WIDTH_M = 0.06
 MAX_CORRIDOR_WIDTH_M = 0.55
@@ -232,13 +235,70 @@ class ReflectivityCorridorEstimator:
     ) -> Optional[Dict[str, object]]:
         heatmap_points = cls._points(cells)
         point_returns = cls._points(point_observations)
+        pairs = cls._pair_candidates(
+            primary_points=point_returns,
+            secondary_points=heatmap_points,
+            primary_min_support=MIN_POINT_WALL_SUPPORT,
+            primary_min_span_m=MIN_POINT_WALL_SPAN_M,
+            primary_min_clearance_m=MIN_POINT_WALL_CLEARANCE_FROM_SENSOR_M,
+            primary_min_mean_intensity=MIN_CELL_INTENSITY,
+            secondary_min_support=MIN_HEATMAP_WALL_SUPPORT,
+            secondary_min_span_m=MIN_HEATMAP_WALL_SPAN_M,
+            secondary_min_clearance_m=(
+                MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M
+            ),
+            secondary_min_mean_intensity=MIN_CELL_INTENSITY,
+            require_disjoint_support=False,
+        )
+        if not pairs:
+            pairs = cls._pair_candidates(
+                primary_points=heatmap_points,
+                secondary_points=heatmap_points,
+                primary_min_support=HEATMAP_ONLY_MIN_WALL_SUPPORT,
+                primary_min_span_m=HEATMAP_ONLY_MIN_WALL_SPAN_M,
+                primary_min_clearance_m=(
+                    MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M
+                ),
+                primary_min_mean_intensity=(
+                    HEATMAP_ONLY_MIN_MEAN_INTENSITY
+                ),
+                secondary_min_support=HEATMAP_ONLY_MIN_WALL_SUPPORT,
+                secondary_min_span_m=HEATMAP_ONLY_MIN_WALL_SPAN_M,
+                secondary_min_clearance_m=(
+                    MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M
+                ),
+                secondary_min_mean_intensity=(
+                    HEATMAP_ONLY_MIN_MEAN_INTENSITY
+                ),
+                require_disjoint_support=True,
+            )
+        if not pairs:
+            return None
+        return min(pairs, key=lambda value: value[0])[1]
+
+    @classmethod
+    def _pair_candidates(
+        cls,
+        *,
+        primary_points: Sequence[Point],
+        secondary_points: Sequence[Point],
+        primary_min_support: int,
+        primary_min_span_m: float,
+        primary_min_clearance_m: float,
+        primary_min_mean_intensity: float,
+        secondary_min_support: int,
+        secondary_min_span_m: float,
+        secondary_min_clearance_m: float,
+        secondary_min_mean_intensity: float,
+        require_disjoint_support: bool,
+    ) -> List[Tuple[Tuple[object, ...], Dict[str, object]]]:
         pairs: List[Tuple[Tuple[object, ...], Dict[str, object]]] = []
-        for left_index, left in enumerate(point_returns):
-            for right in point_returns[left_index + 1:]:
+        for left_index, left in enumerate(primary_points):
+            for right in primary_points[left_index + 1:]:
                 delta_forward = right[0] - left[0]
                 delta_lateral = right[1] - left[1]
                 pair_span = math.hypot(delta_forward, delta_lateral)
-                if pair_span < MIN_POINT_WALL_SPAN_M:
+                if pair_span < primary_min_span_m:
                     continue
                 heading = math.degrees(math.atan2(
                     delta_lateral,
@@ -259,73 +319,80 @@ class ReflectivityCorridorEstimator:
                     normal_forward * left[0]
                     + normal_lateral * left[1]
                 )
-                point_inliers = tuple(
+                primary_inliers = tuple(
                     index
-                    for index, point in enumerate(point_returns)
+                    for index, point in enumerate(primary_points)
                     if abs(
                         normal_forward * point[0]
                         + normal_lateral * point[1]
                         - normal_offset
                     ) <= LINE_TOLERANCE_M + 1e-12
                 )
-                if len(point_inliers) < MIN_POINT_WALL_SUPPORT:
+                if len(primary_inliers) < primary_min_support:
                     continue
-                point_projections = [
-                    unit_forward * point_returns[index][0]
-                    + unit_lateral * point_returns[index][1]
-                    for index in point_inliers
+                primary_projections = [
+                    unit_forward * primary_points[index][0]
+                    + unit_lateral * primary_points[index][1]
+                    for index in primary_inliers
                 ]
-                point_span = max(point_projections) - min(point_projections)
-                if point_span < MIN_POINT_WALL_SPAN_M:
+                primary_span = max(primary_projections) - min(
+                    primary_projections
+                )
+                if primary_span < primary_min_span_m:
                     continue
                 normal_offset = _median([
-                    normal_forward * point_returns[index][0]
-                    + normal_lateral * point_returns[index][1]
-                    for index in point_inliers
+                    normal_forward * primary_points[index][0]
+                    + normal_lateral * primary_points[index][1]
+                    for index in primary_inliers
                 ])
-                if (
-                    abs(normal_offset)
-                    < MIN_POINT_WALL_CLEARANCE_FROM_SENSOR_M
-                ):
+                if abs(normal_offset) < primary_min_clearance_m:
                     continue
                 primary = cls._wall_payload(
                     heading,
                     normal_offset,
-                    [point_returns[index] for index in point_inliers],
+                    [primary_points[index] for index in primary_inliers],
                 )
-                heatmap_offsets = [
+                primary_mean_intensity = float(primary["mean_intensity"])
+                if primary_mean_intensity < primary_min_mean_intensity:
+                    continue
+                secondary_offsets = [
                     normal_forward * point[0] + normal_lateral * point[1]
-                    for point in heatmap_points
+                    for point in secondary_points
                 ]
                 seen_support = set()
-                for seed_offset in heatmap_offsets:
-                    heatmap_inliers = tuple(
+                for seed_offset in secondary_offsets:
+                    secondary_inliers = tuple(
                         index
-                        for index, offset in enumerate(heatmap_offsets)
+                        for index, offset in enumerate(secondary_offsets)
                         if abs(offset - seed_offset) <= LINE_TOLERANCE_M + 1e-12
                     )
-                    if heatmap_inliers in seen_support:
+                    if secondary_inliers in seen_support:
                         continue
-                    seen_support.add(heatmap_inliers)
-                    if len(heatmap_inliers) < MIN_HEATMAP_WALL_SUPPORT:
+                    seen_support.add(secondary_inliers)
+                    if len(secondary_inliers) < secondary_min_support:
                         continue
-                    heatmap_projections = [
-                        unit_forward * heatmap_points[index][0]
-                        + unit_lateral * heatmap_points[index][1]
-                        for index in heatmap_inliers
+                    if (
+                        require_disjoint_support
+                        and not set(primary_inliers).isdisjoint(
+                            secondary_inliers
+                        )
+                    ):
+                        continue
+                    secondary_projections = [
+                        unit_forward * secondary_points[index][0]
+                        + unit_lateral * secondary_points[index][1]
+                        for index in secondary_inliers
                     ]
-                    heatmap_span = max(heatmap_projections) - min(
-                        heatmap_projections
+                    secondary_span = max(secondary_projections) - min(
+                        secondary_projections
                     )
-                    if heatmap_span < MIN_HEATMAP_WALL_SPAN_M:
+                    if secondary_span < secondary_min_span_m:
                         continue
                     secondary_offset = _median([
-                        heatmap_offsets[index] for index in heatmap_inliers
+                        secondary_offsets[index]
+                        for index in secondary_inliers
                     ])
-                    if (
-                        abs(secondary_offset)
-                        < MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M
-                    ):
+                    if abs(secondary_offset) < secondary_min_clearance_m:
                         continue
                     offsets = sorted((normal_offset, secondary_offset))
                     if not offsets[0] < 0.0 < offsets[1]:
@@ -336,8 +403,19 @@ class ReflectivityCorridorEstimator:
                     secondary = cls._wall_payload(
                         heading,
                         secondary_offset,
-                        [heatmap_points[index] for index in heatmap_inliers],
+                        [
+                            secondary_points[index]
+                            for index in secondary_inliers
+                        ],
                     )
+                    secondary_mean_intensity = float(
+                        secondary["mean_intensity"]
+                    )
+                    if (
+                        secondary_mean_intensity
+                        < secondary_min_mean_intensity
+                    ):
+                        continue
                     walls = sorted(
                         (primary, secondary),
                         key=lambda wall: float(wall["normal_offset_m"]),
@@ -351,18 +429,22 @@ class ReflectivityCorridorEstimator:
                     mean_intensity = sum(
                         float(wall["mean_intensity"]) for wall in walls
                     ) / 2.0
-                    primary_mean_intensity = sum(
-                        point_returns[index][2]
-                        for index in point_inliers
-                    ) / len(point_inliers)
                     confidence = min(
                         1.0,
                         min(1.0, support_total / 8.0) * 0.50
                         + min(1.0, minimum_span / 0.30) * 0.25
                         + mean_intensity * 0.25,
                     )
+                    intensity_priority = (
+                        min(
+                            primary_mean_intensity,
+                            secondary_mean_intensity,
+                        )
+                        if require_disjoint_support
+                        else primary_mean_intensity
+                    )
                     pair_key = (
-                        -primary_mean_intensity,
+                        -intensity_priority,
                         -confidence,
                         -support_total,
                         -minimum_span,
@@ -376,9 +458,7 @@ class ReflectivityCorridorEstimator:
                         "confidence": confidence,
                         "walls": walls,
                     }))
-        if not pairs:
-            return None
-        return min(pairs, key=lambda value: value[0])[1]
+        return pairs
 
     @staticmethod
     def _wall_payload(

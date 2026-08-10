@@ -92,6 +92,19 @@ PHOTO_LAYOUT_CENTER_ARC = [
     (0.400, -0.156, 0.81),
 ]
 
+STRONG_STRAIGHT_HEATMAP_CORRIDOR = [
+    (0.150, -0.155, 0.64),
+    (0.225, -0.155, 0.68),
+    (0.300, -0.155, 0.65),
+    (0.375, -0.155, 0.69),
+    (0.450, -0.155, 0.66),
+    (0.150, 0.155, 0.67),
+    (0.225, 0.155, 0.71),
+    (0.300, 0.155, 0.66),
+    (0.375, 0.155, 0.68),
+    (0.450, 0.155, 0.69),
+]
+
 
 def cells(rows):
     return [
@@ -113,6 +126,26 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "unavailable")
         self.assertEqual(payload["walls"], [])
+
+    def test_strong_bilateral_heatmap_walls_confirm_without_point_returns(self):
+        estimator = ReflectivityCorridorEstimator()
+        observed = cells(STRONG_STRAIGHT_HEATMAP_CORRIDOR)
+
+        for _ in range(3):
+            estimator.ingest(observed)
+        payload = estimator.payload()
+
+        self.assertEqual(payload["status"], "confirmed")
+        self.assertEqual(payload["hits"], 3)
+        self.assertAlmostEqual(payload["measured_heading_deg"], 0.0, places=6)
+        self.assertAlmostEqual(payload["width_m"], 0.31, places=6)
+        self.assertEqual(len(payload["walls"]), 2)
+        self.assertLess(payload["walls"][0]["normal_offset_m"], 0.0)
+        self.assertGreater(payload["walls"][1]["normal_offset_m"], 0.0)
+        self.assertTrue(all(
+            wall["support_cells"] >= 5 and wall["span_m"] >= 0.20
+            for wall in payload["walls"]
+        ))
 
     def test_point_seeded_photo_layout_confirms_after_three_frames(self):
         estimator = ReflectivityCorridorEstimator()

@@ -1725,6 +1725,48 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         for wall in scene["reflectivity_corridor"]["walls"]:
             self.assertAlmostEqual(wall["start"][0], 0.0, places=6)
 
+    def test_scene_displays_strong_straight_heatmap_walls_without_points(self):
+        estimator = calibrated_estimator()
+        wall_cells = [
+            {
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "intensity": intensity,
+            }
+            for lateral_m, intensities in (
+                (-0.155, (0.64, 0.68, 0.65, 0.69, 0.66)),
+                (0.155, (0.67, 0.71, 0.66, 0.68, 0.69)),
+            )
+            for forward_m, intensity in zip(
+                (0.150, 0.225, 0.300, 0.375, 0.450),
+                intensities,
+            )
+        ]
+        with patch.object(estimator, "_reflectivity_surface"):
+            estimator._reflectivity_surface.payload.return_value = {
+                "cells": wall_cells,
+            }
+            for frame_number in range(1, 4):
+                estimator.ingest(
+                    radar_frame([], frame_number=frame_number),
+                    received_at=7.0 + frame_number * 0.125,
+                )
+
+        scene = estimator.snapshot(now=7.375)
+
+        self.assertEqual(scene["diagnostics"]["raw_point_count"], 0)
+        self.assertEqual(scene["reflectivity_corridor"]["status"], "confirmed")
+        self.assertAlmostEqual(
+            scene["reflectivity_corridor"]["measured_heading_deg"],
+            0.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            scene["reflectivity_corridor"]["width_m"],
+            0.31,
+            places=6,
+        )
+
     def test_ground_level_wall_return_guides_left_without_becoming_obstacle(self):
         estimator = calibrated_estimator()
         with patch.object(estimator, "_reflectivity_surface"):
