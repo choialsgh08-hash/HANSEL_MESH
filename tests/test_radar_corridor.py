@@ -1,4 +1,6 @@
 import math
+import random
+import time
 import unittest
 
 from monitor.radar_corridor import ReflectivityCorridorEstimator
@@ -129,6 +131,27 @@ def cells(rows):
             "intensity": intensity,
         }
         for forward, lateral, intensity in rows
+    ]
+
+
+def varied_quantized_scatter(seed, points_per_side):
+    left = [
+        (forward_index * 0.025, lateral_index * 0.025)
+        for forward_index in range(1, 21)
+        for lateral_index in range(-20, -1)
+        if math.hypot(
+            forward_index * 0.025,
+            lateral_index * 0.025,
+        ) <= 0.5 + 1e-12
+    ]
+    right = [(forward, -lateral) for forward, lateral in left]
+    rng = random.Random(seed)
+    return [
+        (forward, lateral, rng.uniform(0.60, 1.0))
+        for forward, lateral in rng.sample(left, points_per_side)
+    ] + [
+        (forward, lateral, rng.uniform(0.60, 1.0))
+        for forward, lateral in rng.sample(right, points_per_side)
     ]
 
 
@@ -319,6 +342,199 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         ])
         estimator = ReflectivityCorridorEstimator()
         estimator.ingest(observed)
+
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+
+    def test_independent_wall_headings_survive_inner_reflection_clutter(self):
+        forward_rows = (0.200, 0.250, 0.300, 0.350, 0.400)
+        measured_walls = [
+            (forward_m, -0.250, 0.92)
+            for forward_m in forward_rows
+        ] + [
+            (forward_m, 0.450 - forward_m, 0.91)
+            for forward_m in forward_rows
+        ]
+        inner_clutter = [
+            (forward_m, lateral_m, 0.64)
+            for forward_m, lateral_m in zip(
+                forward_rows,
+                (-0.050, -0.150, -0.050, -0.150, -0.050),
+            )
+        ]
+        estimator = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            estimator.ingest(cells(measured_walls + inner_clutter))
+
+        payload = estimator.payload()
+
+        self.assertEqual(payload["status"], "confirmed")
+        self.assertEqual(payload["geometry"], "converging")
+        self.assertAlmostEqual(payload["walls"][0]["heading_deg"], 0.0)
+        self.assertAlmostEqual(payload["walls"][1]["heading_deg"], -45.0)
+        self.assertAlmostEqual(payload["walls"][0]["start"][0], 0.20)
+        self.assertAlmostEqual(payload["walls"][1]["start"][0], 0.20)
+
+    def test_dense_bilateral_scatter_cannot_invent_wall_boundaries(self):
+        rng = random.Random(7)
+        scatter = []
+        for _ in range(20):
+            scatter.append((
+                rng.uniform(0.05, 0.55),
+                rng.uniform(-0.32, -0.04),
+                0.80,
+            ))
+            scatter.append((
+                rng.uniform(0.05, 0.55),
+                rng.uniform(0.04, 0.32),
+                0.80,
+            ))
+        estimator = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            estimator.ingest(cells(scatter))
+
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+
+    def test_dense_quantized_scatter_cannot_invent_wall_boundaries(self):
+        rng = random.Random(19)
+        scatter = set()
+        while len(scatter) < 40:
+            side = -1 if len(scatter) % 2 == 0 else 1
+            scatter.add((
+                rng.randint(2, 20) * 0.025,
+                side * rng.randint(2, 12) * 0.025,
+                0.80,
+            ))
+        estimator = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            estimator.ingest(cells(scatter))
+
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+
+    def test_varied_bright_quantized_scatter_cannot_invent_boundaries(self):
+        for seed in range(100):
+            with self.subTest(seed=seed):
+                scatter = varied_quantized_scatter(seed, 20)
+                estimator = ReflectivityCorridorEstimator()
+                for _ in range(3):
+                    estimator.ingest(cells(scatter))
+                self.assertEqual(
+                    estimator.payload()["status"],
+                    "unavailable",
+                )
+
+    def test_denser_scatter_cannot_form_accidental_independent_walls(self):
+        estimator = ReflectivityCorridorEstimator()
+        scatter = varied_quantized_scatter(200, 30)
+        for _ in range(3):
+            estimator.ingest(cells(scatter))
+
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+
+    def test_denser_scatter_cannot_form_a_four_row_bottleneck(self):
+        estimator = ReflectivityCorridorEstimator()
+        scatter = varied_quantized_scatter(62, 80)
+        for _ in range(3):
+            estimator.ingest(cells(scatter))
+
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+
+    def test_independent_fit_stays_inside_one_eight_hz_frame_budget(self):
+        occupied_semicircle = [
+            (forward_index * 0.025, lateral_index * 0.025, 0.80)
+            for forward_index in range(21)
+            for lateral_index in range(-20, 21)
+            if math.hypot(
+                forward_index * 0.025,
+                lateral_index * 0.025,
+            ) <= 0.5 + 1e-12
+        ]
+        self.assertEqual(len(occupied_semicircle), 649)
+
+        started = time.perf_counter()
+        ReflectivityCorridorEstimator._independent_heatmap_candidate(
+            occupied_semicircle,
+        )
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 0.125)
+
+    def test_point_seeded_geometry_precedes_heatmap_only_geometry(self):
+        heatmap = [
+            (forward_m, -0.25, 0.90)
+            for forward_m in (0.10, 0.15, 0.20, 0.25, 0.30)
+        ] + [
+            (forward_m, 0.355 - 0.5 * forward_m, 0.90)
+            for forward_m in (0.11, 0.16, 0.21, 0.26, 0.31)
+        ]
+        point_returns = [
+            (0.10, -0.10, 0.95),
+            (0.30, -0.20, 0.95),
+        ]
+
+        fit = ReflectivityCorridorEstimator._fit_pair(
+            cells(heatmap),
+            cells(point_returns),
+        )
+
+        self.assertIsNotNone(fit)
+        self.assertEqual(fit["geometry"], "parallel")
+        self.assertAlmostEqual(
+            fit["measured_heading_deg"],
+            -26.565051,
+            places=6,
+        )
+
+    def test_independent_walls_keep_their_full_measured_extents(self):
+        left = [
+            (0.10 + index * 0.075, -0.20, 0.90)
+            for index in range(5)
+        ]
+        right = [
+            (0.20 + index * 0.075, 0.20, 0.90)
+            for index in range(5)
+        ]
+
+        fit = ReflectivityCorridorEstimator._independent_heatmap_candidate(
+            sorted(left + right),
+        )
+
+        self.assertIsNotNone(fit)
+        self.assertEqual(fit["walls"][0]["start"][0], 0.10)
+        self.assertEqual(fit["walls"][0]["end"][0], 0.40)
+        self.assertEqual(fit["walls"][1]["start"][0], 0.20)
+        self.assertEqual(fit["walls"][1]["end"][0], 0.50)
+
+    def test_near_narrow_walls_beat_a_brighter_later_lobe(self):
+        near = []
+        far = []
+        for index in range(5):
+            near.append((0.075 + index * 0.050, -0.10, 0.72))
+            near.append((0.100 + index * 0.050, 0.10, 0.72))
+            far.append((0.325 + index * 0.050, -0.20, 0.96))
+            far.append((0.350 + index * 0.050, 0.20, 0.96))
+
+        fit = ReflectivityCorridorEstimator._independent_heatmap_candidate(
+            sorted(near + far),
+        )
+
+        self.assertIsNotNone(fit)
+        self.assertAlmostEqual(fit["width_m"], 0.20)
+        self.assertLessEqual(max(
+            float(wall["end"][0]) for wall in fit["walls"]
+        ), 0.300001)
+
+    def test_shallow_independent_narrowing_is_not_a_converging_corridor(self):
+        left = [
+            (forward, -0.20, 0.90)
+            for forward in (0.10, 0.15, 0.20, 0.25, 0.30)
+        ]
+        right = [
+            (forward, 0.30 - 0.20 * forward, 0.90)
+            for forward in (0.11, 0.16, 0.21, 0.26, 0.31)
+        ]
+        estimator = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            estimator.ingest(cells(left + right))
 
         self.assertEqual(estimator.payload()["status"], "unavailable")
 

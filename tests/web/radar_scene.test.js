@@ -124,7 +124,7 @@ function makeReflectivityCorridor(overrides = {}) {
     history_frames: 5,
     required_hits: 3,
     hits: 3,
-    measured_heading_deg: 65.407542,
+    measured_heading_deg: 65.556027,
     guidance_heading_deg: 55.0,
     width_m: 0.19321,
     confidence: 0.90049,
@@ -384,7 +384,7 @@ test("validates and detaches the measured two-wall reflectivity corridor", () =>
     historyFrames: 5,
     requiredHits: 3,
     hits: 3,
-    measuredHeadingDeg: 65.407542,
+    measuredHeadingDeg: 65.556027,
     guidanceHeadingDeg: 55.0,
     widthM: 0.19321,
     confidence: 0.90049,
@@ -503,6 +503,41 @@ test("accepts a short near-sensor wall supported by two consistent points", () =
   assert.equal(parsed.walls[0].spanM, 0.05206);
 });
 
+test("accepts parallel wall centerline from independent headings", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 2.504769,
+    guidance_heading_deg: 2.504769,
+    width_m: 0.399239,
+    confidence: 0.793333,
+    walls: [
+      {
+        wall_id: "wall_1", heading_deg: 0.0,
+        normal_offset_m: -0.2, support_cells: 5,
+        span_m: 0.2, mean_intensity: 0.9,
+        start: [0.10, -0.20], end: [0.30, -0.20],
+      },
+      {
+        wall_id: "wall_2", heading_deg: 5.0,
+        normal_offset_m: 0.199239, support_cells: 5,
+        span_m: 0.200764, mean_intensity: 0.9,
+        start: [0.11, 0.209624], end: [0.31, 0.227121],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.measuredHeadingDeg, 2.504769);
+  assert.equal(parsed.walls[1].headingDeg, 5.0);
+});
+
 test("accepts independently measured converging walls and bottleneck width", () => {
   const snapshot = makeSnapshot();
   snapshot.scene.reflectivity_corridor = {
@@ -547,6 +582,50 @@ test("accepts independently measured converging walls and bottleneck width", () 
   assert.equal(parsed.measuredHeadingDeg, 0.0);
   assert.deepEqual(parsed.walls[0].start, [0.20, -0.25]);
   assert.deepEqual(parsed.walls[1].end, [0.40, 0.05]);
+});
+
+test("accepts converging walls with independently measured extents", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "converging",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: -26.565051,
+    guidance_heading_deg: -26.565051,
+    width_m: 0.30,
+    confidence: 0.82,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: 0.0,
+        normal_offset_m: -0.25,
+        support_cells: 5,
+        span_m: 0.30,
+        mean_intensity: 0.90,
+        start: [0.10, -0.25],
+        end: [0.40, -0.25],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -45.0,
+        normal_offset_m: 0.318198,
+        support_cells: 5,
+        span_m: 0.424264,
+        mean_intensity: 0.91,
+        start: [0.20, 0.25],
+        end: [0.50, -0.05],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.measuredHeadingDeg, -26.565051);
+  assert.deepEqual(parsed.walls[0].start, [0.10, -0.25]);
+  assert.deepEqual(parsed.walls[1].end, [0.50, -0.05]);
 });
 
 test("accepts only canonical unavailable and candidate corridor states", () => {

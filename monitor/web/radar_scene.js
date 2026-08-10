@@ -305,7 +305,7 @@
         -Math.sin(headingRad) * wall.start[0] +
         Math.cos(headingRad) * wall.start[1];
       if (endpointSpan + 2e-5 < wall.span_m ||
-          Math.abs(endpointHeading - wall.heading_deg) > 2e-4 ||
+          Math.abs(endpointHeading - wall.heading_deg) > 5e-4 ||
           Math.abs(endpointNormalOffset - wall.normal_offset_m) > 2e-5) {
         return invalid();
       }
@@ -323,34 +323,55 @@
     if (new Set(walls.map((wall) => wall.wallId)).size !== 2) {
       return invalid();
     }
+    const lateralAt = (wall, forward) => {
+      const fraction = (
+        (forward - wall.start[0]) /
+        (wall.end[0] - wall.start[0])
+      );
+      return wall.start[1] + fraction * (
+        wall.end[1] - wall.start[1]
+      );
+    };
+    const overlapStart = Math.max(
+      walls[0].start[0],
+      walls[1].start[0],
+    );
+    const overlapEnd = Math.min(walls[0].end[0], walls[1].end[0]);
+    const centerlineHeading = () => {
+      const nearCenterLateral = walls.reduce(
+        (sum, wall) => sum + lateralAt(wall, overlapStart),
+        0,
+      ) / 2;
+      const farCenterLateral = walls.reduce(
+        (sum, wall) => sum + lateralAt(wall, overlapEnd),
+        0,
+      ) / 2;
+      return Math.atan2(
+        farCenterLateral - nearCenterLateral,
+        overlapEnd - overlapStart,
+      ) * 180 / Math.PI;
+    };
     if (corridor.geometry === "parallel") {
       if (Math.abs(walls[0].headingDeg - walls[1].headingDeg) > 10 ||
           Math.abs(
             Math.abs(walls[0].normalOffsetM - walls[1].normalOffsetM) -
             corridor.width_m
-          ) > 2e-5 || Math.abs(
-            (walls[0].headingDeg + walls[1].headingDeg) / 2 -
-            corridor.measured_heading_deg
-          ) > 2e-5) {
+          ) > 2e-5 || overlapEnd <= overlapStart || Math.abs(
+            centerlineHeading() - corridor.measured_heading_deg
+          ) > 2e-4) {
         return invalid();
       }
     } else {
-      const nearWidth = walls[1].start[1] - walls[0].start[1];
-      const farWidth = walls[1].end[1] - walls[0].end[1];
-      const nearCenter = [
-        (walls[0].start[0] + walls[1].start[0]) / 2,
-        (walls[0].start[1] + walls[1].start[1]) / 2,
-      ];
-      const farCenter = [
-        (walls[0].end[0] + walls[1].end[0]) / 2,
-        (walls[0].end[1] + walls[1].end[1]) / 2,
-      ];
-      const centerHeading = Math.atan2(
-        farCenter[1] - nearCenter[1],
-        farCenter[0] - nearCenter[0],
-      ) * 180 / Math.PI;
-      if (Math.abs(walls[0].start[0] - walls[1].start[0]) > 2e-5 ||
-          Math.abs(walls[0].end[0] - walls[1].end[0]) > 2e-5 ||
+      const nearLaterals = walls.map(
+        (wall) => lateralAt(wall, overlapStart),
+      );
+      const farLaterals = walls.map(
+        (wall) => lateralAt(wall, overlapEnd),
+      );
+      const nearWidth = nearLaterals[1] - nearLaterals[0];
+      const farWidth = farLaterals[1] - farLaterals[0];
+      const centerHeading = centerlineHeading();
+      if (overlapEnd - overlapStart < 0.075 - 2e-5 ||
           nearWidth <= 0 || farWidth < 0 ||
           nearWidth - farWidth < 0.075 - 2e-5 ||
           Math.abs(farWidth - corridor.width_m) > 2e-5 ||

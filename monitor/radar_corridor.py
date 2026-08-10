@@ -11,14 +11,26 @@ MIN_POINT_WALL_SPAN_M = 0.04
 MIN_HEATMAP_WALL_SUPPORT = 2
 MIN_HEATMAP_WALL_SPAN_M = 0.08
 HEATMAP_ONLY_MIN_WALL_SUPPORT = 5
-HEATMAP_ONLY_MIN_WALL_SPAN_M = 0.20
 HEATMAP_ONLY_MIN_MEAN_INTENSITY = 0.60
+INDEPENDENT_MIN_WALL_SPAN_M = 0.18
+INDEPENDENT_MIN_OVERLAP_M = 0.12
+INDEPENDENT_PARALLEL_WIDTH_DELTA_M = 0.025
+INDEPENDENT_HEADING_STEP_DEG = 5
+INDEPENDENT_OFFSET_BIN_M = 0.025
+INDEPENDENT_MAX_HOUGH_SEEDS = 16
+INDEPENDENT_MAX_WALL_CANDIDATES = 16
+INDEPENDENT_MAX_FORWARD_GAP_M = 0.10
+INDEPENDENT_MAX_SUPPORT_GAP_M = 0.08
+INDEPENDENT_MIN_LOCAL_CONTRAST = 0.05
+BOUNDARY_PROMINENCE_BAND_M = LINE_TOLERANCE_M + 0.010
+MIN_BOUNDARY_PROMINENCE = 0.55
 CONVERGING_MIN_ROWS = 4
+CONVERGING_SHORT_RUN_MAX_LINE_RESIDUAL_M = 0.010
 CONVERGING_MAX_ROW_GAP_M = 0.055
 CONVERGING_MAX_WIDTH_REOPEN_M = 0.025
 CONVERGING_MIN_WIDTH_REDUCTION_M = 0.075
 CONVERGING_MIN_SIDE_CLEARANCE_M = 0.03
-CONVERGING_MAX_LINE_RESIDUAL_M = 0.035
+CONVERGING_MAX_LINE_RESIDUAL_M = 0.020
 MAX_ABS_WALL_HEADING_DEG = 75.0
 MIN_CORRIDOR_WIDTH_M = 0.06
 MAX_CORRIDOR_WIDTH_M = 0.55
@@ -41,6 +53,24 @@ def _median(values: Sequence[float]) -> float:
 
 def _rounded(value: float) -> float:
     return round(float(value), 6)
+
+
+def _least_squares_line(points: Sequence[Point]) -> Optional[Tuple[float, float]]:
+    mean_forward = sum(point[0] for point in points) / len(points)
+    mean_lateral = sum(point[1] for point in points) / len(points)
+    denominator = sum(
+        (point[0] - mean_forward) ** 2 for point in points
+    )
+    if denominator <= 1e-12:
+        return None
+    slope = sum(
+        (point[0] - mean_forward) * (point[1] - mean_lateral)
+        for point in points
+    ) / denominator
+    intercept = _median([
+        point[1] - slope * point[0] for point in points
+    ])
+    return slope, intercept
 
 
 class ReflectivityCorridorEstimator:
@@ -189,31 +219,32 @@ class ReflectivityCorridorEstimator:
                     _rounded(end_lateral),
                 ],
             })
+        overlap_start = max(float(wall["start"][0]) for wall in walls)
+        overlap_end = min(float(wall["end"][0]) for wall in walls)
+        near_center = (
+            overlap_start,
+            sum(
+                self._wall_lateral_at(wall, overlap_start)
+                for wall in walls
+            ) / 2.0,
+        )
+        far_center = (
+            overlap_end,
+            sum(
+                self._wall_lateral_at(wall, overlap_end)
+                for wall in walls
+            ) / 2.0,
+        )
+        measured_heading = math.degrees(math.atan2(
+            far_center[1] - near_center[1],
+            far_center[0] - near_center[0],
+        ))
         if geometry == "converging":
-            near_center = (
-                (float(walls[0]["start"][0]) + float(walls[1]["start"][0]))
-                / 2.0,
-                (float(walls[0]["start"][1]) + float(walls[1]["start"][1]))
-                / 2.0,
-            )
-            far_center = (
-                (float(walls[0]["end"][0]) + float(walls[1]["end"][0]))
-                / 2.0,
-                (float(walls[0]["end"][1]) + float(walls[1]["end"][1]))
-                / 2.0,
-            )
-            measured_heading = math.degrees(math.atan2(
-                far_center[1] - near_center[1],
-                far_center[0] - near_center[0],
-            ))
             serialized_width = (
-                float(walls[1]["end"][1]) - float(walls[0]["end"][1])
+                self._wall_lateral_at(walls[1], overlap_end)
+                - self._wall_lateral_at(walls[0], overlap_end)
             )
         else:
-            measured_heading = _median([
-                float(fit["measured_heading_deg"])
-                for fit in cluster
-            ])
             serialized_width = abs(
                 float(walls[0]["normal_offset_m"])
                 - float(walls[1]["normal_offset_m"])
@@ -342,31 +373,337 @@ class ReflectivityCorridorEstimator:
             secondary_min_mean_intensity=MIN_CELL_INTENSITY,
             require_disjoint_support=False,
         )
-        if not pairs:
-            pairs = cls._pair_candidates(
-                primary_points=heatmap_points,
-                secondary_points=heatmap_points,
-                primary_min_support=HEATMAP_ONLY_MIN_WALL_SUPPORT,
-                primary_min_span_m=HEATMAP_ONLY_MIN_WALL_SPAN_M,
-                primary_min_clearance_m=(
-                    MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M
-                ),
-                primary_min_mean_intensity=(
-                    HEATMAP_ONLY_MIN_MEAN_INTENSITY
-                ),
-                secondary_min_support=HEATMAP_ONLY_MIN_WALL_SUPPORT,
-                secondary_min_span_m=HEATMAP_ONLY_MIN_WALL_SPAN_M,
-                secondary_min_clearance_m=(
-                    MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M
-                ),
-                secondary_min_mean_intensity=(
-                    HEATMAP_ONLY_MIN_MEAN_INTENSITY
-                ),
-                require_disjoint_support=True,
+        if pairs:
+            return min(pairs, key=lambda value: value[0])[1]
+        return cls._independent_heatmap_candidate(heatmap_points)
+
+    @classmethod
+    def _independent_heatmap_candidate(
+        cls,
+        heatmap_points: Sequence[Point],
+    ) -> Optional[Dict[str, object]]:
+        side_candidates = [
+            cls._independent_wall_candidates(
+                [
+                    point for point in heatmap_points
+                    if point[1] < -CONVERGING_MIN_SIDE_CLEARANCE_M
+                ]
+            ),
+            cls._independent_wall_candidates(
+                [
+                    point for point in heatmap_points
+                    if point[1] > CONVERGING_MIN_SIDE_CLEARANCE_M
+                ]
+            ),
+        ]
+        pairs: List[Tuple[Tuple[object, ...], Dict[str, object]]] = []
+        for left in side_candidates[0]:
+            for right in side_candidates[1]:
+                overlap_start = max(
+                    float(left["start"][0]),
+                    float(right["start"][0]),
+                )
+                overlap_end = min(
+                    float(left["end"][0]),
+                    float(right["end"][0]),
+                )
+                if overlap_end - overlap_start < INDEPENDENT_MIN_OVERLAP_M:
+                    continue
+                walls = [left, right]
+                start_width = (
+                    cls._wall_lateral_at(walls[1], overlap_start)
+                    - cls._wall_lateral_at(walls[0], overlap_start)
+                )
+                end_width = (
+                    cls._wall_lateral_at(walls[1], overlap_end)
+                    - cls._wall_lateral_at(walls[0], overlap_end)
+                )
+                if not (
+                    MIN_CORRIDOR_WIDTH_M
+                    <= min(start_width, end_width)
+                    <= max(start_width, end_width)
+                    <= MAX_CORRIDOR_WIDTH_M
+                ):
+                    continue
+                heading_delta = abs(
+                    float(walls[0]["heading_deg"])
+                    - float(walls[1]["heading_deg"])
+                )
+                if (
+                    heading_delta <= COMPATIBLE_WALL_HEADING_DEG
+                    and abs(start_width - end_width)
+                    <= INDEPENDENT_PARALLEL_WIDTH_DELTA_M
+                ):
+                    geometry = "parallel"
+                    width = (start_width + end_width) / 2.0
+                elif (
+                    end_width < start_width
+                    and start_width - end_width
+                    >= CONVERGING_MIN_WIDTH_REDUCTION_M - 1e-12
+                ):
+                    geometry = "converging"
+                    width = end_width
+                else:
+                    continue
+                near_center_lateral = (
+                    cls._wall_lateral_at(walls[0], overlap_start)
+                    + cls._wall_lateral_at(walls[1], overlap_start)
+                ) / 2.0
+                far_center_lateral = (
+                    cls._wall_lateral_at(walls[0], overlap_end)
+                    + cls._wall_lateral_at(walls[1], overlap_end)
+                ) / 2.0
+                measured_heading = math.degrees(math.atan2(
+                    far_center_lateral - near_center_lateral,
+                    overlap_end - overlap_start,
+                ))
+                if abs(measured_heading) > MAX_ABS_WALL_HEADING_DEG:
+                    continue
+                overlap_supports = [
+                    [
+                        point for point in wall["_support"]
+                        if overlap_start - 1e-12
+                        <= point[0]
+                        <= overlap_end + 1e-12
+                    ]
+                    for wall in walls
+                ]
+                if any(len(support) < 3 for support in overlap_supports):
+                    continue
+                if not cls._has_boundary_prominence(
+                    heatmap_points,
+                    walls,
+                    overlap_start,
+                    overlap_end,
+                ):
+                    continue
+                overlap_intensities = [
+                    sum(point[2] for point in support) / len(support)
+                    for support in overlap_supports
+                ]
+                minimum_intensity = min(overlap_intensities)
+                mean_intensity = sum(overlap_intensities) / 2.0
+                minimum_span = min(
+                    math.hypot(
+                        overlap_end - overlap_start,
+                        cls._wall_lateral_at(wall, overlap_end)
+                        - cls._wall_lateral_at(wall, overlap_start),
+                    )
+                    for wall in walls
+                )
+                support_total = sum(len(support) for support in overlap_supports)
+                confidence = min(
+                    1.0,
+                    min(1.0, support_total / 12.0) * 0.35
+                    + min(1.0, minimum_span / 0.25) * 0.25
+                    + mean_intensity * 0.30
+                    + min(
+                        1.0,
+                        1.0 - max(
+                            float(wall["max_residual_m"])
+                            for wall in walls
+                        ) / CONVERGING_MAX_LINE_RESIDUAL_M,
+                    ) * 0.10,
+                )
+                pair_key = (
+                    overlap_end,
+                    width,
+                    -confidence,
+                    -minimum_intensity,
+                    -mean_intensity,
+                    -minimum_span,
+                )
+                pairs.append((pair_key, {
+                    "geometry": geometry,
+                    "measured_heading_deg": measured_heading,
+                    "width_m": width,
+                    "confidence": confidence,
+                    "walls": walls,
+                }))
+        return min(pairs, key=lambda value: value[0])[1] if pairs else None
+
+    @classmethod
+    def _independent_wall_candidates(
+        cls,
+        points: Sequence[Point],
+    ) -> List[Dict[str, object]]:
+        points = sorted(points)
+        if len(points) < HEATMAP_ONLY_MIN_WALL_SUPPORT:
+            return []
+        hough_bins: Dict[Tuple[int, int], List[int]] = {}
+        for heading_deg in range(
+            -int(MAX_ABS_WALL_HEADING_DEG),
+            int(MAX_ABS_WALL_HEADING_DEG) + 1,
+            INDEPENDENT_HEADING_STEP_DEG,
+        ):
+            heading_rad = math.radians(heading_deg)
+            normal_forward = -math.sin(heading_rad)
+            normal_lateral = math.cos(heading_rad)
+            for index, point in enumerate(points):
+                offset = (
+                    normal_forward * point[0]
+                    + normal_lateral * point[1]
+                )
+                key = (
+                    heading_deg,
+                    round(offset / INDEPENDENT_OFFSET_BIN_M),
+                )
+                hough_bins.setdefault(key, []).append(index)
+
+        seeds = sorted(
+            hough_bins.items(),
+            key=lambda item: (
+                -len(item[1]),
+                -sum(points[index][2] for index in item[1]),
+                abs(item[0][0]),
+                item[0],
+            ),
+        )[:INDEPENDENT_MAX_HOUGH_SEEDS]
+        candidates: List[Dict[str, object]] = []
+        seen_support = set()
+        for (heading_deg, _), seed_indices in seeds:
+            if len(seed_indices) < 3:
+                continue
+            support_indices = cls._robust_line_support(
+                points,
+                seed_indices,
+                seed_slope=math.tan(math.radians(heading_deg)),
             )
-        if not pairs:
-            return None
-        return min(pairs, key=lambda value: value[0])[1]
+            if len(support_indices) < HEATMAP_ONLY_MIN_WALL_SUPPORT:
+                continue
+            support_indices = cls._robust_line_support(
+                points,
+                support_indices,
+            )
+            if support_indices in seen_support:
+                continue
+            seen_support.add(support_indices)
+            support = [points[index] for index in support_indices]
+            ordered_support = sorted(support)
+            if any(
+                math.hypot(
+                    right[0] - left[0],
+                    right[1] - left[1],
+                ) > INDEPENDENT_MAX_SUPPORT_GAP_M + 1e-12
+                for left, right in zip(
+                    ordered_support,
+                    ordered_support[1:],
+                )
+            ):
+                continue
+            forward_rows = sorted(set(point[0] for point in support))
+            if len(forward_rows) < HEATMAP_ONLY_MIN_WALL_SUPPORT:
+                continue
+            if any(
+                right - left > INDEPENDENT_MAX_FORWARD_GAP_M + 1e-12
+                for left, right in zip(forward_rows, forward_rows[1:])
+            ):
+                continue
+            wall = cls._independent_wall_payload(support)
+            if (
+                float(wall["span_m"]) < INDEPENDENT_MIN_WALL_SPAN_M
+                or float(wall["mean_intensity"])
+                < HEATMAP_ONLY_MIN_MEAN_INTENSITY
+                or float(wall["max_residual_m"])
+                > CONVERGING_MAX_LINE_RESIDUAL_M
+            ):
+                continue
+            support_set = set(support_indices)
+            local_background = [
+                point[2]
+                for index, point in enumerate(points)
+                if index not in support_set
+                and float(wall["start"][0]) - 1e-12
+                <= point[0]
+                <= float(wall["end"][0]) + 1e-12
+            ]
+            if (
+                len(local_background) >= 3
+                and float(wall["mean_intensity"])
+                < _median(local_background) + INDEPENDENT_MIN_LOCAL_CONTRAST
+            ):
+                continue
+            candidates.append(wall)
+        return sorted(
+            candidates,
+            key=lambda wall: (
+                -float(wall["mean_intensity"]),
+                -int(wall["support_cells"]),
+                -float(wall["span_m"]),
+                float(wall["max_residual_m"]),
+                float(wall["start"][0]),
+                float(wall["normal_offset_m"]),
+            ),
+        )[:INDEPENDENT_MAX_WALL_CANDIDATES]
+
+    @staticmethod
+    def _robust_line_support(
+        points: Sequence[Point],
+        seed_indices: Sequence[int],
+        *,
+        seed_slope: Optional[float] = None,
+    ) -> Tuple[int, ...]:
+        seed = [points[index] for index in seed_indices]
+        if seed_slope is None:
+            line = _least_squares_line(seed)
+            if line is None:
+                return ()
+            slope, _ = line
+        else:
+            slope = seed_slope
+        if not math.isfinite(slope):
+            return ()
+        intercept = _median([
+            point[1] - slope * point[0] for point in seed
+        ])
+        distance_scale = math.sqrt(1.0 + slope * slope)
+        return tuple(
+            index
+            for index, point in enumerate(points)
+            if abs(point[1] - (intercept + slope * point[0]))
+            / distance_scale <= LINE_TOLERANCE_M + 1e-12
+        )
+
+    @staticmethod
+    def _wall_lateral_at(wall: Mapping[str, object], forward: float) -> float:
+        start = wall["start"]
+        end = wall["end"]
+        slope = (
+            (float(end[1]) - float(start[1]))
+            / (float(end[0]) - float(start[0]))
+        )
+        return float(start[1]) + slope * (forward - float(start[0]))
+
+    @classmethod
+    def _has_boundary_prominence(
+        cls,
+        points: Sequence[Point],
+        walls: Sequence[Mapping[str, object]],
+        overlap_start: float,
+        overlap_end: float,
+    ) -> bool:
+        overlap_points = [
+            point for point in points
+            if overlap_start - 1e-12
+            <= point[0]
+            <= overlap_end + 1e-12
+        ]
+        if not overlap_points:
+            return False
+        boundary_points = sum(
+            min(
+                abs(
+                    point[1]
+                    - cls._wall_lateral_at(wall, point[0])
+                )
+                for wall in walls
+            ) <= BOUNDARY_PROMINENCE_BAND_M + 1e-12
+            for point in overlap_points
+        )
+        return (
+            boundary_points / len(overlap_points)
+            >= MIN_BOUNDARY_PROMINENCE
+        )
 
     @classmethod
     def _pair_candidates(
@@ -620,16 +957,28 @@ class ReflectivityCorridorEstimator:
             ),
         )
         walls = [
-            cls._independent_wall_payload(
-                [boundary[side_index] for boundary in run]
+            cls._anchored_wall_payload(
+                [boundary[side_index] for boundary in run],
+                run[-1][side_index],
             )
             for side_index in (1, 2)
         ]
+        max_line_residual_m = (
+            CONVERGING_SHORT_RUN_MAX_LINE_RESIDUAL_M
+            if len(run) == CONVERGING_MIN_ROWS
+            else CONVERGING_MAX_LINE_RESIDUAL_M
+        )
         if any(
             abs(float(wall["heading_deg"])) > MAX_ABS_WALL_HEADING_DEG
-            or float(wall["max_residual_m"])
-            > CONVERGING_MAX_LINE_RESIDUAL_M
+            or float(wall["max_residual_m"]) > max_line_residual_m
             for wall in walls
+        ):
+            return None
+        if not cls._has_boundary_prominence(
+            heatmap_points,
+            walls,
+            run[0][0],
+            run[-1][0],
         ):
             return None
         near_width = float(walls[1]["start"][1]) - float(
@@ -680,36 +1029,20 @@ class ReflectivityCorridorEstimator:
 
     @staticmethod
     def _independent_wall_payload(support: Sequence[Point]) -> Dict[str, object]:
-        slopes = [
-            (right[1] - left[1]) / (right[0] - left[0])
-            for left_index, left in enumerate(support)
-            for right in support[left_index + 1:]
-            if right[0] > left[0]
-        ]
-        slope = _median(slopes)
-        intercept = _median([
-            point[1] - slope * point[0] for point in support
-        ])
+        line = _least_squares_line(support)
+        if line is None:
+            raise ValueError("wall support must span multiple forward rows")
+        slope, intercept = line
         start_forward = min(point[0] for point in support)
         end_forward = max(point[0] for point in support)
-        start_lateral = _median([
-            point[1] for point in support if point[0] == start_forward
-        ])
-        end_lateral = _median([
-            point[1] for point in support if point[0] == end_forward
-        ])
-        endpoint_slope = (
-            (end_lateral - start_lateral)
-            / (end_forward - start_forward)
-        )
-        heading_deg = math.degrees(math.atan(endpoint_slope))
+        start_lateral = intercept + slope * start_forward
+        end_lateral = intercept + slope * end_forward
+        heading_deg = math.degrees(math.atan(slope))
         heading_rad = math.radians(heading_deg)
+        distance_scale = math.sqrt(1.0 + slope * slope)
         return {
             "heading_deg": heading_deg,
-            "normal_offset_m": (
-                -math.sin(heading_rad) * start_forward
-                + math.cos(heading_rad) * start_lateral
-            ),
+            "normal_offset_m": intercept * math.cos(heading_rad),
             "support_cells": len(support),
             "span_m": math.hypot(
                 end_forward - start_forward,
@@ -718,10 +1051,48 @@ class ReflectivityCorridorEstimator:
             "mean_intensity": sum(point[2] for point in support) / len(support),
             "max_residual_m": max(
                 abs(point[1] - (intercept + slope * point[0]))
+                / distance_scale
                 for point in support
             ),
             "start": [start_forward, start_lateral],
             "end": [end_forward, end_lateral],
+            "_support": tuple(sorted(support)),
+        }
+
+    @staticmethod
+    def _anchored_wall_payload(
+        support: Sequence[Point],
+        endpoint: Point,
+    ) -> Dict[str, object]:
+        line = _least_squares_line(support)
+        if line is None:
+            raise ValueError("wall support must span multiple forward rows")
+        slope, _ = line
+        start_forward = min(point[0] for point in support)
+        end_forward = endpoint[0]
+        end_lateral = endpoint[1]
+        intercept = end_lateral - slope * end_forward
+        start_lateral = intercept + slope * start_forward
+        heading_deg = math.degrees(math.atan(slope))
+        heading_rad = math.radians(heading_deg)
+        distance_scale = math.sqrt(1.0 + slope * slope)
+        return {
+            "heading_deg": heading_deg,
+            "normal_offset_m": intercept * math.cos(heading_rad),
+            "support_cells": len(support),
+            "span_m": math.hypot(
+                end_forward - start_forward,
+                end_lateral - start_lateral,
+            ),
+            "mean_intensity": sum(point[2] for point in support) / len(support),
+            "max_residual_m": max(
+                abs(point[1] - (intercept + slope * point[0]))
+                / distance_scale
+                for point in support
+            ),
+            "start": [start_forward, start_lateral],
+            "end": [end_forward, end_lateral],
+            "_support": tuple(sorted(support)),
         }
 
     @staticmethod

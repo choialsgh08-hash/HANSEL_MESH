@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260811-converging-boundaries-r49";
+  const UI_BUILD_ID = "20260811-independent-walls-r50";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
