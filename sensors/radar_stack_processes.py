@@ -178,6 +178,8 @@ def build_viewer_command(
     *,
     parent_lease_path: Path | None = None,
 ) -> list[str]:
+    clutter_model = load_clutter_model(config.calibration_path)
+    axes = clutter_model.axes
     command = [
         sys.executable,
         "monitor/radar_front.py",
@@ -195,6 +197,14 @@ def build_viewer_command(
         f"{config.viewer_max_range_m:g}",
         "--history-window",
         str(config.viewer_history_s),
+        "--forward-axis",
+        axes.forward_axis,
+        "--forward-sign",
+        str(axes.forward_sign),
+        "--lateral-axis",
+        axes.lateral_axis,
+        "--lateral-sign",
+        str(axes.lateral_sign),
         "--quiet",
     ]
     if parent_lease_path is not None:

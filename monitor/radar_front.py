@@ -285,17 +285,17 @@ class RadarFrontState:
                 default=None,
             )
             source_heatmap = getattr(record, "heatmap", None)
-            default_heatmap_axes = self.axes == RadarAxes()
+            native_heatmap_axes = self.axes.supports_native_heatmap()
             heatmap = (
                 self._heatmap_payload(source_heatmap)
-                if default_heatmap_axes
+                if native_heatmap_axes
                 else None
             )
             if heatmap is None and self.source_mode == "demo":
                 heatmap = self._demo_heatmap_payload(display_points)
             if source_heatmap is None:
                 heatmap_status = "not_provided"
-            elif not default_heatmap_axes:
+            elif not native_heatmap_axes:
                 heatmap_status = "disabled_nondefault_axes"
             elif heatmap is None:
                 heatmap_status = "invalid_metadata"

@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from common.radar_geometry import RadarAxes
 from sensors.radar_owner_lock import acquire_radar_owner_lock
 from sensors.radar_parent_lease import create_parent_death_lease
 from sensors.radar_watchdog import ExpectedRadarEvidence, RadarEpochWatchdog
@@ -105,7 +106,8 @@ class RadarStackProcessesTests(unittest.TestCase):
             "sensors.radar_stack_processes.load_clutter_model",
             create=True,
             return_value=SimpleNamespace(
-                calibration_id="radar-clutter-live-test"
+                calibration_id="radar-clutter-live-test",
+                axes=RadarAxes(lateral_sign=-1),
             ),
         )
         self.load_clutter_model = load_model_patcher.start()
@@ -175,8 +177,13 @@ class RadarStackProcessesTests(unittest.TestCase):
                     / "radar-supervisor-run-1.json"
                 ),
                 "--bind", "127.0.0.1", "--http-port", "8081",
-                "--max-range-m", "3", "--history-window", "0.3", "--quiet",
+                "--max-range-m", "3", "--history-window", "0.3",
+                "--forward-axis", "y", "--forward-sign", "1",
+                "--lateral-axis", "x", "--lateral-sign", "-1", "--quiet",
             ],
+        )
+        self.load_clutter_model.assert_called_once_with(
+            self.config.calibration_path
         )
 
     def test_owned_commands_receive_parent_death_and_uart_handoff(self):
@@ -1364,7 +1371,10 @@ class RadarStackLauncherTests(unittest.TestCase):
         with mock.patch(
             "sensors.radar_stack_processes.load_clutter_model",
             create=True,
-            return_value=SimpleNamespace(calibration_id="relative-calibration"),
+            return_value=SimpleNamespace(
+                calibration_id="relative-calibration",
+                axes=RadarAxes(lateral_sign=-1),
+            ),
         ) as loader:
             capture_command = build_capture_command(
                 RadarPortIdentity(
@@ -1378,8 +1388,14 @@ class RadarStackLauncherTests(unittest.TestCase):
                 paths,
                 config,
             )
-        loader.assert_called_once_with(config.calibration_path)
-        viewer_command = build_viewer_command(paths, config)
+            viewer_command = build_viewer_command(paths, config)
+        self.assertEqual(
+            loader.call_args_list,
+            [
+                mock.call(config.calibration_path),
+                mock.call(config.calibration_path),
+            ],
+        )
         self.assertEqual(
             Path(capture_command[capture_command.index("--output") + 1]),
             paths.mission,

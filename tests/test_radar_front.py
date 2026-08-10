@@ -975,7 +975,7 @@ class RadarFrontStateTests(unittest.TestCase):
         clock = FakeClock()
         state = RadarFrontState(
             "follow",
-            axes=RadarAxes(lateral_sign=-1),
+            axes=RadarAxes(forward_axis="x", lateral_axis="y"),
             clock=clock,
         )
         heatmap = RadarHeatmap(
@@ -994,6 +994,33 @@ class RadarFrontStateTests(unittest.TestCase):
         self.assertEqual(
             frame["heatmap_status"],
             "disabled_nondefault_axes",
+        )
+
+    def test_native_heatmap_remains_available_for_lateral_mirror_mount(self):
+        clock = FakeClock()
+        state = RadarFrontState(
+            "follow",
+            axes=RadarAxes(lateral_sign=-1),
+            clock=clock,
+        )
+        heatmap = RadarHeatmap(
+            data=bytes([0, 32, 128, 255]),
+            range_bins=2,
+            azimuth_bins=2,
+            range_step_m=0.05,
+            tlv_type=304,
+            motion_mode="major",
+            floor_db=-36.0,
+            ceiling_db=27.0,
+        )
+
+        state.ingest(radar_frame([], heatmap=heatmap))
+        frame = state.snapshot()["frame"]
+
+        self.assertEqual(frame["heatmap_status"], "available")
+        self.assertEqual(
+            base64.b64decode(frame["heatmap"]["data_base64"]),
+            heatmap.data,
         )
 
     def test_point_history_is_time_bounded_return_evidence(self):
@@ -1170,6 +1197,7 @@ class RadarFrontDocumentationTests(unittest.TestCase):
         "python -m sensors radar-calibrate "
         "missions\\radar-empty-scene.jsonl `\n"
         "  --output configs\\radar\\calibrations\\head-near-8hz.json `\n"
+        "  --lateral-sign -1 `\n"
         "  --min-frames 50"
     )
     VIEWER_COMMAND = (
@@ -1177,6 +1205,7 @@ class RadarFrontDocumentationTests(unittest.TestCase):
         "  --follow missions\\radar-board-live.jsonl `\n"
         "  --clutter-calibration "
         "configs\\radar\\calibrations\\head-near-8hz.json `\n"
+        "  --lateral-sign -1 `\n"
         "  --max-range-m 3 `\n"
         "  --history-window 0.3"
     )

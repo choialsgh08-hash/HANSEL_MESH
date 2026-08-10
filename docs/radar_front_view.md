@@ -89,6 +89,7 @@ New-Item -ItemType Directory -Force -Path configs\radar\calibrations
 
 python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
   --output configs\radar\calibrations\head-near-8hz.json `
+  --lateral-sign -1 `
   --min-frames 50
 ```
 
@@ -128,7 +129,7 @@ python -m sensors radar-live `
   --raw-output captures\radar-board-live.bin `
   --mission-id radar-board-live `
   --profile-id lsdk-05.05.04.02-presence-near-heatmap16-elev8-cfar12-8hz-v2 `
-  --calibration-id radar-clutter-56430af388abb134
+  --calibration-id radar-clutter-6a2521e3c545a052
 ```
 
 이 PowerShell은 캡처가 끝날 때까지 닫지 않는다. 출력 요약의
@@ -143,6 +144,7 @@ python -m sensors radar-live `
 python monitor\radar_front.py `
   --follow missions\radar-board-live.jsonl `
   --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
+  --lateral-sign -1 `
   --max-range-m 3 `
   --history-window 0.3
 ```
@@ -156,6 +158,7 @@ python monitor\radar_front.py `
 python monitor\radar_front.py `
   --replay missions\radar-board-live.jsonl `
   --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
+  --lateral-sign -1 `
   --max-range-m 3 `
   --history-window 0.3 `
   --speed 1

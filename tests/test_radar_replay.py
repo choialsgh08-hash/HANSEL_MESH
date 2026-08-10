@@ -820,7 +820,7 @@ class RadarBenchAnnotationTests(unittest.TestCase):
         self.assertEqual(guide.count("--calibration-id uncalibrated"), 1)
         self.assertNotIn("--calibration-id uncalibrated", operational_command)
         self.assertIn(
-            "--calibration-id radar-clutter-56430af388abb134",
+            "--calibration-id radar-clutter-6a2521e3c545a052",
             operational_command,
         )
 

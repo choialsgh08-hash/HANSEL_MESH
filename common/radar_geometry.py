@@ -33,6 +33,13 @@ class RadarAxes:
             values[self.lateral_axis] * self.lateral_sign,
         )
 
+    def supports_native_heatmap(self) -> bool:
+        return (
+            self.forward_axis == "y"
+            and self.forward_sign == 1
+            and self.lateral_axis == "x"
+        )
+
     def to_dict(self) -> Dict[str, object]:
         return {
             "forward_axis": self.forward_axis,

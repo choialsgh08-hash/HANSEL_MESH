@@ -66,6 +66,7 @@ New-Item -ItemType Directory -Force -Path configs\radar\calibrations
 
 python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
   --output configs\radar\calibrations\head-near-8hz.json `
+  --lateral-sign -1 `
   --min-frames 50
 ```
 
@@ -102,6 +103,7 @@ python -m sensors radar-live `
 python monitor\radar_front.py `
   --follow missions\radar-board-live.jsonl `
   --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
+  --lateral-sign -1 `
   --max-range-m 3 `
   --history-window 0.3
 ```

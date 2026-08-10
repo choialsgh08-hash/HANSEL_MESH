@@ -2560,6 +2560,37 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertEqual(tracks[0]["source"], "point")
         self.assertAlmostEqual(tracks[0]["forward_m"], 0.40)
 
+    def test_lateral_mirror_mount_flips_point_and_native_heatmap_together(self):
+        axes = RadarAxes(lateral_sign=-1)
+        model = RadarClutterModel(
+            **{
+                **clutter_model().__dict__,
+                "axes": axes,
+            }
+        )
+        estimator = RadarSceneEstimator(axes, model)
+        frame = clustered_heatmap_frame(
+            4,
+            frame_number=1,
+            with_point=False,
+        )
+        frame = replace(
+            frame,
+            points=(RadarPoint(0.05, 0.30, 0.02, 0.0, 24.0),),
+        )
+
+        estimator.ingest(frame, received_at=1.0)
+        scene = estimator.snapshot(now=1.0)
+
+        point_track = next(
+            track for track in scene["tracks"] if track["source"] == "point"
+        )
+        heatmap_track = next(
+            track for track in scene["tracks"] if track["source"] == "heatmap"
+        )
+        self.assertLess(point_track["lateral_m"], 0.0)
+        self.assertLess(heatmap_track["lateral_m"], 0.0)
+
     def test_optional_calibration_degrades_heatmap_to_point_only(self):
         estimator = RadarSceneEstimator(
             RadarAxes(),

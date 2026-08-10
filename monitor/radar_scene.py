@@ -573,7 +573,7 @@ class RadarSceneEstimator:
             frame.heatmap is not None
             and self.clutter_model is not None
             and self._calibration_status == "ok"
-            and self.axes.signature() == RadarAxes().signature()
+            and self.axes.supports_native_heatmap()
         ):
             (
                 clusters,
@@ -2723,8 +2723,8 @@ class RadarSceneEstimator:
             reflectivity_observations,
         )
 
-    @staticmethod
     def _heatmap_cell_position(
+        self,
         range_m: float,
         azimuth_index: int,
         azimuth_bins: int,
@@ -2740,7 +2740,7 @@ class RadarSceneEstimator:
         )
         return (
             range_m * math.cos(angle_rad),
-            range_m * math.sin(angle_rad),
+            range_m * math.sin(angle_rad) * self.axes.lateral_sign,
         )
 
     def _near_existing_heatmap_track(
