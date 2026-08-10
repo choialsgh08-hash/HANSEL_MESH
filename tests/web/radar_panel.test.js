@@ -975,7 +975,7 @@ test("stable stopped view does not present a stale blocked route as guidance", (
   ), false, "an old left route must disappear after the block transition frame");
 });
 
-test("stopped view shows the current positive-lateral opening on screen right", () => {
+test("stopped view does not draw an untraversable opening as a route", () => {
   const { panel, contexts } = makeHarness();
   const transform = {
     originX: 250, originY: 250, scale: 400,
@@ -995,14 +995,14 @@ test("stopped view shows the current positive-lateral opening on screen right", 
   const opening = contexts[0].strokeCalls.find(
     (call) => call.strokeStyle === "rgba(255, 213, 79, 0.88)",
   );
-  assert.ok(opening, "the stopped view must retain a visible opening direction");
-  assert.ok(
-    opening.path.at(-1)[1] > transform.originX,
-    "positive lateral (right) must end right of the robot center",
+  assert.equal(
+    opening,
+    undefined,
+    "a blocked goal is not a traversable path and must stay hidden",
   );
-  assert.ok(contexts[0].fillTextCalls.some(
-    ([label, x]) => String(label).includes("RIGHT") && x > transform.originX,
-  ));
+  assert.equal(contexts[0].fillTextCalls.some(
+    ([label]) => /LEFT|RIGHT|STRAIGHT/.test(String(label)),
+  ), false);
 });
 
 test("collision inset includes fifty centimeters and excludes fifty-one", () => {

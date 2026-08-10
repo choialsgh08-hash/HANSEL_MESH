@@ -7,13 +7,14 @@ from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 MIN_CELL_INTENSITY = 0.30
 LINE_TOLERANCE_M = 0.026
 MIN_POINT_WALL_SUPPORT = 2
-MIN_POINT_WALL_SPAN_M = 0.08
+MIN_POINT_WALL_SPAN_M = 0.04
 MIN_HEATMAP_WALL_SUPPORT = 2
 MIN_HEATMAP_WALL_SPAN_M = 0.08
 MAX_ABS_WALL_HEADING_DEG = 75.0
 MIN_CORRIDOR_WIDTH_M = 0.06
 MAX_CORRIDOR_WIDTH_M = 0.55
-MIN_WALL_CLEARANCE_FROM_SENSOR_M = 0.03
+MIN_POINT_WALL_CLEARANCE_FROM_SENSOR_M = 0.005
+MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M = 0.03
 COMPATIBLE_HEADING_DEG = 5.0
 COMPATIBLE_WIDTH_M = 0.05
 MAX_GUIDANCE_HEADING_DEG = 55.0
@@ -282,7 +283,10 @@ class ReflectivityCorridorEstimator:
                     + normal_lateral * point_returns[index][1]
                     for index in point_inliers
                 ])
-                if abs(normal_offset) < MIN_WALL_CLEARANCE_FROM_SENSOR_M:
+                if (
+                    abs(normal_offset)
+                    < MIN_POINT_WALL_CLEARANCE_FROM_SENSOR_M
+                ):
                     continue
                 primary = cls._wall_payload(
                     heading,
@@ -320,7 +324,7 @@ class ReflectivityCorridorEstimator:
                     ])
                     if (
                         abs(secondary_offset)
-                        < MIN_WALL_CLEARANCE_FROM_SENSOR_M
+                        < MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M
                     ):
                         continue
                     offsets = sorted((normal_offset, secondary_offset))
@@ -347,6 +351,10 @@ class ReflectivityCorridorEstimator:
                     mean_intensity = sum(
                         float(wall["mean_intensity"]) for wall in walls
                     ) / 2.0
+                    primary_mean_intensity = sum(
+                        point_returns[index][2]
+                        for index in point_inliers
+                    ) / len(point_inliers)
                     confidence = min(
                         1.0,
                         min(1.0, support_total / 8.0) * 0.50
@@ -354,9 +362,11 @@ class ReflectivityCorridorEstimator:
                         + mean_intensity * 0.25,
                     )
                     pair_key = (
-                        width,
+                        -primary_mean_intensity,
+                        -confidence,
                         -support_total,
                         -minimum_span,
+                        width,
                         abs(heading),
                         offsets[0],
                     )

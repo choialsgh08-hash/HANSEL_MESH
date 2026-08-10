@@ -284,7 +284,7 @@
           Math.abs(wall.heading_deg) > 75 ||
           !Number.isFinite(wall.normal_offset_m) ||
           !Number.isInteger(wall.support_cells) || wall.support_cells < 2 ||
-          !Number.isFinite(wall.span_m) || wall.span_m < 0.08 ||
+          !Number.isFinite(wall.span_m) || wall.span_m < 0.04 ||
           !Number.isFinite(wall.mean_intensity) ||
           wall.mean_intensity < 0.30 || wall.mean_intensity > 1 ||
           !validPointPair(wall.start) || !validPointPair(wall.end) ||

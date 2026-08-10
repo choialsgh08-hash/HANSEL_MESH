@@ -156,6 +156,28 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
             self.assertTrue(all(math.isfinite(value) for value in wall["start"]))
             self.assertTrue(all(math.isfinite(value) for value in wall["end"]))
 
+    def test_short_left_wall_seed_beats_far_center_noise(self):
+        estimator = ReflectivityCorridorEstimator()
+        point_observations = cells([
+            (0.104, -0.119, 0.742),
+            (0.140, -0.157, 0.617),
+            (0.271, -0.015, 0.475),
+            (0.370, -0.015, 0.458),
+        ])
+        observed = cells(LIVE_CLUTTERED_RIGHT_CORRIDOR)
+
+        for _ in range(3):
+            estimator.ingest(
+                observed,
+                point_observations=point_observations,
+            )
+        payload = estimator.payload()
+
+        self.assertEqual(payload["status"], "confirmed")
+        self.assertLess(payload["guidance_heading_deg"], -30.0)
+        self.assertGreater(payload["width_m"], 0.20)
+        self.assertLess(payload["width_m"], 0.35)
+
     def test_input_order_cannot_change_the_confirmed_payload(self):
         forward = ReflectivityCorridorEstimator()
         reverse = ReflectivityCorridorEstimator()

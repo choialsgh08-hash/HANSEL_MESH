@@ -456,6 +456,48 @@ test("accepts point-seeded walls extrapolated back to the sensor body", () => {
   assert.deepEqual(parsed.walls[0].start, [0.0, -0.089623]);
 });
 
+test("accepts a short near-sensor wall supported by two consistent points", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_parallel_ransac",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 5,
+    measured_heading_deg: -45.590657,
+    guidance_heading_deg: -45.590657,
+    width_m: 0.294102,
+    confidence: 0.740123,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: -45.590657,
+        normal_offset_m: -0.008359,
+        support_cells: 2,
+        span_m: 0.05206,
+        mean_intensity: 0.679167,
+        start: [0.0, -0.011945],
+        end: [0.140762, -0.15564],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -45.590657,
+        normal_offset_m: 0.285743,
+        support_cells: 7,
+        span_m: 0.441736,
+        mean_intensity: 0.896343,
+        start: [0.0, 0.408333],
+        end: [0.475, -0.076562],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+  assert.equal(parsed.status, "confirmed");
+  assert.ok(parsed.measuredHeadingDeg < -45);
+  assert.equal(parsed.walls[0].spanM, 0.05206);
+});
+
 test("accepts only canonical unavailable and candidate corridor states", () => {
   const unavailable = makeSnapshot();
   unavailable.scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
@@ -530,7 +572,7 @@ test("rejects malformed measured wall geometry and inconsistent pairs", async (t
     ["normal nonfinite", (corridor) => { corridor.walls[0].normal_offset_m = Infinity; }],
     ["support too low", (corridor) => { corridor.walls[0].support_cells = 1; }],
     ["support fractional", (corridor) => { corridor.walls[0].support_cells = 2.5; }],
-    ["span too short", (corridor) => { corridor.walls[0].span_m = 0.079; }],
+    ["span too short", (corridor) => { corridor.walls[0].span_m = 0.039; }],
     ["intensity too low", (corridor) => { corridor.walls[0].mean_intensity = 0.299; }],
     ["intensity too high", (corridor) => { corridor.walls[0].mean_intensity = 1.01; }],
     ["start arity", (corridor) => { corridor.walls[0].start = [0.1]; }],

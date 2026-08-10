@@ -390,6 +390,27 @@ class RadarSceneEstimator:
             forward_m, lateral_m = self.axes.map_point(point)
             if not self._in_scene(forward_m, lateral_m):
                 continue
+            calibrated_clutter = bool(
+                self.clutter_model is not None
+                and self._calibration_status == "ok"
+                and self.clutter_model.matches_point(
+                    forward_m,
+                    lateral_m,
+                    point.z_m,
+                )
+            )
+            quality_score = point_quality_score(point.snr_db, point.noise_db)
+            if (
+                not calibrated_clutter
+                and quality_score >= CORRIDOR_POINT_MIN_QUALITY
+                and math.hypot(forward_m, lateral_m)
+                <= SHORT_MEMORY_RADIUS_M
+            ):
+                corridor_point_observations.append({
+                    "forward_m": forward_m,
+                    "lateral_m": lateral_m,
+                    "intensity": quality_score,
+                })
             ground_classification = self.mount_geometry.ground_classification(
                 forward_m,
                 lateral_m,
@@ -401,30 +422,12 @@ class RadarSceneEstimator:
                 else:
                     self._ground_fringe_rejected_count += 1
                 continue
-            if (
-                self.clutter_model is not None
-                and self._calibration_status == "ok"
-                and self.clutter_model.matches_point(
-                    forward_m,
-                    lateral_m,
-                    point.z_m,
-                )
-            ):
+            if calibrated_clutter:
                 rejected += 1
                 continue
-            quality_score = point_quality_score(point.snr_db, point.noise_db)
             if range_step_m is None:
                 self._quality_gate_rejected_count += 1
                 continue
-            if (
-                quality_score >= CORRIDOR_POINT_MIN_QUALITY
-                and math.hypot(forward_m, lateral_m) <= SHORT_MEMORY_RADIUS_M
-            ):
-                corridor_point_observations.append({
-                    "forward_m": forward_m,
-                    "lateral_m": lateral_m,
-                    "intensity": quality_score,
-                })
             if quality_score < POINT_MIN_QUALITY:
                 self._quality_gate_rejected_count += 1
                 continue

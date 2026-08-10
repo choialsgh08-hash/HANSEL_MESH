@@ -1725,6 +1725,50 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         for wall in scene["reflectivity_corridor"]["walls"]:
             self.assertAlmostEqual(wall["start"][0], 0.0, places=6)
 
+    def test_ground_level_wall_return_guides_left_without_becoming_obstacle(self):
+        estimator = calibrated_estimator()
+        with patch.object(estimator, "_reflectivity_surface"):
+            estimator._reflectivity_surface.payload.return_value = {
+                "cells": [
+                    {
+                        "forward_m": forward_m,
+                        "lateral_m": lateral_m,
+                        "intensity": intensity,
+                    }
+                    for forward_m, lateral_m, intensity
+                    in RECORDED_RIGHT_CORRIDOR_REFLECTIVITY
+                ]
+            }
+            points = (
+                RadarPoint(-0.105, 0.080, -0.034, 0.0, 27.0),
+                RadarPoint(-0.146, 0.141, 0.000, 0.0, 20.75),
+                RadarPoint(0.000, 0.348, 0.000, 0.0, 14.75),
+            )
+            for frame_number in range(1, 4):
+                estimator.ingest(
+                    radar_frame(points, frame_number=frame_number),
+                    received_at=6.0 + frame_number * 0.125,
+                )
+
+        scene = estimator.snapshot(now=6.375)
+
+        self.assertEqual(scene["diagnostics"]["ground_rejected_count"], 1)
+        self.assertEqual(scene["diagnostics"]["scene_point_count"], 1)
+        self.assertTrue(all(
+            not (
+                math.isclose(float(track["forward_m"]), 0.080, abs_tol=0.01)
+                and math.isclose(
+                    float(track["lateral_m"]), -0.105, abs_tol=0.01
+                )
+            )
+            for track in scene["tracks"]
+        ))
+        self.assertEqual(scene["reflectivity_corridor"]["status"], "confirmed")
+        self.assertLess(
+            scene["reflectivity_corridor"]["guidance_heading_deg"],
+            -20.0,
+        )
+
     def test_diagonal_corridor_produces_a_visible_right_curving_route(self):
         walls = []
         for index in range(8):
