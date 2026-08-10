@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260810-left-wall-selection-r48";
+  const UI_BUILD_ID = "20260811-converging-boundaries-r49";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -638,6 +638,8 @@
       const widthLabel = Number.isFinite(widthM)
         ? `${Math.round(widthM * 100)}cm`
         : "--cm";
+      const geometryLabel = corridor.geometry === "converging"
+        ? `BOTTLENECK ${widthLabel}` : widthLabel;
       const narrowLabel = Number.isFinite(widthM) && widthM < 0.21
         ? " · NARROW" : "";
       ctx.fillStyle = "rgba(205, 255, 249, 0.96)";
@@ -645,7 +647,7 @@
       ctx.textAlign = "center";
       ctx.textBaseline = "bottom";
       ctx.fillText(
-        `${candidate ? "CANDIDATE" : "CONFIRMED"} · ${widthLabel}${narrowLabel}`,
+        `${candidate ? "CANDIDATE" : "CONFIRMED"} · ${geometryLabel}${narrowLabel}`,
         labelX,
         labelY - 6,
       );

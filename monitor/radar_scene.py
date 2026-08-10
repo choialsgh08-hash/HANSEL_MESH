@@ -1435,6 +1435,8 @@ class RadarSceneEstimator:
     def _update_stable_path(self, now: float) -> None:
         obstacles = self._planning_obstacle_payload(now)
         corridor = self._reflectivity_corridor.payload()
+        if corridor["status"] == "confirmed":
+            obstacles.extend(self._reflectivity_corridor_obstacles(corridor))
         preferred_goal_angle_deg = (
             corridor["guidance_heading_deg"]
             if corridor["status"] == "confirmed"
@@ -1476,6 +1478,47 @@ class RadarSceneEstimator:
             now_ns,
         )
         self._set_planned_path(selected, now_ns)
+
+    @staticmethod
+    def _reflectivity_corridor_obstacles(
+        corridor: Dict[str, object],
+    ) -> List[Dict[str, object]]:
+        obstacles: List[Dict[str, object]] = []
+        confidence = float(corridor["confidence"])
+        hits = int(corridor["hits"])
+        for wall in corridor["walls"]:
+            start_forward, start_lateral = map(float, wall["start"])
+            end_forward, end_lateral = map(float, wall["end"])
+            length = math.hypot(
+                end_forward - start_forward,
+                end_lateral - start_lateral,
+            )
+            sample_count = max(
+                1,
+                math.ceil(length / NEAR_OCCUPANCY_RESOLUTION_M),
+            )
+            for sample_index in range(sample_count + 1):
+                ratio = sample_index / sample_count
+                obstacles.append({
+                    "forward_m": (
+                        start_forward
+                        + (end_forward - start_forward) * ratio
+                    ),
+                    "lateral_m": (
+                        start_lateral
+                        + (end_lateral - start_lateral) * ratio
+                    ),
+                    "range_uncertainty_m": 0.0,
+                    "lateral_uncertainty_m": 0.0,
+                    "support_radius_m": (
+                        NEAR_OCCUPANCY_RESOLUTION_M / math.sqrt(2.0)
+                    ),
+                    "confidence": confidence,
+                    "hits": hits,
+                    "evidence_kind": "reflectivity_corridor",
+                    "source": "heatmap",
+                })
+        return obstacles
 
     def _planning_obstacle_payload(
         self,

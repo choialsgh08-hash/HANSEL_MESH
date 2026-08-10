@@ -1767,6 +1767,85 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             places=6,
         )
 
+    def test_confirmed_narrowing_walls_cannot_leave_a_straight_clear_route(self):
+        estimator = calibrated_estimator()
+        wall_cells = [
+            {
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "intensity": 0.82,
+            }
+            for forward_m, half_width_m in (
+                (0.200, 0.250),
+                (0.250, 0.200),
+                (0.300, 0.150),
+                (0.350, 0.100),
+                (0.400, 0.050),
+            )
+            for lateral_m in (-half_width_m, half_width_m)
+        ]
+        with patch.object(estimator, "_reflectivity_surface"):
+            estimator._reflectivity_surface.payload.return_value = {
+                "cells": wall_cells,
+            }
+            for frame_number in range(1, 4):
+                estimator.ingest(
+                    radar_frame([], frame_number=frame_number),
+                    received_at=8.0 + frame_number * 0.125,
+                )
+
+        scene = estimator.snapshot(now=8.375)
+        path = scene["planned_path"]
+
+        self.assertEqual(scene["reflectivity_corridor"]["geometry"], "converging")
+        self.assertGreater(path["persistent_obstacles_used"], 0)
+        self.assertEqual(path["status"], "limited")
+        self.assertFalse(path["goal_reached"])
+        self.assertLess(path["length_m"], 0.30)
+
+    def test_later_wider_reflection_lobe_cannot_clear_first_bottleneck(self):
+        estimator = calibrated_estimator()
+        wall_cells = [
+            {
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "intensity": 0.86,
+            }
+            for forward_m, width_m in (
+                (0.200, 0.40),
+                (0.225, 0.30),
+                (0.250, 0.20),
+                (0.275, 0.10),
+                (0.375, 0.55),
+                (0.400, 0.4875),
+                (0.425, 0.425),
+                (0.450, 0.3625),
+                (0.475, 0.30),
+            )
+            for lateral_m in (-width_m / 2.0, width_m / 2.0)
+        ]
+        with patch.object(estimator, "_reflectivity_surface"):
+            estimator._reflectivity_surface.payload.return_value = {
+                "cells": wall_cells,
+            }
+            for frame_number in range(1, 4):
+                estimator.ingest(
+                    radar_frame([], frame_number=frame_number),
+                    received_at=8.5 + frame_number * 0.125,
+                )
+
+        scene = estimator.snapshot(now=8.875)
+        corridor = scene["reflectivity_corridor"]
+        path = scene["planned_path"]
+
+        self.assertAlmostEqual(corridor["width_m"], 0.10, places=6)
+        self.assertTrue(all(
+            math.isclose(float(wall["end"][0]), 0.275, abs_tol=1e-6)
+            for wall in corridor["walls"]
+        ))
+        self.assertNotEqual(path["status"], "clear")
+        self.assertFalse(path["goal_reached"])
+
     def test_ground_level_wall_return_guides_left_without_becoming_obstacle(self):
         estimator = calibrated_estimator()
         with patch.object(estimator, "_reflectivity_surface"):

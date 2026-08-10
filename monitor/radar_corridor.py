@@ -13,6 +13,12 @@ MIN_HEATMAP_WALL_SPAN_M = 0.08
 HEATMAP_ONLY_MIN_WALL_SUPPORT = 5
 HEATMAP_ONLY_MIN_WALL_SPAN_M = 0.20
 HEATMAP_ONLY_MIN_MEAN_INTENSITY = 0.60
+CONVERGING_MIN_ROWS = 4
+CONVERGING_MAX_ROW_GAP_M = 0.055
+CONVERGING_MAX_WIDTH_REOPEN_M = 0.025
+CONVERGING_MIN_WIDTH_REDUCTION_M = 0.075
+CONVERGING_MIN_SIDE_CLEARANCE_M = 0.03
+CONVERGING_MAX_LINE_RESIDUAL_M = 0.035
 MAX_ABS_WALL_HEADING_DEG = 75.0
 MIN_CORRIDOR_WIDTH_M = 0.06
 MAX_CORRIDOR_WIDTH_M = 0.55
@@ -20,8 +26,10 @@ MIN_POINT_WALL_CLEARANCE_FROM_SENSOR_M = 0.005
 MIN_HEATMAP_WALL_CLEARANCE_FROM_SENSOR_M = 0.03
 COMPATIBLE_HEADING_DEG = 5.0
 COMPATIBLE_WIDTH_M = 0.05
+COMPATIBLE_WALL_HEADING_DEG = 10.0
+COMPATIBLE_WALL_POSITION_M = 0.075
 MAX_GUIDANCE_HEADING_DEG = 55.0
-METHOD = "deterministic_parallel_ransac"
+METHOD = "deterministic_boundary_fit"
 
 
 Point = Tuple[float, float, float]
@@ -81,13 +89,7 @@ class ReflectivityCorridorEstimator:
             compatible = [
                 fit
                 for fit in fits
-                if abs(
-                    float(fit["measured_heading_deg"])
-                    - float(seed["measured_heading_deg"])
-                ) <= COMPATIBLE_HEADING_DEG
-                and abs(
-                    float(fit["width_m"]) - float(seed["width_m"])
-                ) <= COMPATIBLE_WIDTH_M
+                if self._fits_are_compatible(fit, seed)
             ]
             clusters.append(compatible)
         cluster = max(
@@ -102,30 +104,69 @@ class ReflectivityCorridorEstimator:
             ),
         )
         hits = len(cluster)
+        geometry = str(cluster[0]["geometry"])
         walls: List[Dict[str, object]] = []
         for wall_index in range(2):
             source_walls = [
                 fit["walls"][wall_index]
                 for fit in cluster
             ]
-            wall_heading = _median([
-                float(wall["heading_deg"])
-                for wall in source_walls
-            ])
-            normal_offset = _median([
-                float(wall["normal_offset_m"])
-                for wall in source_walls
-            ])
             start_forward = _median([
                 float(wall["start"][0])
+                for wall in source_walls
+            ])
+            start_lateral = _median([
+                float(wall["start"][1])
                 for wall in source_walls
             ])
             end_forward = _median([
                 float(wall["end"][0])
                 for wall in source_walls
             ])
-            heading_rad = math.radians(wall_heading)
-            lateral_at_origin = normal_offset / math.cos(heading_rad)
+            end_lateral = _median([
+                float(wall["end"][1])
+                for wall in source_walls
+            ])
+            if geometry == "parallel":
+                wall_heading = _median([
+                    float(wall["heading_deg"])
+                    for wall in source_walls
+                ])
+                normal_offset = _median([
+                    float(wall["normal_offset_m"])
+                    for wall in source_walls
+                ])
+                heading_rad = math.radians(wall_heading)
+                start_lateral = (
+                    normal_offset / math.cos(heading_rad)
+                    + math.tan(heading_rad) * start_forward
+                )
+                end_lateral = (
+                    normal_offset / math.cos(heading_rad)
+                    + math.tan(heading_rad) * end_forward
+                )
+            else:
+                wall_heading = math.degrees(math.atan2(
+                    end_lateral - start_lateral,
+                    end_forward - start_forward,
+                ))
+                heading_rad = math.radians(wall_heading)
+                normal_offset = (
+                    -math.sin(heading_rad) * start_forward
+                    + math.cos(heading_rad) * start_lateral
+                )
+            endpoint_span = math.hypot(
+                end_forward - start_forward,
+                end_lateral - start_lateral,
+            )
+            serialized_span = (
+                _median([
+                    float(wall["span_m"])
+                    for wall in source_walls
+                ])
+                if geometry == "parallel"
+                else endpoint_span
+            )
             walls.append({
                 "wall_id": f"wall_{wall_index + 1}",
                 "heading_deg": _rounded(wall_heading),
@@ -134,42 +175,55 @@ class ReflectivityCorridorEstimator:
                     float(wall["support_cells"])
                     for wall in source_walls
                 ]))),
-                "span_m": _rounded(_median([
-                    float(wall["span_m"])
-                    for wall in source_walls
-                ])),
+                "span_m": _rounded(serialized_span),
                 "mean_intensity": _rounded(_median([
                     float(wall["mean_intensity"])
                     for wall in source_walls
                 ])),
                 "start": [
                     _rounded(start_forward),
-                    _rounded(
-                        lateral_at_origin
-                        + math.tan(heading_rad) * start_forward
-                    ),
+                    _rounded(start_lateral),
                 ],
                 "end": [
                     _rounded(end_forward),
-                    _rounded(
-                        lateral_at_origin
-                        + math.tan(heading_rad) * end_forward
-                    ),
+                    _rounded(end_lateral),
                 ],
             })
-        measured_heading = _median([
-            float(fit["measured_heading_deg"])
-            for fit in cluster
-        ])
-        serialized_width = abs(
-            float(walls[0]["normal_offset_m"])
-            - float(walls[1]["normal_offset_m"])
-        )
+        if geometry == "converging":
+            near_center = (
+                (float(walls[0]["start"][0]) + float(walls[1]["start"][0]))
+                / 2.0,
+                (float(walls[0]["start"][1]) + float(walls[1]["start"][1]))
+                / 2.0,
+            )
+            far_center = (
+                (float(walls[0]["end"][0]) + float(walls[1]["end"][0]))
+                / 2.0,
+                (float(walls[0]["end"][1]) + float(walls[1]["end"][1]))
+                / 2.0,
+            )
+            measured_heading = math.degrees(math.atan2(
+                far_center[1] - near_center[1],
+                far_center[0] - near_center[0],
+            ))
+            serialized_width = (
+                float(walls[1]["end"][1]) - float(walls[0]["end"][1])
+            )
+        else:
+            measured_heading = _median([
+                float(fit["measured_heading_deg"])
+                for fit in cluster
+            ])
+            serialized_width = abs(
+                float(walls[0]["normal_offset_m"])
+                - float(walls[1]["normal_offset_m"])
+            )
         return {
             "status": (
                 "confirmed" if hits >= self._required_hits else "candidate"
             ),
             "method": METHOD,
+            "geometry": geometry,
             "history_frames": self._history_frames,
             "required_hits": self._required_hits,
             "hits": hits,
@@ -186,10 +240,45 @@ class ReflectivityCorridorEstimator:
             "walls": walls,
         }
 
+    @staticmethod
+    def _fits_are_compatible(
+        left: Dict[str, object],
+        right: Dict[str, object],
+    ) -> bool:
+        if (
+            left["geometry"] != right["geometry"]
+            or abs(
+                float(left["measured_heading_deg"])
+                - float(right["measured_heading_deg"])
+            ) > COMPATIBLE_HEADING_DEG
+            or abs(float(left["width_m"]) - float(right["width_m"]))
+            > COMPATIBLE_WIDTH_M
+        ):
+            return False
+        if left["geometry"] != "converging":
+            return True
+        for wall_index in range(2):
+            left_wall = left["walls"][wall_index]
+            right_wall = right["walls"][wall_index]
+            if abs(
+                float(left_wall["heading_deg"])
+                - float(right_wall["heading_deg"])
+            ) > COMPATIBLE_WALL_HEADING_DEG:
+                return False
+            for endpoint in ("start", "end"):
+                for coordinate in range(2):
+                    if abs(
+                        float(left_wall[endpoint][coordinate])
+                        - float(right_wall[endpoint][coordinate])
+                    ) > COMPATIBLE_WALL_POSITION_M:
+                        return False
+        return True
+
     def _empty_payload(self) -> Dict[str, object]:
         return {
             "status": "unavailable",
             "method": METHOD,
+            "geometry": None,
             "history_frames": self._history_frames,
             "required_hits": self._required_hits,
             "hits": 0,
@@ -235,6 +324,9 @@ class ReflectivityCorridorEstimator:
     ) -> Optional[Dict[str, object]]:
         heatmap_points = cls._points(cells)
         point_returns = cls._points(point_observations)
+        converging = cls._converging_candidate(heatmap_points)
+        if converging is not None:
+            return converging
         pairs = cls._pair_candidates(
             primary_points=point_returns,
             secondary_points=heatmap_points,
@@ -453,12 +545,184 @@ class ReflectivityCorridorEstimator:
                         offsets[0],
                     )
                     pairs.append((pair_key, {
+                        "geometry": "parallel",
                         "measured_heading_deg": heading,
                         "width_m": width,
                         "confidence": confidence,
                         "walls": walls,
                     }))
         return pairs
+
+    @classmethod
+    def _converging_candidate(
+        cls,
+        heatmap_points: Sequence[Point],
+    ) -> Optional[Dict[str, object]]:
+        rows: Dict[float, List[Point]] = {}
+        for point in heatmap_points:
+            if point[2] < HEATMAP_ONLY_MIN_MEAN_INTENSITY:
+                continue
+            rows.setdefault(point[0], []).append(point)
+        boundaries: List[Tuple[float, Point, Point, float]] = []
+        for forward_m, row in sorted(rows.items()):
+            left = [
+                point for point in row
+                if point[1] <= -CONVERGING_MIN_SIDE_CLEARANCE_M
+            ]
+            right = [
+                point for point in row
+                if point[1] >= CONVERGING_MIN_SIDE_CLEARANCE_M
+            ]
+            if not left or not right:
+                continue
+            left_inner = max(left, key=lambda point: point[1])
+            right_inner = min(right, key=lambda point: point[1])
+            width_m = right_inner[1] - left_inner[1]
+            if width_m <= 0.0 or width_m > MAX_CORRIDOR_WIDTH_M:
+                continue
+            boundaries.append((forward_m, left_inner, right_inner, width_m))
+
+        runs: List[List[Tuple[float, Point, Point, float]]] = []
+        for start_index in range(len(boundaries)):
+            run = [boundaries[start_index]]
+            narrowest_width = run[0][3]
+            for boundary in boundaries[start_index + 1:]:
+                previous = run[-1]
+                if boundary[0] - previous[0] > CONVERGING_MAX_ROW_GAP_M:
+                    break
+                if (
+                    boundary[3] - narrowest_width
+                    > CONVERGING_MAX_WIDTH_REOPEN_M + 1e-12
+                ):
+                    break
+                run.append(boundary)
+                narrowest_width = min(narrowest_width, boundary[3])
+            bottleneck_index = min(
+                range(len(run)),
+                key=lambda index: run[index][3],
+            )
+            run = run[:bottleneck_index + 1]
+            if (
+                len(run) >= CONVERGING_MIN_ROWS
+                and run[0][3] - run[-1][3]
+                >= CONVERGING_MIN_WIDTH_REDUCTION_M
+            ):
+                runs.append(run)
+        if not runs:
+            return None
+        run = min(
+            runs,
+            key=lambda values: (
+                values[-1][0],
+                values[-1][3],
+                -len(values),
+                -(values[-1][0] - values[0][0]),
+            ),
+        )
+        walls = [
+            cls._independent_wall_payload(
+                [boundary[side_index] for boundary in run]
+            )
+            for side_index in (1, 2)
+        ]
+        if any(
+            abs(float(wall["heading_deg"])) > MAX_ABS_WALL_HEADING_DEG
+            or float(wall["max_residual_m"])
+            > CONVERGING_MAX_LINE_RESIDUAL_M
+            for wall in walls
+        ):
+            return None
+        near_width = float(walls[1]["start"][1]) - float(
+            walls[0]["start"][1]
+        )
+        bottleneck_width = float(walls[1]["end"][1]) - float(
+            walls[0]["end"][1]
+        )
+        if (
+            bottleneck_width < 0.0
+            or bottleneck_width > MAX_CORRIDOR_WIDTH_M
+            or near_width - bottleneck_width
+            < CONVERGING_MIN_WIDTH_REDUCTION_M
+        ):
+            return None
+        near_center = (
+            (float(walls[0]["start"][0]) + float(walls[1]["start"][0])) / 2,
+            (float(walls[0]["start"][1]) + float(walls[1]["start"][1])) / 2,
+        )
+        far_center = (
+            (float(walls[0]["end"][0]) + float(walls[1]["end"][0])) / 2,
+            (float(walls[0]["end"][1]) + float(walls[1]["end"][1])) / 2,
+        )
+        measured_heading = math.degrees(math.atan2(
+            far_center[1] - near_center[1],
+            far_center[0] - near_center[0],
+        ))
+        if abs(measured_heading) > MAX_ABS_WALL_HEADING_DEG:
+            return None
+        mean_intensity = sum(
+            float(wall["mean_intensity"]) for wall in walls
+        ) / 2.0
+        minimum_span = min(float(wall["span_m"]) for wall in walls)
+        confidence = min(
+            1.0,
+            min(1.0, len(run) / 6.0) * 0.45
+            + min(1.0, minimum_span / 0.25) * 0.25
+            + mean_intensity * 0.20
+            + min(1.0, (near_width - bottleneck_width) / 0.20) * 0.10,
+        )
+        return {
+            "geometry": "converging",
+            "measured_heading_deg": measured_heading,
+            "width_m": bottleneck_width,
+            "confidence": confidence,
+            "walls": walls,
+        }
+
+    @staticmethod
+    def _independent_wall_payload(support: Sequence[Point]) -> Dict[str, object]:
+        slopes = [
+            (right[1] - left[1]) / (right[0] - left[0])
+            for left_index, left in enumerate(support)
+            for right in support[left_index + 1:]
+            if right[0] > left[0]
+        ]
+        slope = _median(slopes)
+        intercept = _median([
+            point[1] - slope * point[0] for point in support
+        ])
+        start_forward = min(point[0] for point in support)
+        end_forward = max(point[0] for point in support)
+        start_lateral = _median([
+            point[1] for point in support if point[0] == start_forward
+        ])
+        end_lateral = _median([
+            point[1] for point in support if point[0] == end_forward
+        ])
+        endpoint_slope = (
+            (end_lateral - start_lateral)
+            / (end_forward - start_forward)
+        )
+        heading_deg = math.degrees(math.atan(endpoint_slope))
+        heading_rad = math.radians(heading_deg)
+        return {
+            "heading_deg": heading_deg,
+            "normal_offset_m": (
+                -math.sin(heading_rad) * start_forward
+                + math.cos(heading_rad) * start_lateral
+            ),
+            "support_cells": len(support),
+            "span_m": math.hypot(
+                end_forward - start_forward,
+                end_lateral - start_lateral,
+            ),
+            "mean_intensity": sum(point[2] for point in support) / len(support),
+            "max_residual_m": max(
+                abs(point[1] - (intercept + slope * point[0]))
+                for point in support
+            ),
+            "start": [start_forward, start_lateral],
+            "end": [end_forward, end_lateral],
+        }
 
     @staticmethod
     def _wall_payload(

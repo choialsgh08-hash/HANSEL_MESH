@@ -119,7 +119,8 @@ function makeReflectivityCell(overrides = {}) {
 function makeReflectivityCorridor(overrides = {}) {
   return {
     status: "confirmed",
-    method: "deterministic_parallel_ransac",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
     history_frames: 5,
     required_hits: 3,
     hits: 3,
@@ -156,7 +157,8 @@ function makeReflectivityCorridor(overrides = {}) {
 function makeUnavailableReflectivityCorridor() {
   return {
     status: "unavailable",
-    method: "deterministic_parallel_ransac",
+    method: "deterministic_boundary_fit",
+    geometry: null,
     history_frames: 5,
     required_hits: 3,
     hits: 0,
@@ -377,7 +379,8 @@ test("validates and detaches the measured two-wall reflectivity corridor", () =>
 
   assert.deepEqual(parsed.reflectivityCorridor, {
     status: "confirmed",
-    method: "deterministic_parallel_ransac",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
     historyFrames: 5,
     requiredHits: 3,
     hits: 3,
@@ -416,7 +419,8 @@ test("accepts point-seeded walls extrapolated back to the sensor body", () => {
   const snapshot = makeSnapshot();
   snapshot.scene.reflectivity_corridor = {
     status: "confirmed",
-    method: "deterministic_parallel_ransac",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
     history_frames: 5,
     required_hits: 3,
     hits: 5,
@@ -460,7 +464,8 @@ test("accepts a short near-sensor wall supported by two consistent points", () =
   const snapshot = makeSnapshot();
   snapshot.scene.reflectivity_corridor = {
     status: "confirmed",
-    method: "deterministic_parallel_ransac",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
     history_frames: 5,
     required_hits: 3,
     hits: 5,
@@ -498,6 +503,52 @@ test("accepts a short near-sensor wall supported by two consistent points", () =
   assert.equal(parsed.walls[0].spanM, 0.05206);
 });
 
+test("accepts independently measured converging walls and bottleneck width", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "converging",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 0.0,
+    guidance_heading_deg: 0.0,
+    width_m: 0.10,
+    confidence: 0.86,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: 45.0,
+        normal_offset_m: -0.318198,
+        support_cells: 5,
+        span_m: 0.282843,
+        mean_intensity: 0.82,
+        start: [0.20, -0.25],
+        end: [0.40, -0.05],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -45.0,
+        normal_offset_m: 0.318198,
+        support_cells: 5,
+        span_m: 0.282843,
+        mean_intensity: 0.82,
+        start: [0.20, 0.25],
+        end: [0.40, 0.05],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.geometry, "converging");
+  assert.equal(parsed.widthM, 0.10);
+  assert.equal(parsed.measuredHeadingDeg, 0.0);
+  assert.deepEqual(parsed.walls[0].start, [0.20, -0.25]);
+  assert.deepEqual(parsed.walls[1].end, [0.40, 0.05]);
+});
+
 test("accepts only canonical unavailable and candidate corridor states", () => {
   const unavailable = makeSnapshot();
   unavailable.scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
@@ -522,6 +573,7 @@ test("rejects every strict reflectivity-corridor metadata violation", async (t) 
     ["array", (scene) => { scene.reflectivity_corridor = []; }],
     ["status", (scene) => { scene.reflectivity_corridor.status = "stable"; }],
     ["method", (scene) => { scene.reflectivity_corridor.method = "least_squares"; }],
+    ["geometry", (scene) => { scene.reflectivity_corridor.geometry = "triangle"; }],
     ["history", (scene) => { scene.reflectivity_corridor.history_frames = 4; }],
     ["required", (scene) => { scene.reflectivity_corridor.required_hits = 2; }],
     ["fractional hits", (scene) => { scene.reflectivity_corridor.hits = 3.5; }],
@@ -548,6 +600,10 @@ test("rejects every strict reflectivity-corridor metadata violation", async (t) 
     ["unavailable walls", (scene) => {
       scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
       scene.reflectivity_corridor.walls = makeReflectivityCorridor().walls;
+    }],
+    ["unavailable geometry kind", (scene) => {
+      scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+      scene.reflectivity_corridor.geometry = "parallel";
     }],
   ];
   for (const [name, mutate] of cases) {
@@ -588,6 +644,54 @@ test("rejects malformed measured wall geometry and inconsistent pairs", async (t
   for (const [name, mutate] of cases) {
     await t.test(name, () => {
       const snapshot = makeSnapshot();
+      mutate(snapshot.scene.reflectivity_corridor);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity corridor contract/,
+      );
+    });
+  }
+});
+
+test("rejects converging wall pairs that do not describe their measured bottleneck", async (t) => {
+  const converging = () => ({
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "converging",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 0.0,
+    guidance_heading_deg: 0.0,
+    width_m: 0.10,
+    confidence: 0.86,
+    walls: [
+      {
+        wall_id: "wall_1", heading_deg: 45.0,
+        normal_offset_m: -0.318198, support_cells: 5,
+        span_m: 0.282843, mean_intensity: 0.82,
+        start: [0.20, -0.25], end: [0.40, -0.05],
+      },
+      {
+        wall_id: "wall_2", heading_deg: -45.0,
+        normal_offset_m: 0.318198, support_cells: 5,
+        span_m: 0.282843, mean_intensity: 0.82,
+        start: [0.20, 0.25], end: [0.40, 0.05],
+      },
+    ],
+  });
+  const cases = [
+    ["not narrowing", (corridor) => { corridor.walls[1].end[1] = 0.35; }],
+    ["wrong bottleneck", (corridor) => { corridor.width_m = 0.11; }],
+    ["wrong centerline", (corridor) => {
+      corridor.measured_heading_deg = 5;
+      corridor.guidance_heading_deg = 5;
+    }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.reflectivity_corridor = converging();
       mutate(snapshot.scene.reflectivity_corridor);
       assert.throws(
         () => sceneApi.parseRadarScene(snapshot),

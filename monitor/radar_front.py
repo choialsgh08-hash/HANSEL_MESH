@@ -52,7 +52,7 @@ from sensors.radar_parent_lease import (  # noqa: E402
 WEB_ROOT = Path(__file__).resolve().parent / "web"
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
-UI_BUILD_ID = "20260810-left-wall-selection-r48"
+UI_BUILD_ID = "20260811-converging-boundaries-r49"
 RADAR_VALID_MIN_RANGE_M = 0.07
 SUPERVISOR_BLOCKED_WARNING = "RADAR RECONNECTING \u00b7 DRIVE STOP"
 

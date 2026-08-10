@@ -105,6 +105,21 @@ STRONG_STRAIGHT_HEATMAP_CORRIDOR = [
     (0.450, 0.155, 0.69),
 ]
 
+STRONG_CONVERGING_HEATMAP_CORRIDOR = [
+    (forward_m, lateral_m, 0.82)
+    for forward_m, half_width_m in (
+        (0.200, 0.250),
+        (0.250, 0.200),
+        (0.300, 0.150),
+        (0.350, 0.100),
+        (0.400, 0.050),
+        # The lobe beyond the bottleneck is multipath, not a wall reopening.
+        (0.425, 0.250),
+        (0.450, 0.200),
+    )
+    for lateral_m in (-half_width_m, half_width_m)
+]
+
 
 def cells(rows):
     return [
@@ -136,6 +151,7 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         payload = estimator.payload()
 
         self.assertEqual(payload["status"], "confirmed")
+        self.assertEqual(payload["geometry"], "parallel")
         self.assertEqual(payload["hits"], 3)
         self.assertAlmostEqual(payload["measured_heading_deg"], 0.0, places=6)
         self.assertAlmostEqual(payload["width_m"], 0.31, places=6)
@@ -146,6 +162,165 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
             wall["support_cells"] >= 5 and wall["span_m"] >= 0.20
             for wall in payload["walls"]
         ))
+
+    def test_converging_boundaries_are_fitted_independently_until_bottleneck(self):
+        estimator = ReflectivityCorridorEstimator()
+        observed = cells(STRONG_CONVERGING_HEATMAP_CORRIDOR)
+
+        for _ in range(3):
+            estimator.ingest(observed)
+        payload = estimator.payload()
+
+        self.assertEqual(payload["status"], "confirmed")
+        self.assertEqual(payload["method"], "deterministic_boundary_fit")
+        self.assertEqual(payload["geometry"], "converging")
+        self.assertAlmostEqual(payload["measured_heading_deg"], 0.0, places=6)
+        self.assertAlmostEqual(payload["guidance_heading_deg"], 0.0, places=6)
+        self.assertAlmostEqual(payload["width_m"], 0.10, places=6)
+        left_wall, right_wall = payload["walls"]
+        self.assertGreater(left_wall["heading_deg"], 30.0)
+        self.assertLess(right_wall["heading_deg"], -30.0)
+        self.assertAlmostEqual(left_wall["start"][0], 0.20, places=6)
+        self.assertAlmostEqual(right_wall["start"][0], 0.20, places=6)
+        self.assertAlmostEqual(left_wall["end"][0], 0.40, places=6)
+        self.assertAlmostEqual(right_wall["end"][0], 0.40, places=6)
+        near_gap = right_wall["start"][1] - left_wall["start"][1]
+        bottleneck_gap = right_wall["end"][1] - left_wall["end"][1]
+        self.assertGreater(near_gap, bottleneck_gap)
+        self.assertAlmostEqual(bottleneck_gap, payload["width_m"], places=6)
+
+    def test_converging_fit_is_mirror_equivariant_not_direction_hardcoded(self):
+        asymmetric = [
+            (forward_m, lateral_m, 0.84)
+            for forward_m, left_m, right_m in (
+                (0.150, -0.250, 0.250),
+                (0.200, -0.220, 0.190),
+                (0.250, -0.190, 0.130),
+                (0.300, -0.160, 0.070),
+                (0.350, -0.130, 0.030),
+            )
+            for lateral_m in (left_m, right_m)
+        ]
+        original = ReflectivityCorridorEstimator()
+        mirrored = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            original.ingest(cells(asymmetric))
+            mirrored.ingest(cells([
+                (forward_m, -lateral_m, intensity)
+                for forward_m, lateral_m, intensity in asymmetric
+            ]))
+
+        original_payload = original.payload()
+        mirrored_payload = mirrored.payload()
+
+        self.assertEqual(original_payload["geometry"], "converging")
+        self.assertEqual(mirrored_payload["geometry"], "converging")
+        self.assertAlmostEqual(
+            original_payload["measured_heading_deg"],
+            -mirrored_payload["measured_heading_deg"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            original_payload["width_m"],
+            mirrored_payload["width_m"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            original_payload["walls"][0]["heading_deg"],
+            -mirrored_payload["walls"][1]["heading_deg"],
+            places=6,
+        )
+
+    def test_distributed_reopen_is_cut_at_the_measured_bottleneck(self):
+        widths = (0.55, 0.45, 0.35, 0.25, 0.10, 0.15, 0.20, 0.25, 0.30)
+        observed = cells([
+            (0.200 + index * 0.025, lateral_m, 0.86)
+            for index, width_m in enumerate(widths)
+            for lateral_m in (-width_m / 2.0, width_m / 2.0)
+        ])
+        estimator = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            estimator.ingest(observed)
+
+        payload = estimator.payload()
+
+        self.assertEqual(payload["geometry"], "converging")
+        self.assertAlmostEqual(payload["width_m"], 0.10, places=6)
+        self.assertTrue(all(
+            math.isclose(float(wall["end"][0]), 0.30, abs_tol=1e-6)
+            for wall in payload["walls"]
+        ))
+
+    def test_later_wider_lobe_cannot_replace_the_first_bottleneck(self):
+        observed = cells([
+            (forward_m, lateral_m, 0.86)
+            for forward_m, width_m in (
+                (0.200, 0.40),
+                (0.225, 0.30),
+                (0.250, 0.20),
+                (0.275, 0.10),
+                (0.375, 0.55),
+                (0.400, 0.4875),
+                (0.425, 0.425),
+                (0.450, 0.3625),
+                (0.475, 0.30),
+            )
+            for lateral_m in (-width_m / 2.0, width_m / 2.0)
+        ])
+        estimator = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            estimator.ingest(observed)
+
+        payload = estimator.payload()
+
+        self.assertEqual(payload["geometry"], "converging")
+        self.assertAlmostEqual(payload["width_m"], 0.10, places=6)
+        self.assertTrue(all(
+            math.isclose(float(wall["end"][0]), 0.275, abs_tol=1e-6)
+            for wall in payload["walls"]
+        ))
+
+    def test_alternating_forward_ranges_cannot_combine_into_confirmation(self):
+        near = [
+            (forward_m, lateral_m, 0.83)
+            for forward_m, half_width_m in (
+                (0.150, 0.250),
+                (0.200, 0.200),
+                (0.250, 0.150),
+                (0.300, 0.100),
+                (0.350, 0.050),
+            )
+            for lateral_m in (-half_width_m, half_width_m)
+        ]
+        far = [
+            (forward_m + 0.150, lateral_m, intensity)
+            for forward_m, lateral_m, intensity in near
+        ]
+        estimator = ReflectivityCorridorEstimator()
+        for observed in (near, far, near):
+            estimator.ingest(cells(observed))
+
+        payload = estimator.payload()
+
+        self.assertEqual(payload["status"], "candidate")
+        self.assertEqual(payload["hits"], 2)
+
+    def test_zigzag_inner_returns_do_not_form_straight_measured_walls(self):
+        observed = cells([
+            (forward_m, lateral_m, 0.85)
+            for forward_m, left_m, right_m in (
+                (0.200, -0.250, 0.250),
+                (0.250, -0.100, 0.300),
+                (0.300, -0.200, 0.100),
+                (0.350, -0.050, 0.150),
+                (0.400, -0.050, 0.050),
+            )
+            for lateral_m in (left_m, right_m)
+        ])
+        estimator = ReflectivityCorridorEstimator()
+        estimator.ingest(observed)
+
+        self.assertEqual(estimator.payload()["status"], "unavailable")
 
     def test_point_seeded_photo_layout_confirms_after_three_frames(self):
         estimator = ReflectivityCorridorEstimator()
@@ -245,6 +420,7 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
                     "end": [0.4, 0.4 * math.tan(math.radians(-20.0))],
                 })
             estimator._history.append({
+                "geometry": "parallel",
                 "measured_heading_deg": -20.0,
                 "width_m": left_clearance + right_clearance,
                 "confidence": 0.60,
@@ -285,7 +461,8 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         estimator.reset()
         self.assertEqual(estimator.payload(), {
             "status": "unavailable",
-            "method": "deterministic_parallel_ransac",
+            "method": "deterministic_boundary_fit",
+            "geometry": None,
             "history_frames": 5,
             "required_hits": 3,
             "hits": 0,

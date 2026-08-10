@@ -233,7 +233,8 @@
     };
     if (!isPlainObject(corridor) ||
         !["unavailable", "candidate", "confirmed"].includes(corridor.status) ||
-        corridor.method !== "deterministic_parallel_ransac" ||
+        corridor.method !== "deterministic_boundary_fit" ||
+        ![null, "parallel", "converging"].includes(corridor.geometry) ||
         corridor.history_frames !== 5 || corridor.required_hits !== 3 ||
         !Number.isInteger(corridor.hits) || corridor.hits < 0 ||
         corridor.hits > corridor.history_frames ||
@@ -244,12 +245,14 @@
     if (corridor.status === "unavailable") {
       if (corridor.hits !== 0 || corridor.measured_heading_deg !== null ||
           corridor.guidance_heading_deg !== null || corridor.width_m !== null ||
-          corridor.confidence !== 0 || corridor.walls.length !== 0) {
+          corridor.geometry !== null || corridor.confidence !== 0 ||
+          corridor.walls.length !== 0) {
         return invalid();
       }
       return {
         status: corridor.status,
         method: corridor.method,
+        geometry: null,
         historyFrames: corridor.history_frames,
         requiredHits: corridor.required_hits,
         hits: corridor.hits,
@@ -272,8 +275,10 @@
           corridor.guidance_heading_deg - Math.max(
             -55, Math.min(55, corridor.measured_heading_deg),
           )
-        ) > 1e-6 || !Number.isFinite(corridor.width_m) ||
-        corridor.width_m < 0.06 || corridor.width_m > 0.55 ||
+        ) > 1e-6 || !["parallel", "converging"].includes(corridor.geometry) ||
+        !Number.isFinite(corridor.width_m) || corridor.width_m < 0 ||
+        corridor.width_m > 0.55 ||
+        (corridor.geometry === "parallel" && corridor.width_m < 0.06) ||
         corridor.walls.length !== 2) {
       return invalid();
     }
@@ -295,8 +300,13 @@
       const deltaLateral = wall.end[1] - wall.start[1];
       const endpointSpan = Math.hypot(deltaForward, deltaLateral);
       const endpointHeading = Math.atan2(deltaLateral, deltaForward) * 180 / Math.PI;
+      const headingRad = wall.heading_deg * Math.PI / 180;
+      const endpointNormalOffset =
+        -Math.sin(headingRad) * wall.start[0] +
+        Math.cos(headingRad) * wall.start[1];
       if (endpointSpan + 2e-5 < wall.span_m ||
-          Math.abs(endpointHeading - wall.heading_deg) > 2e-4) {
+          Math.abs(endpointHeading - wall.heading_deg) > 2e-4 ||
+          Math.abs(endpointNormalOffset - wall.normal_offset_m) > 2e-5) {
         return invalid();
       }
       return {
@@ -310,20 +320,48 @@
         end: [...wall.end],
       };
     });
-    if (new Set(walls.map((wall) => wall.wallId)).size !== 2 ||
-        Math.abs(walls[0].headingDeg - walls[1].headingDeg) > 10 ||
-        Math.abs(
-          Math.abs(walls[0].normalOffsetM - walls[1].normalOffsetM) -
-          corridor.width_m
-        ) > 2e-5 || Math.abs(
-          (walls[0].headingDeg + walls[1].headingDeg) / 2 -
-          corridor.measured_heading_deg
-        ) > 2e-5) {
+    if (new Set(walls.map((wall) => wall.wallId)).size !== 2) {
       return invalid();
+    }
+    if (corridor.geometry === "parallel") {
+      if (Math.abs(walls[0].headingDeg - walls[1].headingDeg) > 10 ||
+          Math.abs(
+            Math.abs(walls[0].normalOffsetM - walls[1].normalOffsetM) -
+            corridor.width_m
+          ) > 2e-5 || Math.abs(
+            (walls[0].headingDeg + walls[1].headingDeg) / 2 -
+            corridor.measured_heading_deg
+          ) > 2e-5) {
+        return invalid();
+      }
+    } else {
+      const nearWidth = walls[1].start[1] - walls[0].start[1];
+      const farWidth = walls[1].end[1] - walls[0].end[1];
+      const nearCenter = [
+        (walls[0].start[0] + walls[1].start[0]) / 2,
+        (walls[0].start[1] + walls[1].start[1]) / 2,
+      ];
+      const farCenter = [
+        (walls[0].end[0] + walls[1].end[0]) / 2,
+        (walls[0].end[1] + walls[1].end[1]) / 2,
+      ];
+      const centerHeading = Math.atan2(
+        farCenter[1] - nearCenter[1],
+        farCenter[0] - nearCenter[0],
+      ) * 180 / Math.PI;
+      if (Math.abs(walls[0].start[0] - walls[1].start[0]) > 2e-5 ||
+          Math.abs(walls[0].end[0] - walls[1].end[0]) > 2e-5 ||
+          nearWidth <= 0 || farWidth < 0 ||
+          nearWidth - farWidth < 0.075 - 2e-5 ||
+          Math.abs(farWidth - corridor.width_m) > 2e-5 ||
+          Math.abs(centerHeading - corridor.measured_heading_deg) > 2e-4) {
+        return invalid();
+      }
     }
     return {
       status: corridor.status,
       method: corridor.method,
+      geometry: corridor.geometry,
       historyFrames: corridor.history_frames,
       requiredHits: corridor.required_hits,
       hits: corridor.hits,

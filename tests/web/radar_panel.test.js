@@ -405,7 +405,8 @@ function livePresentationWithProbabilityMap() {
     },
     reflectivityCorridor: {
       status: "confirmed",
-      method: "deterministic_parallel_ransac",
+      method: "deterministic_boundary_fit",
+      geometry: "parallel",
       historyFrames: 5,
       requiredHits: 3,
       hits: 3,
@@ -647,6 +648,39 @@ test("confirmed two-wall corridor draws measured walls region width and narrow l
   ));
   assert.ok(contexts[0].fillTextCalls.some(
     ([label]) => label === "CONFIRMED · 19cm · NARROW",
+  ));
+});
+
+test("converging wall display labels the measured bottleneck", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  const corridor = {
+    ...presentation.reflectivityCorridor,
+    geometry: "converging",
+    measuredHeadingDeg: 0,
+    guidanceHeadingDeg: 0,
+    widthM: 0.10,
+    walls: [
+      {
+        ...presentation.reflectivityCorridor.walls[0],
+        start: [0.20, -0.25], end: [0.40, -0.05],
+      },
+      {
+        ...presentation.reflectivityCorridor.walls[1],
+        start: [0.20, 0.25], end: [0.40, 0.05],
+      },
+    ],
+  };
+
+  panel.drawReflectivityCorridor(contexts[0], transform, corridor);
+
+  assert.ok(contexts[0].fillTextCalls.some(
+    ([label]) => label === "CONFIRMED · BOTTLENECK 10cm · NARROW",
   ));
 });
 
