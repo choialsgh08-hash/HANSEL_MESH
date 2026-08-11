@@ -109,10 +109,10 @@ python monitor\radar_front.py `
 ```
 
 브라우저에서 `http://127.0.0.1:8081/`을 연다. 기존 탭은 `Ctrl+F5`로 새로 고친다.
-정상 화면에는 `UI R9`, `0~3m FORWARD MAP`, `ROBOT RELATIVE`,
-`0~50cm 충돌 확대`가 보인다.
+정상 화면에는 `UI R54`, `반지름 30cm 근접 주행 지도`, `ROBOT RELATIVE`,
+`0~30cm 충돌 확대`가 보인다.
 
-50cm는 전체 시야 제한이 아니라 근거리 확대창이다. 주 지도는 전방 3m까지 표시한다.
+주 지도와 충돌 확대창은 모두 붕괴 틈새 주행에 맞춰 30cm 이내를 표시한다.
 빨강은 고정 클러터가 아닌 확인 포인트가 10cm 이하일 때만 허용된다. heatmap의
 가까운 bin과 missing return은 안전을 뜻하지 않으며, 어두운 영역은 `UNKNOWN`이다.
 

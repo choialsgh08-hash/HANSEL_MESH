@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import heapq
 import math
+import statistics
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -16,6 +17,7 @@ from monitor.radar_motion import RadarMotionEstimator
 from monitor.radar_path import PathSelectionHysteresis
 from monitor.radar_ground import RadarMountGeometry
 from monitor.radar_corridor import ReflectivityCorridorEstimator
+from monitor.radar_contour import CalibratedContourEstimator
 from monitor.radar_reflectivity import RadarReflectivitySurface
 from monitor.radar_tracking import (
     DEFAULT_RANGE_STEP_M,
@@ -96,12 +98,12 @@ HEATMAP_ENTER_MIN_RESIDUAL_DB = 8.0
 HEATMAP_EXIT_MIN_RESIDUAL_DB = 5.0
 HEATMAP_ENTER_MAD_MULTIPLIER = 5.0
 HEATMAP_EXIT_MAD_MULTIPLIER = 3.0
-HEATMAP_EDGE_MIN_AZIMUTH_BINS = 24
-HEATMAP_EDGE_MIN_RANGE_M = 0.18
-HEATMAP_EDGE_MAX_RANGE_M = 0.55
-HEATMAP_EDGE_MIN_GRADIENT_DB = 0.20
-HEATMAP_EDGE_FULL_CONFIDENCE_DB = 2.0
-HEATMAP_EDGE_SIDE_CLEARANCE_M = 0.03
+CONTOUR_MIN_AZIMUTH_BINS = 24
+CONTOUR_MIN_RANGE_M = 0.10
+CONTOUR_MAX_RANGE_M = 0.30
+CONTOUR_TRUSTED_AZIMUTH_DEG = 60.0
+CONTOUR_MIN_RESIDUAL_DB = 0.50
+CONTOUR_MIN_ROW_PROMINENCE_DB = 2.0
 HEATMAP_SINGLE_CELL_PEAK_DB = 16.0
 HEATMAP_TRACK_ASSOCIATION_M = 0.24
 HEATMAP_POINT_ASSOCIATION_M = 0.25
@@ -297,6 +299,7 @@ class RadarSceneEstimator:
         )
         self._reflectivity_surface = RadarReflectivitySurface()
         self._reflectivity_corridor = ReflectivityCorridorEstimator()
+        self._reflectivity_contours = CalibratedContourEstimator()
         self._scene_epoch = 0
         self._travel_trail: List[Tuple[float, float]] = [(0.0, 0.0)]
         self._path_selector = PathSelectionHysteresis(confirm_frames=3)
@@ -332,6 +335,7 @@ class RadarSceneEstimator:
         self._probability_grid.clear()
         self._reflectivity_surface.reset()
         self._reflectivity_corridor.reset()
+        self._reflectivity_contours.reset()
         self._travel_trail = [(0.0, 0.0)]
         self._path_selector.reset()
         self._planned_path = self._neutral_planned_path("reset")
@@ -578,7 +582,7 @@ class RadarSceneEstimator:
             point_count += 1
 
         reflectivity_observations: List[Tuple[float, float, float]] = []
-        edge_observations: List[Dict[str, object]] = []
+        contour_observations: List[Dict[str, object]] = []
         if (
             frame.heatmap is not None
             and self.clutter_model is not None
@@ -590,7 +594,9 @@ class RadarSceneEstimator:
                 candidate_cell_count,
                 reflectivity_observations,
             ) = self._heatmap_clusters(frame)
-            edge_observations = self._heatmap_edge_observations(frame)
+            contour_observations = self._calibrated_contour_observations(
+                frame
+            )
             point_supported_clusters = set()
             for point_forward, point_lateral in accepted_point_positions:
                 nearest_cluster_index = min(
@@ -650,7 +656,10 @@ class RadarSceneEstimator:
             self._reflectivity_surface.payload(now)["cells"],
             elapsed_frame_windows=heatmap_elapsed_frame_windows,
             point_observations=corridor_point_observations,
-            edge_observations=edge_observations,
+        )
+        self._reflectivity_contours.ingest(
+            contour_observations,
+            elapsed_frame_windows=heatmap_elapsed_frame_windows,
         )
 
         self._update_probability_map(now)
@@ -749,6 +758,7 @@ class RadarSceneEstimator:
         reflectivity_boundaries = (
             self._reflectivity_corridor.boundaries_payload()
         )
+        reflectivity_contours = self._reflectivity_contours.payload()
         probability_map = self._probability_grid.payload(observed_at)
         occupied_probability_cells = self._probability_grid.occupied_cells(
             observed_at
@@ -826,6 +836,7 @@ class RadarSceneEstimator:
             "reflectivity_surface": reflectivity_surface,
             "reflectivity_corridor": reflectivity_corridor,
             "reflectivity_boundaries": reflectivity_boundaries,
+            "reflectivity_contours": reflectivity_contours,
             "probabilistic_local_map": probability_map,
             "rolling_local_map": {
                 "radius_m": 0.50,
@@ -1447,12 +1458,18 @@ class RadarSceneEstimator:
 
     def _update_stable_path(self, now: float) -> None:
         obstacles = self._planning_obstacle_payload(now)
+        contours = self._reflectivity_contours.payload()
         corridor = self._reflectivity_corridor.payload()
-        if corridor["status"] == "confirmed":
+        if contours["status"] == "confirmed":
+            obstacles.extend(self._reflectivity_contour_obstacles(contours))
+        elif corridor["status"] == "confirmed":
             obstacles.extend(self._reflectivity_corridor_obstacles(corridor))
         preferred_goal_angle_deg = (
             corridor["guidance_heading_deg"]
-            if corridor["status"] == "confirmed"
+            if (
+                contours["status"] != "confirmed"
+                and corridor["status"] == "confirmed"
+            )
             else None
         )
         candidate = self._plan_path(
@@ -1491,6 +1508,45 @@ class RadarSceneEstimator:
             now_ns,
         )
         self._set_planned_path(selected, now_ns)
+
+    @staticmethod
+    def _reflectivity_contour_obstacles(
+        contours: Dict[str, object],
+    ) -> List[Dict[str, object]]:
+        obstacles: List[Dict[str, object]] = []
+        for segment in contours["segments"]:
+            start_forward, start_lateral = map(float, segment["start"])
+            end_forward, end_lateral = map(float, segment["end"])
+            length = math.hypot(
+                end_forward - start_forward,
+                end_lateral - start_lateral,
+            )
+            sample_count = max(
+                1,
+                math.ceil(length / NEAR_OCCUPANCY_RESOLUTION_M),
+            )
+            for sample_index in range(sample_count + 1):
+                ratio = sample_index / sample_count
+                obstacles.append({
+                    "forward_m": (
+                        start_forward
+                        + (end_forward - start_forward) * ratio
+                    ),
+                    "lateral_m": (
+                        start_lateral
+                        + (end_lateral - start_lateral) * ratio
+                    ),
+                    "range_uncertainty_m": 0.0,
+                    "lateral_uncertainty_m": 0.0,
+                    "support_radius_m": (
+                        NEAR_OCCUPANCY_RESOLUTION_M / math.sqrt(2.0)
+                    ),
+                    "confidence": float(segment["confidence"]),
+                    "hits": int(segment["hits"]),
+                    "evidence_kind": "reflectivity_contour",
+                    "source": "heatmap",
+                })
+        return obstacles
 
     @staticmethod
     def _reflectivity_corridor_obstacles(
@@ -2802,78 +2858,88 @@ class RadarSceneEstimator:
             range_m * math.sin(angle_rad) * self.axes.lateral_sign,
         )
 
-    def _heatmap_edge_observations(
+    def _calibrated_contour_observations(
         self,
         frame: RadarFrame,
     ) -> List[Dict[str, object]]:
-        """Extract static wall edges from absolute range-azimuth gradients.
+        """Extract the nearest calibrated reflection independently per ray.
 
-        A per-cell clutter baseline deliberately removes stationary objects,
-        including walls present during calibration.  Wall display therefore
-        uses only coherent azimuth edges from the current native heatmap; it
-        does not feed obstacle or hazard state.  Geometry and temporal gates
-        are applied later by ``ReflectivityCorridorEstimator``.
+        Each range row is normalized by its trusted-FOV median so changes in
+        receiver gain do not become walls.  No left/right, parallel, or
+        converging-wall assumption is made here; adjacent rays and actual
+        range discontinuities define the later contour segments.
         """
         heatmap = frame.heatmap
+        model = self.clutter_model
         if (
             heatmap is None
-            or heatmap.azimuth_bins < HEATMAP_EDGE_MIN_AZIMUTH_BINS
+            or model is None
+            or heatmap.azimuth_bins < CONTOUR_MIN_AZIMUTH_BINS
         ):
             return []
         span_db = heatmap.ceiling_db - heatmap.floor_db
-        observations: List[Dict[str, object]] = []
+        nearest_by_azimuth: Dict[int, Dict[str, object]] = {}
         for range_index in range(1, heatmap.range_bins):
             range_m = range_index * heatmap.range_step_m
-            if range_m < HEATMAP_EDGE_MIN_RANGE_M:
+            if range_m < CONTOUR_MIN_RANGE_M:
                 continue
-            if range_m > HEATMAP_EDGE_MAX_RANGE_M:
+            if range_m > CONTOUR_MAX_RANGE_M + 1e-12:
                 break
-            row = [
-                heatmap.floor_db
-                + heatmap.data[
+            row_residuals: Dict[int, float] = {}
+            for azimuth_index in range(heatmap.azimuth_bins):
+                argument = 2.0 * (
+                    azimuth_index - heatmap.azimuth_bins / 2.0
+                ) / heatmap.azimuth_bins
+                azimuth_deg = math.degrees(math.asin(
+                    max(-1.0, min(1.0, argument))
+                ))
+                if abs(azimuth_deg) > CONTOUR_TRUSTED_AZIMUTH_DEG:
+                    continue
+                flat_index = (
                     range_index * heatmap.azimuth_bins + azimuth_index
-                ] / 255.0 * span_db
-                for azimuth_index in range(heatmap.azimuth_bins)
-            ]
-            positions = [
-                self._heatmap_cell_position(
+                )
+                if flat_index >= len(model.heatmap_median_db):
+                    continue
+                observed_db = (
+                    heatmap.floor_db
+                    + heatmap.data[flat_index] / 255.0 * span_db
+                )
+                row_residuals[azimuth_index] = (
+                    observed_db - model.heatmap_median_db[flat_index]
+                )
+            if not row_residuals:
+                continue
+            row_baseline_db = statistics.median(row_residuals.values())
+            for azimuth_index, residual_db in row_residuals.items():
+                prominence_db = residual_db - row_baseline_db
+                if (
+                    residual_db < CONTOUR_MIN_RESIDUAL_DB
+                    or prominence_db < CONTOUR_MIN_ROW_PROMINENCE_DB
+                ):
+                    continue
+                existing = nearest_by_azimuth.get(azimuth_index)
+                if (
+                    existing is not None
+                    and int(existing["range_index"]) < range_index
+                ):
+                    continue
+                forward_m, lateral_m = self._heatmap_cell_position(
                     range_m,
                     azimuth_index,
                     heatmap.azimuth_bins,
                 )
-                for azimuth_index in range(heatmap.azimuth_bins)
-            ]
-            for azimuth_index in range(heatmap.azimuth_bins - 1):
-                first = positions[azimuth_index]
-                second = positions[azimuth_index + 1]
-                if first[1] * second[1] <= 0.0:
-                    continue
-                if min(abs(first[1]), abs(second[1])) < (
-                    HEATMAP_EDGE_SIDE_CLEARANCE_M
-                ):
-                    continue
-                if abs(first[1]) < abs(second[1]):
-                    inner_index = azimuth_index
-                    outer_index = azimuth_index + 1
-                else:
-                    inner_index = azimuth_index + 1
-                    outer_index = azimuth_index
-                gradient_db = row[inner_index] - row[outer_index]
-                if gradient_db < HEATMAP_EDGE_MIN_GRADIENT_DB:
-                    continue
-                observations.append({
-                    "forward_m": (first[0] + second[0]) / 2.0,
-                    "lateral_m": (first[1] + second[1]) / 2.0,
-                    "intensity": max(
-                        0.30,
-                        min(
-                            1.0,
-                            gradient_db / HEATMAP_EDGE_FULL_CONFIDENCE_DB,
-                        ),
-                    ),
+                nearest_by_azimuth[azimuth_index] = {
+                    "forward_m": forward_m,
+                    "lateral_m": lateral_m,
+                    "azimuth_index": azimuth_index,
                     "range_index": range_index,
-                })
-        return observations
+                    "residual_db": residual_db,
+                    "prominence_db": prominence_db,
+                }
+        return [
+            nearest_by_azimuth[index]
+            for index in sorted(nearest_by_azimuth)
+        ]
 
     def _near_existing_heatmap_track(
         self,

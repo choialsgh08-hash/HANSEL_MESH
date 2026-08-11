@@ -730,7 +730,7 @@
       <header class="page-header">
         <div class="brand">
           <p class="eyebrow">HANSEL MESH / RADAR OPERATOR VIEW</p>
-          <h1>반지름 50cm 원형 롤링 지도</h1>
+          <h1>반지름 30cm 근접 주행 지도</h1>
           <p class="subtitle">
             측정된 반사 증거만 표시 · UNKNOWN ≠ FREE · 카메라 영상 및 SLAM 아님
           </p>
@@ -749,7 +749,7 @@
         <div class="radar-stage" id="radar-panel">
           <canvas
             id="radar-main-canvas"
-            aria-label="레이더 중심 반지름 50센티미터 원형 롤링 지도"
+            aria-label="레이더 중심 반지름 30센티미터 근접 주행 지도"
           ></canvas>
 
           <div class="stage-tags">
@@ -766,24 +766,24 @@
             <span class="tag">±60° TRUSTED FOV</span>
             <span class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>
             <span class="tag" id="ground-filter-tag">SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN</span>
-            <span class="tag" id="build-tag">UI R53</span>
+            <span class="tag" id="build-tag">UI R54</span>
             <span class="tag" id="axis-warning">장착축/보정 확인</span>
           </div>
 
           <section id="collision-inset" data-hazard="UNKNOWN">
             <header>
-              <strong>0~50cm 충돌 확대</strong>
+              <strong>0~30cm 충돌 확대</strong>
               <span id="collision-distance">-- cm</span>
             </header>
             <canvas
               id="collision-canvas"
-              aria-label="전방 0~50센티미터 충돌 확대 지도"
+              aria-label="전방 0~30센티미터 충돌 확대 지도"
             ></canvas>
           </section>
 
           <section id="pointcloud-3d-panel">
             <header>
-              <strong>2.5D FILTERED TRACKS · 0~50cm</strong>
+              <strong>2.5D FILTERED TRACKS · 0~30cm</strong>
               <span id="pointcloud-3d-status">FILTERED · SENSOR-RELATIVE Z</span>
             </header>
             <canvas
@@ -932,8 +932,8 @@
       </footer>
     </main>
 
-    <script src="/radar_scene.js?v=20260811-static-heatmap-edges-r53"></script>
-    <script src="/radar_panel.js?v=20260811-static-heatmap-edges-r53"></script>
+    <script src="/radar_scene.js?v=20260811-calibrated-contours-r54"></script>
+    <script src="/radar_panel.js?v=20260811-calibrated-contours-r54"></script>
     <script>
       const panel = new window.HanselRadarPanel(
         document.querySelector("#radar-panel"),

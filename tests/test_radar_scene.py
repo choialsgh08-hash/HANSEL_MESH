@@ -354,7 +354,7 @@ def saturated_near_heatmap_frame(frame_index: int) -> RadarFrame:
     )
 
 
-def near_wall_edge_fixture(
+def current_layout_contour_fixture(
     *,
     frame_number: int,
     uniform: bool = False,
@@ -362,28 +362,13 @@ def near_wall_edge_fixture(
     range_bins = 128
     azimuth_bins = 32
     range_step_m = 0.05859375
-    data = bytearray([200] * (range_bins * azimuth_bins))
+    baseline_value = 128
+    data = bytearray([baseline_value] * (range_bins * azimuth_bins))
     if not uniform:
-        for range_index in range(1, range_bins):
-            range_m = range_index * range_step_m
-            for azimuth_index in range(azimuth_bins):
-                argument = 2.0 * (
-                    azimuth_index - azimuth_bins / 2.0
-                ) / azimuth_bins
-                angle = max(
-                    math.radians(-60.0),
-                    min(
-                        math.radians(60.0),
-                        math.asin(max(-1.0, min(1.0, argument))),
-                    ),
-                )
-                lateral_m = range_m * math.sin(angle)
-                left_wall_m = -0.21 - 0.10 * range_m
-                right_wall_m = 0.32 - 0.10 * range_m
-                if left_wall_m <= lateral_m <= right_wall_m:
-                    data[
-                        range_index * azimuth_bins + azimuth_index
-                    ] = 212
+        for azimuth_index in range(14, 21):
+            data[3 * azimuth_bins + azimuth_index] = 138
+        for azimuth_index in range(21, 27):
+            data[5 * azimuth_bins + azimuth_index] = 143
     heatmap = RadarHeatmap(
         data=bytes(data),
         range_bins=range_bins,
@@ -398,64 +383,67 @@ def near_wall_edge_fixture(
         heatmap=heatmap,
         frame_number=frame_number,
     )
-    observed_db = tuple(value / 255.0 * 100.0 for value in data)
+    baseline_db = baseline_value / 255.0 * 100.0
     model = RadarClutterModel(
         schema_version=1,
         calibration_id=CALIBRATION_ID,
         profile_id=PROFILE_ID,
-        axes=RadarAxes(),
+        axes=RadarAxes(lateral_sign=-1),
         range_bins=range_bins,
         azimuth_bins=azimuth_bins,
         range_step_m=range_step_m,
         motion_mode="major",
         point_clusters=(),
-        heatmap_median_db=observed_db,
+        heatmap_median_db=(baseline_db,) * len(data),
         heatmap_mad_db=(1.0,) * len(data),
     )
     return frame, model
 
 
 class RadarSceneEstimatorTests(unittest.TestCase):
-    def test_static_32_bin_heatmap_edges_recover_walls_removed_by_clutter_baseline(self):
-        first_frame, model = near_wall_edge_fixture(frame_number=1)
-        estimator = RadarSceneEstimator(RadarAxes(), model)
+    def test_calibrated_nearest_returns_recover_independent_current_layout_surfaces(self):
+        first_frame, model = current_layout_contour_fixture(frame_number=1)
+        estimator = RadarSceneEstimator(RadarAxes(lateral_sign=-1), model)
         estimator.ingest(first_frame, received_at=1.0)
         for frame_number in (2, 3):
-            frame, _ = near_wall_edge_fixture(frame_number=frame_number)
+            frame, _ = current_layout_contour_fixture(
+                frame_number=frame_number
+            )
             estimator.ingest(frame, received_at=1.0 + frame_number * 0.2)
 
         scene = estimator.snapshot(now=1.6)
         self.assertEqual(scene["reflectivity_surface"]["cells"], [])
-        self.assertEqual(scene["reflectivity_boundaries"]["status"], "confirmed")
+        self.assertEqual(scene["reflectivity_corridor"]["status"], "unavailable")
+        self.assertEqual(scene["reflectivity_boundaries"]["status"], "unavailable")
+        contours = scene["reflectivity_contours"]
+        self.assertEqual(contours["status"], "confirmed")
+        self.assertEqual(len(contours["segments"]), 2)
+        headings = sorted(abs(segment["heading_deg"]) for segment in contours["segments"])
+        self.assertGreater(headings[0], 55.0)
+        self.assertGreater(headings[1], 80.0)
+        planning_obstacles = estimator._reflectivity_contour_obstacles(contours)
+        self.assertTrue(planning_obstacles)
         self.assertEqual(
-            [
-                wall["evidence_kind"]
-                for wall in scene["reflectivity_boundaries"]["walls"]
-            ],
-            ["heatmap_edge", "heatmap_edge"],
+            {value["evidence_kind"] for value in planning_obstacles},
+            {"reflectivity_contour"},
         )
-        self.assertEqual(scene["reflectivity_corridor"]["status"], "confirmed")
-        self.assertLess(
-            abs(scene["reflectivity_corridor"]["measured_heading_deg"]),
-            10.0,
-        )
-        self.assertGreater(scene["reflectivity_corridor"]["width_m"], 0.45)
 
-    def test_uniform_32_bin_heatmap_cannot_invent_edge_walls(self):
-        first_frame, model = near_wall_edge_fixture(
+    def test_uniform_32_bin_heatmap_cannot_invent_contours(self):
+        first_frame, model = current_layout_contour_fixture(
             frame_number=1,
             uniform=True,
         )
-        estimator = RadarSceneEstimator(RadarAxes(), model)
+        estimator = RadarSceneEstimator(RadarAxes(lateral_sign=-1), model)
         estimator.ingest(first_frame, received_at=1.0)
         for frame_number in (2, 3, 4, 5):
-            frame, _ = near_wall_edge_fixture(
+            frame, _ = current_layout_contour_fixture(
                 frame_number=frame_number,
                 uniform=True,
             )
             estimator.ingest(frame, received_at=1.0 + frame_number * 0.2)
 
         scene = estimator.snapshot(now=2.0)
+        self.assertEqual(scene["reflectivity_contours"]["status"], "unavailable")
         self.assertEqual(scene["reflectivity_corridor"]["status"], "unavailable")
         self.assertEqual(scene["reflectivity_boundaries"]["status"], "unavailable")
 

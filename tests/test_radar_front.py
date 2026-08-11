@@ -1225,13 +1225,12 @@ class RadarFrontDocumentationTests(unittest.TestCase):
             )
         }
 
-    def test_both_guides_document_the_calibrated_r9_contract(self):
+    def test_both_guides_document_the_calibrated_r54_contract(self):
         for name, docs in self.read_guides().items():
             with self.subTest(name=name):
                 self.assertIn(self.CALIBRATE_COMMAND, docs)
                 self.assertIn(self.VIEWER_COMMAND, docs)
-                self.assertIn("0~3m", docs)
-                self.assertIn("0~50cm", docs)
+                self.assertIn("0~30cm", docs)
                 self.assertIn("10cm", docs)
                 self.assertIn("UNKNOWN", docs)
                 self.assertNotIn("흑백 벽면", docs)
@@ -1351,7 +1350,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260811-static-heatmap-edges-r53",
+                "20260811-calibrated-contours-r54",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1366,11 +1365,11 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
             self.assertIn(
-                "/radar_scene.js?v=20260811-static-heatmap-edges-r53",
+                "/radar_scene.js?v=20260811-calibrated-contours-r54",
                 html,
             )
             self.assertIn(
-                "/radar_panel.js?v=20260811-static-heatmap-edges-r53",
+                "/radar_panel.js?v=20260811-calibrated-contours-r54",
                 html,
             )
             self.assertIn(
@@ -1381,7 +1380,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 '#radar-status[data-status="http_lost"]',
                 html,
             )
-            self.assertIn('id="build-tag">UI R53</span>', html)
+            self.assertIn('id="build-tag">UI R54</span>', html)
             self.assertIn('class="tag">WHITE = STABLE REFLECTIVITY</span>', html)
             self.assertIn('class="tag">CYAN = MEASURED WALLS</span>', html)
             self.assertIn(
@@ -1407,7 +1406,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html,
             )
             self.assertIn(
-                'const UI_BUILD_ID = "20260811-static-heatmap-edges-r53";',
+                'const UI_BUILD_ID = "20260811-calibrated-contours-r54";',
                 javascript,
             )
             self.assertIn(
@@ -1430,7 +1429,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertIn('id="radar-main-canvas"', html)
             self.assertIn('id="collision-canvas"', html)
             self.assertIn('id="pointcloud-3d-canvas"', html)
-            self.assertIn("2.5D FILTERED TRACKS · 0~50cm", html)
+            self.assertIn("2.5D FILTERED TRACKS · 0~30cm", html)
             for height_label in ("BELOW", "SENSOR LEVEL", "ABOVE", "Z UNKNOWN"):
                 self.assertIn(height_label, html)
             self.assertIn('id="heatmap-candidate-value"', html)
@@ -1449,8 +1448,8 @@ class RadarFrontHttpTests(unittest.TestCase):
                 "path-accepted-value",
             ):
                 self.assertIn(f'id="{diagnostic_id}"', html)
-            self.assertIn("반지름 50cm 원형 롤링 지도", html)
-            self.assertIn("0~50cm 충돌 확대", html)
+            self.assertIn("반지름 30cm 근접 주행 지도", html)
+            self.assertIn("0~30cm 충돌 확대", html)
             self.assertIn("UNKNOWN ≠ FREE", html)
             self.assertIn("ROBOT RELATIVE · SHORT MEMORY", html)
             self.assertIn("RAW DEBUG · 표시 전용", html)
@@ -1495,6 +1494,9 @@ class RadarFrontHttpTests(unittest.TestCase):
                 javascript,
             )
             self.assertIn("DANGER_RANGE_M = 0.1", javascript)
+            self.assertIn("MAIN_MAX_RANGE_M = 0.3", javascript)
+            self.assertIn("MAIN_HALF_WIDTH_M = 0.3", javascript)
+            self.assertIn("CLOSE_MAX_RANGE_M = 0.3", javascript)
             self.assertIn("UI_BUILD_ID", javascript)
             self.assertIn("requestFullscreen", javascript)
             for forbidden in (

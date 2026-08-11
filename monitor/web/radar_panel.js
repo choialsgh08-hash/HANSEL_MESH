@@ -1,10 +1,10 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260811-static-heatmap-edges-r53";
-  const MAIN_MAX_RANGE_M = 0.5;
-  const MAIN_HALF_WIDTH_M = 0.5;
-  const CLOSE_MAX_RANGE_M = 0.5;
+  const UI_BUILD_ID = "20260811-calibrated-contours-r54";
+  const MAIN_MAX_RANGE_M = 0.3;
+  const MAIN_HALF_WIDTH_M = 0.3;
+  const CLOSE_MAX_RANGE_M = 0.3;
   const DANGER_RANGE_M = 0.1;
   const TRACK_MAX_AGE_MS = 300;
   const NORMAL_COPY =
@@ -446,17 +446,24 @@
         scene.reflectivitySurface,
         { clipShape: "circle" },
       );
-      this.drawReflectivityBoundaries(
+      this.drawReflectivityContours(
         ctx,
         transform,
-        scene.reflectivityBoundaries,
-        scene.reflectivityCorridor,
+        scene.reflectivityContours,
       );
-      this.drawReflectivityCorridor(
-        ctx,
-        transform,
-        scene.reflectivityCorridor,
-      );
+      if (scene.reflectivityContours?.status !== "confirmed") {
+        this.drawReflectivityBoundaries(
+          ctx,
+          transform,
+          scene.reflectivityBoundaries,
+          scene.reflectivityCorridor,
+        );
+        this.drawReflectivityCorridor(
+          ctx,
+          transform,
+          scene.reflectivityCorridor,
+        );
+      }
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
           clipShape: "circle",
@@ -523,17 +530,24 @@
         scene.reflectivitySurface,
         { clipShape: "radial" },
       );
-      this.drawReflectivityBoundaries(
+      this.drawReflectivityContours(
         ctx,
         transform,
-        scene.reflectivityBoundaries,
-        scene.reflectivityCorridor,
+        scene.reflectivityContours,
       );
-      this.drawReflectivityCorridor(
-        ctx,
-        transform,
-        scene.reflectivityCorridor,
-      );
+      if (scene.reflectivityContours?.status !== "confirmed") {
+        this.drawReflectivityBoundaries(
+          ctx,
+          transform,
+          scene.reflectivityBoundaries,
+          scene.reflectivityCorridor,
+        );
+        this.drawReflectivityCorridor(
+          ctx,
+          transform,
+          scene.reflectivityCorridor,
+        );
+      }
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
           clipShape: "radial",
@@ -631,6 +645,57 @@
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
+    }
+
+    drawReflectivityContours(ctx, transform, contours) {
+      const segments = contours && contours.status === "confirmed" &&
+        Array.isArray(contours.segments) ? contours.segments : [];
+      if (segments.length === 0) return;
+      ctx.save();
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.shadowBlur = 0;
+      for (const segment of segments) {
+        const start = window.HanselRadarScene.projectMapPoint(
+          transform, segment.start[0], segment.start[1],
+        );
+        const end = window.HanselRadarScene.projectMapPoint(
+          transform, segment.end[0], segment.end[1],
+        );
+        const trace = (color, width) => {
+          ctx.beginPath();
+          ctx.moveTo(start.x, start.y);
+          ctx.lineTo(end.x, end.y);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = width;
+          ctx.stroke();
+        };
+        trace("rgba(80, 235, 224, 0.20)", 10);
+        trace("rgba(190, 255, 250, 0.98)", 3.5);
+        for (const point of [start, end]) {
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, 3.2, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(224, 255, 252, 0.98)";
+          ctx.fill();
+        }
+        const midpoint = {
+          x: (start.x + end.x) / 2,
+          y: (start.y + end.y) / 2,
+        };
+        const nearestM = Math.min(
+          Math.hypot(...segment.start),
+          Math.hypot(...segment.end),
+        );
+        ctx.fillStyle = "rgba(220, 255, 252, 0.96)";
+        ctx.font = "800 10px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(
+          `${Math.round(nearestM * 100)}cm · ${Math.round(segment.headingDeg)}°`,
+          midpoint.x,
+          midpoint.y - 8,
+        );
+      }
+      ctx.restore();
     }
 
     drawReflectivityCorridor(ctx, transform, corridor) {
@@ -848,7 +913,7 @@
     }
 
     drawPointCloud25d(ctx, width, height, filteredTracks, rawPoints, showRaw) {
-      const rangeM = 0.50;
+      const rangeM = 0.30;
       const azimuthLimit = Math.PI / 3;
       const tracks = (Array.isArray(filteredTracks) ? filteredTracks : [])
         .filter((track) => {
@@ -862,7 +927,7 @@
             : Math.hypot(forward, lateral);
           return Number.isFinite(forward) && forward > 0 &&
             Number.isFinite(lateral) && Number.isFinite(distance) &&
-            distance >= 0 && distance <= rangeM &&
+            distance >= 0 && distance <= rangeM + 1e-9 &&
             Math.abs(Math.atan2(lateral, forward)) <= azimuthLimit;
         })
         .sort((left, right) => left.distance_m - right.distance_m);
@@ -877,7 +942,7 @@
           .filter((point) => Number.isFinite(point.forward) &&
             point.forward > 0 && Number.isFinite(point.lateral) &&
             Number.isFinite(point.height) &&
-            Math.hypot(point.forward, point.lateral) <= rangeM &&
+            Math.hypot(point.forward, point.lateral) <= rangeM + 1e-9 &&
             Math.abs(Math.atan2(point.lateral, point.forward)) <= azimuthLimit)
         : [];
       const yaw = this.pointCloud3dYaw;
@@ -953,7 +1018,7 @@
           "rgba(92, 228, 208, 0.16)",
         );
       }
-      for (const shell of [0.10, 0.30, 0.50]) {
+      for (const shell of [0.10, 0.20, 0.30]) {
         drawShell(shell);
       }
 
@@ -2028,7 +2093,7 @@
       const memoryElement = document.querySelector("#obstacle-memory-value");
       if (memoryElement) {
         const count = diagnosticValue("rolling_local_map_cell_count");
-        memoryElement.textContent = count === "--" ? "--" : `${count} · IN 50cm`;
+        memoryElement.textContent = count === "--" ? "--" : `${count} · IN 30cm`;
       }
       const stableCellElement = document.querySelector("#stable-cell-value");
       if (stableCellElement) {
@@ -2098,6 +2163,15 @@
         return;
       }
       presentation.tracks.forEach((track) => {
+        const distance = Number.isFinite(track.distance_m)
+          ? track.distance_m
+          : Math.hypot(track.forward_m, track.lateral_m);
+        if (
+          !Number.isFinite(distance) || distance < 0 ||
+          distance > MAIN_MAX_RANGE_M + 1e-9
+        ) {
+          return;
+        }
         const angle =
           (Math.atan2(track.lateral_m, track.forward_m) * 180) / Math.PI;
         if (!Number.isFinite(angle) || angle < -70 || angle > 70) {

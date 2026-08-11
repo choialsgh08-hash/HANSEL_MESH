@@ -226,6 +226,86 @@
     };
   }
 
+  function parseReflectivityContours(scene) {
+    const contours = scene.reflectivity_contours;
+    const invalid = () => {
+      throw new Error("invalid reflectivity contour contract");
+    };
+    if (!isPlainObject(contours) ||
+        !["unavailable", "confirmed"].includes(contours.status) ||
+        contours.method !== "calibrated_nearest_reflection_segments" ||
+        contours.history_frames !== 5 || contours.required_hits !== 3 ||
+        contours.max_range_m !== 0.30 || !Array.isArray(contours.segments)) {
+      return invalid();
+    }
+    if (contours.status === "unavailable") {
+      if (contours.segments.length !== 0) return invalid();
+      return {
+        status: contours.status,
+        method: contours.method,
+        historyFrames: contours.history_frames,
+        requiredHits: contours.required_hits,
+        maxRangeM: contours.max_range_m,
+        segments: [],
+      };
+    }
+    if (contours.segments.length < 1) return invalid();
+    const segments = contours.segments.map((segment, index) => {
+      if (!isPlainObject(segment) ||
+          segment.segment_id !== `contour_${index + 1}` ||
+          segment.evidence_kind !== "calibrated_heatmap_prominence" ||
+          !Number.isInteger(segment.hits) ||
+          segment.hits < contours.required_hits ||
+          segment.hits > contours.history_frames ||
+          !Number.isFinite(segment.confidence) || segment.confidence < 0 ||
+          segment.confidence > 1 ||
+          !Number.isFinite(segment.heading_deg) ||
+          Math.abs(segment.heading_deg) > 90.0 + 1e-9 ||
+          !Number.isInteger(segment.support_cells) ||
+          segment.support_cells < 3 ||
+          !Number.isFinite(segment.span_m) || segment.span_m < 0.030 ||
+          segment.span_m > contours.max_range_m ||
+          !Number.isFinite(segment.mean_prominence_db) ||
+          segment.mean_prominence_db < 2.0 ||
+          !validPointPair(segment.start) || !validPointPair(segment.end) ||
+          segment.start[0] < 0 || segment.end[0] < 0 ||
+          Math.hypot(...segment.start) > contours.max_range_m + 1e-9 ||
+          Math.hypot(...segment.end) > contours.max_range_m + 1e-9) {
+        return invalid();
+      }
+      const deltaForward = segment.end[0] - segment.start[0];
+      const deltaLateral = segment.end[1] - segment.start[1];
+      const endpointSpan = Math.hypot(deltaForward, deltaLateral);
+      const endpointHeading = Math.atan2(
+        deltaLateral, deltaForward,
+      ) * 180 / Math.PI;
+      if (Math.abs(endpointSpan - segment.span_m) > 2e-5 ||
+          Math.abs(endpointHeading - segment.heading_deg) > 5e-4) {
+        return invalid();
+      }
+      return {
+        segmentId: segment.segment_id,
+        evidenceKind: segment.evidence_kind,
+        hits: segment.hits,
+        confidence: segment.confidence,
+        headingDeg: segment.heading_deg,
+        supportCells: segment.support_cells,
+        spanM: segment.span_m,
+        meanProminenceDb: segment.mean_prominence_db,
+        start: [...segment.start],
+        end: [...segment.end],
+      };
+    });
+    return {
+      status: contours.status,
+      method: contours.method,
+      historyFrames: contours.history_frames,
+      requiredHits: contours.required_hits,
+      maxRangeM: contours.max_range_m,
+      segments,
+    };
+  }
+
   function parseReflectivityCorridor(scene) {
     const corridor = scene.reflectivity_corridor;
     const invalid = () => {
@@ -420,13 +500,11 @@
     const walls = boundaries.walls.map((wall) => {
       const pointEvidence = wall?.evidence_kind === "point";
       const heatmapEvidence = wall?.evidence_kind === "heatmap";
-      const heatmapEdgeEvidence = wall?.evidence_kind === "heatmap_edge";
-      const minimumSupport = (pointEvidence || heatmapEdgeEvidence) ? 3 : 5;
-      const minimumSpanM = (pointEvidence || heatmapEdgeEvidence) ? 0.10 : 0.18;
-      const minimumIntensity = pointEvidence ? 0.50 :
-        (heatmapEdgeEvidence ? 0.30 : 0.90);
+      const minimumSupport = pointEvidence ? 3 : 5;
+      const minimumSpanM = pointEvidence ? 0.10 : 0.18;
+      const minimumIntensity = pointEvidence ? 0.50 : 0.90;
       if (!isPlainObject(wall) ||
-          (!pointEvidence && !heatmapEvidence && !heatmapEdgeEvidence) ||
+          (!pointEvidence && !heatmapEvidence) ||
           !["left", "right"].includes(wall.side) ||
           wall.wall_id !== `boundary_${wall.side}` ||
           !Number.isInteger(wall.hits) ||
@@ -742,6 +820,8 @@
       ? parseReflectivityCorridor(scene) : null;
     const reflectivityBoundaries = hasProbabilityMap
       ? parseReflectivityBoundaries(scene) : null;
+    const reflectivityContours = hasProbabilityMap
+      ? parseReflectivityContours(scene) : null;
     const groundFilter = parseGroundFilter(scene.ground_filter, hasProbabilityMap);
     const diagnostics = parseDiagnostics(scene.diagnostics, hasProbabilityMap);
     const plannedPath = hasProbabilityMap
@@ -845,6 +925,7 @@
       reflectivitySurface,
       reflectivityCorridor,
       reflectivityBoundaries,
+      reflectivityContours,
       groundFilter,
       filteredTracks: deepClone(filteredTracks),
       tracks: deepClone(tracks),

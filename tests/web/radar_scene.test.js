@@ -206,6 +206,33 @@ function makeUnavailableReflectivityBoundaries() {
   };
 }
 
+function makeReflectivityContours(overrides = {}) {
+  return {
+    status: "confirmed",
+    method: "calibrated_nearest_reflection_segments",
+    history_frames: 5,
+    required_hits: 3,
+    max_range_m: 0.30,
+    segments: [{
+      segment_id: "contour_1",
+      evidence_kind: "calibrated_heatmap_prominence",
+      hits: 3,
+      confidence: 0.72,
+      heading_deg: 90.0,
+      support_cells: 7,
+      span_m: 0.08,
+      mean_prominence_db: 4.0,
+      start: [0.18, -0.04],
+      end: [0.18, 0.04],
+    }],
+    ...overrides,
+  };
+}
+
+function makeUnavailableReflectivityContours() {
+  return makeReflectivityContours({ status: "unavailable", segments: [] });
+}
+
 function makeSnapshot(overrides = {}) {
   const grid = makeGrid(60, 60).payload;
   const diagnostics = Object.fromEntries(
@@ -243,6 +270,7 @@ function makeSnapshot(overrides = {}) {
       },
       reflectivity_corridor: makeReflectivityCorridor(),
       reflectivity_boundaries: makeReflectivityBoundaries(),
+      reflectivity_contours: makeReflectivityContours(),
       probabilistic_local_map: {
         radius_m: 0.50,
         resolution_m: 0.05,
@@ -299,6 +327,7 @@ function makeLegacySnapshot(overrides = {}) {
   delete snapshot.scene.ground_filter;
   delete snapshot.scene.reflectivity_corridor;
   delete snapshot.scene.reflectivity_boundaries;
+  delete snapshot.scene.reflectivity_contours;
   snapshot.scene.pose_mode = "robot_relative";
   for (const key of ADDITIVE_DIAGNOSTIC_KEYS) {
     delete snapshot.scene.diagnostics[key];
@@ -410,6 +439,69 @@ test("validates and detaches the display-only reflectivity surface", () => {
   assert.equal(parsed.reflectivitySurface.cells[0].intensity, 0.9);
 });
 
+test("validates and detaches arbitrary calibrated contour segments", () => {
+  const snapshot = makeSnapshot();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivityContours, {
+    status: "confirmed",
+    method: "calibrated_nearest_reflection_segments",
+    historyFrames: 5,
+    requiredHits: 3,
+    maxRangeM: 0.30,
+    segments: [{
+      segmentId: "contour_1",
+      evidenceKind: "calibrated_heatmap_prominence",
+      hits: 3,
+      confidence: 0.72,
+      headingDeg: 90.0,
+      supportCells: 7,
+      spanM: 0.08,
+      meanProminenceDb: 4.0,
+      start: [0.18, -0.04],
+      end: [0.18, 0.04],
+    }],
+  });
+  snapshot.scene.reflectivity_contours.segments[0].start[0] = 9.0;
+  assert.equal(parsed.reflectivityContours.segments[0].start[0], 0.18);
+});
+
+test("accepts only canonical unavailable calibrated contours", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_contours = makeUnavailableReflectivityContours();
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.reflectivityContours.status, "unavailable");
+  assert.deepEqual(parsed.reflectivityContours.segments, []);
+
+  snapshot.scene.reflectivity_contours.segments = [
+    makeReflectivityContours().segments[0],
+  ];
+  assert.throws(
+    () => sceneApi.parseRadarScene(snapshot),
+    /reflectivity contour contract/,
+  );
+});
+
+test("rejects malformed calibrated contour geometry", () => {
+  const mutations = [
+    (value) => { value.method = "corridor"; },
+    (value) => { value.max_range_m = 0.50; },
+    (value) => { value.segments[0].support_cells = 2; },
+    (value) => { value.segments[0].confidence = Infinity; },
+    (value) => { value.segments[0].start = [0.31, 0.0]; },
+    (value) => { value.segments[0].span_m = 0.12; },
+  ];
+  for (const mutate of mutations) {
+    const snapshot = makeSnapshot();
+    mutate(snapshot.scene.reflectivity_contours);
+    assert.throws(
+      () => sceneApi.parseRadarScene(snapshot),
+      /reflectivity contour contract/,
+    );
+  }
+});
+
 test("validates and detaches one confirmed independent boundary", () => {
   const snapshot = makeSnapshot();
 
@@ -470,30 +562,6 @@ test("accepts a measured short point-backed boundary", () => {
   assert.equal(wall.evidenceKind, "point");
   assert.equal(wall.supportCells, 3);
   assert.equal(wall.meanIntensity, 0.569444);
-});
-
-test("accepts a temporally confirmed native heatmap edge boundary", () => {
-  const snapshot = makeSnapshot();
-  snapshot.scene.reflectivity_boundaries.walls = [{
-    wall_id: "boundary_left",
-    evidence_kind: "heatmap_edge",
-    side: "left",
-    hits: 3,
-    confidence: 0.75875,
-    heading_deg: -5.710593,
-    normal_offset_m: -0.208958,
-    support_cells: 4,
-    span_m: 0.301496,
-    mean_intensity: 0.825,
-    start: [0.2, -0.23],
-    end: [0.5, -0.26],
-  }];
-
-  const wall = sceneApi.parseRadarScene(snapshot)
-    .reflectivityBoundaries.walls[0];
-
-  assert.equal(wall.evidenceKind, "heatmap_edge");
-  assert.equal(wall.supportCells, 4);
 });
 
 test("rejects malformed independent boundary contracts", async (t) => {

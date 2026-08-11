@@ -449,6 +449,14 @@ function livePresentationWithProbabilityMap() {
         end: [0.475, 0.134483],
       }],
     },
+    reflectivityContours: {
+      status: "unavailable",
+      method: "calibrated_nearest_reflection_segments",
+      historyFrames: 5,
+      requiredHits: 3,
+      maxRangeM: 0.30,
+      segments: [],
+    },
     probabilisticLocalMap: {
       sourceField: "probabilistic_local_map",
       radiusM: 0.50,
@@ -546,34 +554,34 @@ test("sensor fault bypasses and clears the transient scene hold", () => {
   assert.equal(panel.presentation.reason, "invalid_scene");
 });
 
-test("main rolling-map transform keeps the radar at circle center", () => {
+test("main thirty-centimeter transform keeps the radar at circle center", () => {
   const harness = makeHarness();
   const transform = harness.panel.makeCircularViewportTransform(
     600,
     500,
-    0.5,
+    0.3,
     { top: 50, right: 25, bottom: 50, left: 25 },
   );
 
   assert.equal(transform.originX, 300);
   assert.equal(transform.originY, 250);
-  assert.equal(transform.scale, 400);
+  assert.ok(Math.abs(transform.scale - 666.6666666666667) < 1e-9);
   assert.equal(transform.centeredCircle, true);
 });
 
-test("2.5d point cloud uses filtered height and filters beyond fifty centimeters", () => {
+test("2.5d point cloud uses filtered height and filters beyond thirty centimeters", () => {
   const { panel, contexts } = makeHarness();
   const context = contexts[2];
 
   panel.drawPointCloud25d(context, 360, 260, [
     { source: "point", classification: "confirmed_obstacle",
-      point_confirmed: true, forward_m: 0.30, lateral_m: 0.10,
-      distance_m: 0.316, height_m: 0.10, height_band: "sensor_level",
+      point_confirmed: true, forward_m: 0.28, lateral_m: 0.05,
+      distance_m: 0.284, height_m: 0.10, height_band: "sensor_level",
       height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
       age_ms: 0 },
     { source: "point", classification: "confirmed_obstacle",
-      point_confirmed: true, forward_m: 0.60, lateral_m: 0,
-      distance_m: 0.60, height_m: 0, height_band: "sensor_level",
+      point_confirmed: true, forward_m: 0.31, lateral_m: 0,
+      distance_m: 0.31, height_m: 0, height_band: "sensor_level",
       height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
       age_ms: 0 },
   ], [], false);
@@ -661,7 +669,7 @@ test("null probability map preserves both legacy layers in both map views", () =
   assert.equal(legacyCircleCalls, 2);
 });
 
-test("both map views invoke reflectivity boundary corridor probability and robot-footprint renderers", () => {
+test("both map views invoke contour legacy probability and robot-footprint renderers", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -673,10 +681,12 @@ test("both map views invoke reflectivity boundary corridor probability and robot
   let reflectivityCalls = 0;
   let boundaryCalls = 0;
   let corridorCalls = 0;
+  let contourCalls = 0;
   let footprintCalls = 0;
   panel.drawReflectivitySurface = () => { reflectivityCalls += 1; };
   panel.drawReflectivityBoundaries = () => { boundaryCalls += 1; };
   panel.drawReflectivityCorridor = () => { corridorCalls += 1; };
+  panel.drawReflectivityContours = () => { contourCalls += 1; };
   panel.drawProbabilisticLocalMap = () => { probabilityCalls += 1; };
   panel.drawRobotFootprint = () => { footprintCalls += 1; };
   panel.drawLidarTopView(contexts[0], transform, presentation);
@@ -684,11 +694,12 @@ test("both map views invoke reflectivity boundary corridor probability and robot
   assert.equal(reflectivityCalls, 2);
   assert.equal(boundaryCalls, 2);
   assert.equal(corridorCalls, 2);
+  assert.equal(contourCalls, 2);
   assert.equal(probabilityCalls, 2);
   assert.equal(footprintCalls, 2);
 });
 
-test("both map views draw surface boundary corridor probability path then every track layer", () => {
+test("both map views draw surface contour legacy probability path then every track layer", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -697,15 +708,16 @@ test("both map views draw surface boundary corridor probability path then every 
     halfWidthM: 0.5, centeredCircle: true,
   };
   for (const [context, expected, render] of [
-    [contexts[0], ["reflectivity", "boundary", "corridor", "probability", "path", "tracks", "tracks"],
+    [contexts[0], ["reflectivity", "contour", "boundary", "corridor", "probability", "path", "tracks", "tracks"],
       () => panel.drawLidarTopView(contexts[0], transform, presentation)],
-    [contexts[1], ["reflectivity", "boundary", "corridor", "probability", "path", "tracks"],
+    [contexts[1], ["reflectivity", "contour", "boundary", "corridor", "probability", "path", "tracks"],
       () => panel.drawCollisionInset(contexts[1], transform, presentation)],
   ]) {
     const order = [];
     panel.drawReflectivitySurface = () => { order.push("reflectivity"); };
     panel.drawReflectivityBoundaries = () => { order.push("boundary"); };
     panel.drawReflectivityCorridor = () => { order.push("corridor"); };
+    panel.drawReflectivityContours = () => { order.push("contour"); };
     panel.drawProbabilisticLocalMap = () => { order.push("probability"); };
     panel.drawPlannedPath = () => { order.push("path"); };
     panel.drawTracks = () => { order.push("tracks"); };
@@ -713,6 +725,36 @@ test("both map views draw surface boundary corridor probability path then every 
     assert.deepEqual(order, expected);
     assert.ok(context);
   }
+});
+
+test("confirmed arbitrary contours replace the forced corridor wall layers", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.reflectivityContours = {
+    ...presentation.reflectivityContours,
+    status: "confirmed",
+    segments: [{
+      segmentId: "contour_1", confidence: 0.8, headingDeg: 90,
+      supportCells: 7, spanM: 0.08, meanProminenceDb: 4,
+      start: [0.18, -0.04], end: [0.18, 0.04],
+    }],
+  };
+  const transform = {
+    originX: 250, originY: 250, scale: 500,
+    width: 500, height: 500, forwardMaxM: 0.3,
+    halfWidthM: 0.3, centeredCircle: true,
+  };
+  let contourCalls = 0;
+  let legacyCalls = 0;
+  panel.drawReflectivityContours = () => { contourCalls += 1; };
+  panel.drawReflectivityBoundaries = () => { legacyCalls += 1; };
+  panel.drawReflectivityCorridor = () => { legacyCalls += 1; };
+
+  panel.drawLidarTopView(contexts[0], transform, presentation);
+  panel.drawCollisionInset(contexts[1], transform, presentation);
+
+  assert.equal(contourCalls, 2);
+  assert.equal(legacyCalls, 0);
 });
 
 test("confirmed single boundary draws the measured right wall without inventing its pair", () => {
@@ -960,20 +1002,20 @@ test("2.5d view renders filtered height bands and unknown heatmap height", () =>
   const { panel, contexts } = makeHarness();
   const context = contexts[2];
   panel.drawPointCloud25d(context, 420, 300, [
-    { source: "point", classification: "confirmed_obstacle", forward_m: 0.30,
-      lateral_m: 0.05, distance_m: 0.304, height_m: 0.12,
+    { source: "point", classification: "confirmed_obstacle", forward_m: 0.25,
+      lateral_m: 0.05, distance_m: 0.255, height_m: 0.12,
       height_band: "above_sensor",
       height_reference: "sensor_relative_uncalibrated",
       confidence: 0.8, age_ms: 0 },
     { source: "heatmap", classification: "confirmed_obstacle",
-      heatmap_confirmed: true, forward_m: 0.35,
-      lateral_m: -0.05, distance_m: 0.354, height_m: null,
+      heatmap_confirmed: true, forward_m: 0.28,
+      lateral_m: -0.05, distance_m: 0.284, height_m: null,
       height_band: "unknown", height_reference: "unavailable",
       confidence: 0.5, age_ms: 0 },
   ], [], false);
   assert.ok(context.fillTextCalls.some(([text]) => String(text).includes("FILTERED 2")));
   assert.ok(context.fillTextCalls.some(([text]) => String(text).includes("Z UNKNOWN")));
-  assert.ok(context.fillTextCalls.some(([text]) => String(text).includes("0.30m")));
+  assert.ok(context.fillTextCalls.some(([text]) => String(text).includes("0.26m")));
 });
 
 test("full draw never evaluates frame points while raw debug is off", () => {
@@ -1176,46 +1218,64 @@ test("stopped view does not draw an untraversable opening as a route", () => {
   ), false);
 });
 
-test("collision inset includes fifty centimeters and excludes fifty-one", () => {
+test("collision inset includes thirty centimeters and excludes thirty-one", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   presentation.tracks = [
     { source: "point", point_confirmed: true, classification: "confirmed_obstacle",
-      age_ms: 0, distance_m: 0.50, forward_m: 0.50, lateral_m: 0,
+      age_ms: 0, distance_m: 0.30, forward_m: 0.30, lateral_m: 0,
       height_m: 0, height_band: "sensor_level" },
     { source: "point", point_confirmed: true, classification: "confirmed_obstacle",
-      age_ms: 0, distance_m: 0.51, forward_m: 0.51, lateral_m: 0,
+      age_ms: 0, distance_m: 0.31, forward_m: 0.31, lateral_m: 0,
       height_m: 0, height_band: "sensor_level" },
   ];
   panel.presentation = presentation;
   panel.draw();
   const labels = contexts[1].fillTextCalls.map(([text]) => String(text));
-  assert.ok(labels.includes("P 50cm"));
-  assert.equal(labels.includes("P 51cm"), false);
+  assert.ok(labels.includes("P 30cm"));
+  assert.equal(labels.includes("P 31cm"), false);
 });
 
-test("collision nearest distance excludes evidence beyond fifty centimeters", () => {
+test("collision nearest distance excludes evidence beyond thirty centimeters", () => {
   const { panel, elements } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   presentation.tracks = [{
     source: "point", point_confirmed: true, classification: "confirmed_obstacle",
-    age_ms: 0, distance_m: 0.51, forward_m: 0.51, lateral_m: 0,
+    age_ms: 0, distance_m: 0.31, forward_m: 0.31, lateral_m: 0,
     height_m: 0, height_band: "sensor_level",
   }];
   panel.updateText(presentation);
   assert.equal(elements.get("#collision-distance").textContent, "-- cm");
 
-  presentation.tracks[0].distance_m = 0.50;
-  presentation.tracks[0].forward_m = 0.50;
+  presentation.tracks[0].distance_m = 0.30;
+  presentation.tracks[0].forward_m = 0.30;
   panel.updateText(presentation);
-  assert.equal(elements.get("#collision-distance").textContent, "50 cm");
+  assert.equal(elements.get("#collision-distance").textContent, "30 cm");
 });
 
-test("2.5d view excludes tracks beyond fifty centimeters or sixty degrees", () => {
+test("main-view sectors exclude evidence beyond thirty centimeters", () => {
+  const { panel, elements } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.tracks = [{
+    source: "point", point_confirmed: true, classification: "confirmed_obstacle",
+    age_ms: 0, distance_m: 0.31, forward_m: 0.31, lateral_m: 0,
+    height_m: 0, height_band: "sensor_level",
+  }];
+
+  panel.updateSectors(presentation);
+  assert.equal(elements.get("#sector-2").querySelector("span").textContent, "UNKNOWN");
+
+  presentation.tracks[0].distance_m = 0.30;
+  presentation.tracks[0].forward_m = 0.30;
+  panel.updateSectors(presentation);
+  assert.match(elements.get("#sector-2").querySelector("span").textContent, /30cm/);
+});
+
+test("2.5d view excludes tracks beyond thirty centimeters or sixty degrees", () => {
   const { panel, contexts } = makeHarness();
   panel.drawPointCloud25d(contexts[2], 420, 300, [
     { source: "point", classification: "confirmed_obstacle",
-      forward_m: 0.51, lateral_m: 0, distance_m: 0.51, height_m: 0,
+      forward_m: 0.31, lateral_m: 0, distance_m: 0.31, height_m: 0,
       height_band: "sensor_level",
       height_reference: "sensor_relative_uncalibrated", confidence: 0.8,
       age_ms: 0 },
@@ -1238,12 +1298,12 @@ test("2.5d markers distinguish confirmed tentative heatmap and raw geometry", ()
       distance_m: 0.204, height_m: 0.0, height_band: "sensor_level",
       height_reference: "sensor_relative_uncalibrated", confidence: 0.9, age_ms: 0 },
     { source: "point", classification: "point_candidate",
-      point_confirmed: false, forward_m: 0.30, lateral_m: 0.04,
-      distance_m: 0.303, height_m: 0.12, height_band: "above_sensor",
+      point_confirmed: false, forward_m: 0.22, lateral_m: 0.04,
+      distance_m: 0.224, height_m: 0.12, height_band: "above_sensor",
       height_reference: "sensor_relative_uncalibrated", confidence: 0.6, age_ms: 0 },
     { source: "heatmap", classification: "confirmed_obstacle",
-      heatmap_confirmed: true, forward_m: 0.40, lateral_m: 0.0,
-      distance_m: 0.40, height_m: null, height_band: "unknown",
+      heatmap_confirmed: true, forward_m: 0.27, lateral_m: 0.0,
+      distance_m: 0.27, height_m: null, height_band: "unknown",
       height_reference: "unavailable", confidence: 0.5, age_ms: 0 },
     { source: "point", classification: "confirmed_obstacle",
       point_confirmed: true, forward_m: 0.25, lateral_m: 0.0,
@@ -1275,7 +1335,7 @@ test("2.5d markers distinguish confirmed tentative heatmap and raw geometry", ()
     ([text]) => String(text).includes("RAW DEBUG 1"),
   ));
   assert.equal(contexts[2].shadowBlur, 0);
-  for (const label of ["10cm", "30cm", "50cm"]) {
+  for (const label of ["10cm", "20cm", "30cm"]) {
     assert.ok(contexts[2].fillTextCalls.some(
       ([text]) => String(text).includes(label),
     ));
