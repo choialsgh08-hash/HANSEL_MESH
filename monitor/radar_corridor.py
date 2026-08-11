@@ -1,4 +1,5 @@
 import math
+import itertools
 import statistics
 from collections import deque
 from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -25,6 +26,20 @@ INDEPENDENT_MIN_LOCAL_CONTRAST = 0.05
 BOUNDARY_ONLY_MIN_MEAN_INTENSITY = 0.90
 BOUNDARY_ONLY_MIN_CELL_INTENSITY = 0.90
 BOUNDARY_ONLY_MIN_ENVELOPE_RATIO = 0.80
+POINT_BOUNDARY_MIN_SUPPORT = 3
+POINT_BOUNDARY_MIN_SPAN_M = 0.10
+POINT_BOUNDARY_MAX_SUPPORT_GAP_M = 0.18
+POINT_BOUNDARY_MIN_MEAN_INTENSITY = 0.50
+POINT_BOUNDARY_MAX_LINE_RESIDUAL_M = 0.03
+EDGE_BOUNDARY_MIN_SUPPORT = 3
+EDGE_BOUNDARY_MIN_SPAN_M = 0.10
+EDGE_BOUNDARY_MAX_LINE_RESIDUAL_M = 0.024
+EDGE_BOUNDARY_MIN_NORMAL_OFFSET_M = 0.14
+EDGE_BOUNDARY_MAX_HEADING_DEG = 45.0
+EDGE_BOUNDARY_MAX_ROW_GAP = 1
+EDGE_PAIR_MIN_OVERLAP_M = 0.10
+EDGE_PAIR_PARALLEL_WIDTH_DELTA_M = 0.05
+EDGE_PAIR_EQUIVALENT_HEADING_DEG = 3.0
 BOUNDARY_PROMINENCE_BAND_M = LINE_TOLERANCE_M + 0.010
 MIN_BOUNDARY_PROMINENCE = 0.55
 CONVERGING_MIN_ROWS = 4
@@ -48,6 +63,7 @@ METHOD = "deterministic_boundary_fit"
 
 
 Point = Tuple[float, float, float]
+EdgePoint = Tuple[float, float, float, int]
 
 
 def _median(values: Sequence[float]) -> float:
@@ -105,6 +121,7 @@ class ReflectivityCorridorEstimator:
         elapsed_frame_windows: int = 1,
         *,
         point_observations: Sequence[Mapping[str, object]] = (),
+        edge_observations: Sequence[Mapping[str, object]] = (),
     ) -> None:
         if (
             isinstance(elapsed_frame_windows, bool)
@@ -116,9 +133,36 @@ class ReflectivityCorridorEstimator:
         for _ in range(min(self._history_frames, elapsed_frame_windows) - 1):
             self._history.append(None)
             self._boundary_history.append(())
-        self._history.append(self._fit_pair(cells, point_observations))
+        edge_points = self._edge_points(edge_observations)
+        edge_pair = self._fit_edge_pair(edge_points)
+        self._history.append(
+            self._fit_pair(cells, point_observations) or edge_pair
+        )
+        point_boundaries = self._independent_point_boundary_candidates(
+            self._points(point_observations)
+        )
+        point_sides = {wall["side"] for wall in point_boundaries}
+        edge_boundaries = []
+        if edge_pair is not None:
+            for side, wall in zip(("left", "right"), edge_pair["walls"]):
+                if side not in point_sides:
+                    edge_boundaries.append({
+                        **wall,
+                        "side": side,
+                        "evidence_kind": "heatmap_edge",
+                    })
+        represented_sides = point_sides | {
+            wall["side"] for wall in edge_boundaries
+        }
+        heatmap_boundaries = [
+            wall
+            for wall in self._independent_boundary_candidates(
+                self._points(cells)
+            )
+            if wall["side"] not in represented_sides
+        ]
         self._boundary_history.append(tuple(
-            self._independent_boundary_candidates(self._points(cells))
+            point_boundaries + edge_boundaries + heatmap_boundaries
         ))
 
     def boundaries_payload(self) -> Dict[str, object]:
@@ -175,6 +219,7 @@ class ReflectivityCorridorEstimator:
     ) -> bool:
         return (
             left["side"] == right["side"]
+            and left["evidence_kind"] == right["evidence_kind"]
             and abs(
                 float(left["heading_deg"])
                 - float(right["heading_deg"])
@@ -220,6 +265,7 @@ class ReflectivityCorridorEstimator:
         )
         return {
             "wall_id": f"boundary_{side}",
+            "evidence_kind": str(cluster[0]["evidence_kind"]),
             "side": side,
             "hits": hits,
             "confidence": _rounded(confidence),
@@ -470,6 +516,230 @@ class ReflectivityCorridorEstimator:
             if existing is None or intensity > existing[2]:
                 unique[key] = (forward, lateral, intensity)
         return sorted(unique.values())
+
+    @staticmethod
+    def _edge_points(
+        observations: Sequence[Mapping[str, object]],
+    ) -> List[EdgePoint]:
+        unique: Dict[Tuple[int, float, float], EdgePoint] = {}
+        for observation in observations:
+            if not isinstance(observation, Mapping):
+                continue
+            try:
+                forward = float(observation["forward_m"])
+                lateral = float(observation["lateral_m"])
+                intensity = float(observation["intensity"])
+                range_index = observation["range_index"]
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if (
+                isinstance(range_index, bool)
+                or not isinstance(range_index, int)
+                or range_index < 0
+                or not math.isfinite(forward)
+                or not math.isfinite(lateral)
+                or not math.isfinite(intensity)
+                or forward < 0.0
+                or intensity < MIN_CELL_INTENSITY
+                or intensity > 1.0
+            ):
+                continue
+            key = (range_index, forward, lateral)
+            existing = unique.get(key)
+            if existing is None or intensity > existing[2]:
+                unique[key] = (
+                    forward,
+                    lateral,
+                    intensity,
+                    range_index,
+                )
+        return sorted(unique.values(), key=lambda point: (
+            point[3], point[0], point[1], -point[2]
+        ))
+
+    @classmethod
+    def _edge_wall_candidates(
+        cls,
+        points: Sequence[EdgePoint],
+        sign: float,
+    ) -> List[Dict[str, object]]:
+        side_points = [point for point in points if sign * point[1] > 0.03]
+        if len({point[3] for point in side_points}) < EDGE_BOUNDARY_MIN_SUPPORT:
+            return []
+        candidates: List[Dict[str, object]] = []
+        seen_support = set()
+        for first, last in itertools.combinations(side_points, 2):
+            if first[3] == last[3]:
+                continue
+            forward_delta = last[0] - first[0]
+            if abs(forward_delta) < 0.07:
+                continue
+            slope = (last[1] - first[1]) / forward_delta
+            heading_deg = math.degrees(math.atan(slope))
+            if abs(heading_deg) > EDGE_BOUNDARY_MAX_HEADING_DEG:
+                continue
+            intercept = first[1] - slope * first[0]
+            distance_scale = math.sqrt(1.0 + slope * slope)
+            if sign * intercept / distance_scale < (
+                EDGE_BOUNDARY_MIN_NORMAL_OFFSET_M
+            ):
+                continue
+            support: List[EdgePoint] = []
+            for range_index in sorted({point[3] for point in side_points}):
+                row = [
+                    point for point in side_points
+                    if point[3] == range_index
+                    and abs(
+                        point[1] - (intercept + slope * point[0])
+                    ) / distance_scale
+                    <= EDGE_BOUNDARY_MAX_LINE_RESIDUAL_M + 1e-12
+                ]
+                if row:
+                    support.append(min(row, key=lambda point: (
+                        abs(
+                            point[1] - (intercept + slope * point[0])
+                        ),
+                        -point[2],
+                    )))
+            if len(support) < EDGE_BOUNDARY_MIN_SUPPORT:
+                continue
+            if any(
+                right[3] - left[3] > EDGE_BOUNDARY_MAX_ROW_GAP
+                for left, right in zip(support, support[1:])
+            ):
+                continue
+            support_key = tuple(
+                (point[3], point[0], point[1]) for point in support
+            )
+            if support_key in seen_support:
+                continue
+            seen_support.add(support_key)
+            wall = cls._independent_wall_payload([
+                (point[0], point[1], point[2]) for point in support
+            ])
+            if (
+                float(wall["span_m"]) < EDGE_BOUNDARY_MIN_SPAN_M
+                or float(wall["max_residual_m"])
+                > EDGE_BOUNDARY_MAX_LINE_RESIDUAL_M
+                or sign * float(wall["normal_offset_m"])
+                < EDGE_BOUNDARY_MIN_NORMAL_OFFSET_M
+                or abs(float(wall["heading_deg"]))
+                > EDGE_BOUNDARY_MAX_HEADING_DEG
+            ):
+                continue
+            candidates.append(wall)
+        return candidates
+
+    @classmethod
+    def _fit_edge_pair(
+        cls,
+        points: Sequence[EdgePoint],
+    ) -> Optional[Dict[str, object]]:
+        left_candidates = cls._edge_wall_candidates(points, -1.0)
+        right_candidates = cls._edge_wall_candidates(points, 1.0)
+        pairs: List[Tuple[Tuple[object, ...], Dict[str, object]]] = []
+        for left in left_candidates:
+            for right in right_candidates:
+                heading_delta = abs(
+                    float(left["heading_deg"])
+                    - float(right["heading_deg"])
+                )
+                if heading_delta > COMPATIBLE_WALL_HEADING_DEG:
+                    continue
+                overlap_start = max(
+                    float(left["start"][0]),
+                    float(right["start"][0]),
+                )
+                overlap_end = min(
+                    float(left["end"][0]),
+                    float(right["end"][0]),
+                )
+                if overlap_end - overlap_start < EDGE_PAIR_MIN_OVERLAP_M:
+                    continue
+                start_width = (
+                    cls._wall_lateral_at(right, overlap_start)
+                    - cls._wall_lateral_at(left, overlap_start)
+                )
+                end_width = (
+                    cls._wall_lateral_at(right, overlap_end)
+                    - cls._wall_lateral_at(left, overlap_end)
+                )
+                if not (
+                    MIN_CORRIDOR_WIDTH_M
+                    <= min(start_width, end_width)
+                    <= max(start_width, end_width)
+                    <= MAX_CORRIDOR_WIDTH_M
+                ):
+                    continue
+                if abs(start_width - end_width) <= (
+                    EDGE_PAIR_PARALLEL_WIDTH_DELTA_M
+                ):
+                    geometry = "parallel"
+                    width = (
+                        abs(float(right["normal_offset_m"])
+                            - float(left["normal_offset_m"]))
+                    )
+                elif (
+                    start_width - end_width
+                    >= CONVERGING_MIN_WIDTH_REDUCTION_M
+                ):
+                    geometry = "converging"
+                    width = end_width
+                else:
+                    continue
+                near_center_lateral = (
+                    cls._wall_lateral_at(left, overlap_start)
+                    + cls._wall_lateral_at(right, overlap_start)
+                ) / 2.0
+                far_center_lateral = (
+                    cls._wall_lateral_at(left, overlap_end)
+                    + cls._wall_lateral_at(right, overlap_end)
+                ) / 2.0
+                measured_heading = math.degrees(math.atan2(
+                    far_center_lateral - near_center_lateral,
+                    overlap_end - overlap_start,
+                ))
+                support_total = int(left["support_cells"]) + int(
+                    right["support_cells"]
+                )
+                mean_intensity = (
+                    float(left["mean_intensity"])
+                    + float(right["mean_intensity"])
+                ) / 2.0
+                minimum_span = min(
+                    float(left["span_m"]),
+                    float(right["span_m"]),
+                )
+                confidence = min(
+                    0.85,
+                    min(1.0, support_total / 8.0) * 0.35
+                    + min(1.0, minimum_span / 0.25) * 0.25
+                    + mean_intensity * 0.30
+                    + max(0.0, 1.0 - heading_delta / 10.0) * 0.10,
+                )
+                heading_bucket = (
+                    0.0
+                    if heading_delta <= EDGE_PAIR_EQUIVALENT_HEADING_DEG
+                    else heading_delta
+                )
+                pair_key = (
+                    heading_bucket,
+                    -support_total,
+                    -mean_intensity,
+                    -minimum_span,
+                    -width,
+                    float(left["max_residual_m"])
+                    + float(right["max_residual_m"]),
+                    abs(measured_heading),
+                )
+                pairs.append((pair_key, {
+                    "geometry": geometry,
+                    "measured_heading_deg": measured_heading,
+                    "width_m": width,
+                    "confidence": confidence,
+                    "walls": [left, right],
+                }))
+        return min(pairs, key=lambda value: value[0])[1] if pairs else None
 
     @classmethod
     def _fit_pair(
@@ -804,9 +1074,98 @@ class ReflectivityCorridorEstimator:
                     < BOUNDARY_ONLY_MIN_ENVELOPE_RATIO
                 ):
                     continue
-                eligible.append({**wall, "side": side})
+                eligible.append({
+                    **wall,
+                    "side": side,
+                    "evidence_kind": "heatmap",
+                })
             if eligible:
                 boundaries.append(eligible[0])
+        return boundaries
+
+    @classmethod
+    def _independent_point_boundary_candidates(
+        cls,
+        point_observations: Sequence[Point],
+    ) -> List[Dict[str, object]]:
+        """Fit display-only short walls from current CFAR returns.
+
+        Near vertical surfaces can carry an aliased elevation and be removed
+        by the ground classifier even though their range/azimuth is useful in
+        the top view.  This path intentionally consumes the current 2-D point
+        evidence before that classifier, but still requires three collinear
+        returns and the normal three-of-five temporal confirmation.
+        """
+        boundaries: List[Dict[str, object]] = []
+        for side, sign in (("left", -1.0), ("right", 1.0)):
+            points = sorted(
+                point
+                for point in point_observations
+                if sign * point[1] > CONVERGING_MIN_SIDE_CLEARANCE_M
+            )
+            if len(points) < POINT_BOUNDARY_MIN_SUPPORT:
+                continue
+            candidates: List[Dict[str, object]] = []
+            seen_support = set()
+            for first_index in range(len(points) - 1):
+                for last_index in range(first_index + 1, len(points)):
+                    first = points[first_index]
+                    last = points[last_index]
+                    forward_delta = last[0] - first[0]
+                    if abs(forward_delta) <= 1e-9:
+                        continue
+                    seed_slope = (last[1] - first[1]) / forward_delta
+                    if abs(math.degrees(math.atan(seed_slope))) > (
+                        MAX_ABS_WALL_HEADING_DEG
+                    ):
+                        continue
+                    support_indices = cls._robust_line_support(
+                        points,
+                        (first_index, last_index),
+                        seed_slope=seed_slope,
+                    )
+                    if len(support_indices) < POINT_BOUNDARY_MIN_SUPPORT:
+                        continue
+                    support_indices = cls._robust_line_support(
+                        points,
+                        support_indices,
+                    )
+                    if support_indices in seen_support:
+                        continue
+                    seen_support.add(support_indices)
+                    support = [points[index] for index in support_indices]
+                    wall = cls._independent_wall_payload(support)
+                    ordered = list(wall["_support"])
+                    if (
+                        float(wall["span_m"]) < POINT_BOUNDARY_MIN_SPAN_M
+                        or float(wall["mean_intensity"])
+                        < POINT_BOUNDARY_MIN_MEAN_INTENSITY
+                        or float(wall["max_residual_m"])
+                        > POINT_BOUNDARY_MAX_LINE_RESIDUAL_M
+                        or any(
+                            math.hypot(
+                                right[0] - left[0],
+                                right[1] - left[1],
+                            ) > POINT_BOUNDARY_MAX_SUPPORT_GAP_M + 1e-12
+                            for left, right in zip(ordered, ordered[1:])
+                        )
+                    ):
+                        continue
+                    candidates.append({
+                        **wall,
+                        "side": side,
+                        "evidence_kind": "point",
+                    })
+            if candidates:
+                boundaries.append(min(
+                    candidates,
+                    key=lambda wall: (
+                        -int(wall["support_cells"]),
+                        float(wall["max_residual_m"]),
+                        -float(wall["span_m"]),
+                        -float(wall["mean_intensity"]),
+                    ),
+                ))
         return boundaries
 
     @staticmethod

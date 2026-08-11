@@ -179,6 +179,7 @@ function makeReflectivityBoundaries(overrides = {}) {
     walls: [
       {
         wall_id: "boundary_right",
+        evidence_kind: "heatmap",
         side: "right",
         hits: 3,
         confidence: 0.81,
@@ -421,6 +422,7 @@ test("validates and detaches one confirmed independent boundary", () => {
     requiredHits: 3,
     walls: [{
       wallId: "boundary_right",
+      evidenceKind: "heatmap",
       side: "right",
       hits: 3,
       confidence: 0.81,
@@ -445,6 +447,55 @@ test("accepts only canonical unavailable independent boundaries", () => {
   assert.equal(parsed.reflectivityBoundaries.status, "unavailable");
 });
 
+test("accepts a measured short point-backed boundary", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_boundaries.walls = [{
+    wall_id: "boundary_right",
+    evidence_kind: "point",
+    side: "right",
+    hits: 5,
+    confidence: 0.79139,
+    heading_deg: -26.819879,
+    normal_offset_m: 0.306238,
+    support_cells: 3,
+    span_m: 0.213127,
+    mean_intensity: 0.569444,
+    start: [0.222702, 0.230559],
+    end: [0.412903, 0.134399],
+  }];
+
+  const wall = sceneApi.parseRadarScene(snapshot)
+    .reflectivityBoundaries.walls[0];
+
+  assert.equal(wall.evidenceKind, "point");
+  assert.equal(wall.supportCells, 3);
+  assert.equal(wall.meanIntensity, 0.569444);
+});
+
+test("accepts a temporally confirmed native heatmap edge boundary", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_boundaries.walls = [{
+    wall_id: "boundary_left",
+    evidence_kind: "heatmap_edge",
+    side: "left",
+    hits: 3,
+    confidence: 0.75875,
+    heading_deg: -5.710593,
+    normal_offset_m: -0.208958,
+    support_cells: 4,
+    span_m: 0.301496,
+    mean_intensity: 0.825,
+    start: [0.2, -0.23],
+    end: [0.5, -0.26],
+  }];
+
+  const wall = sceneApi.parseRadarScene(snapshot)
+    .reflectivityBoundaries.walls[0];
+
+  assert.equal(wall.evidenceKind, "heatmap_edge");
+  assert.equal(wall.supportCells, 4);
+});
+
 test("rejects malformed independent boundary contracts", async (t) => {
   const cases = [
     ["missing", (scene) => delete scene.reflectivity_boundaries],
@@ -452,6 +503,7 @@ test("rejects malformed independent boundary contracts", async (t) => {
     ["candidate status", (scene) => { scene.reflectivity_boundaries.status = "candidate"; }],
     ["too few hits", (scene) => { scene.reflectivity_boundaries.walls[0].hits = 2; }],
     ["side", (scene) => { scene.reflectivity_boundaries.walls[0].side = "center"; }],
+    ["evidence kind", (scene) => { scene.reflectivity_boundaries.walls[0].evidence_kind = "camera"; }],
     ["side geometry", (scene) => {
       scene.reflectivity_boundaries.walls[0].side = "left";
       scene.reflectivity_boundaries.walls[0].wall_id = "boundary_left";

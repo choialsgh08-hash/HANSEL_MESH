@@ -167,6 +167,132 @@ def varied_quantized_scatter(seed, points_per_side):
 
 
 class ReflectivityCorridorEstimatorTests(unittest.TestCase):
+    def test_heatmap_edges_confirm_a_parallel_left_turn_without_distance_hardcoding(self):
+        estimator = ReflectivityCorridorEstimator()
+        edge_observations = cells([
+            (0.20, -0.23, 0.82),
+            (0.30, -0.24, 0.84),
+            (0.40, -0.25, 0.83),
+            (0.50, -0.26, 0.81),
+            (0.20, 0.30, 0.86),
+            (0.30, 0.29, 0.85),
+            (0.40, 0.28, 0.87),
+            (0.50, 0.27, 0.84),
+        ])
+        for index, observation in enumerate(edge_observations):
+            observation["range_index"] = 4 + index % 4
+        radial_sidelobes = cells([
+            (0.20, -0.115, 1.0),
+            (0.30, -0.173, 1.0),
+            (0.40, -0.231, 1.0),
+            (0.50, -0.289, 1.0),
+            (0.20, 0.115, 1.0),
+            (0.30, 0.173, 1.0),
+            (0.40, 0.231, 1.0),
+            (0.50, 0.289, 1.0),
+        ])
+        for index, observation in enumerate(radial_sidelobes):
+            observation["range_index"] = 4 + index % 4
+
+        for _ in range(3):
+            estimator.ingest(
+                [],
+                edge_observations=edge_observations + radial_sidelobes,
+            )
+
+        corridor = estimator.payload()
+        self.assertEqual(corridor["status"], "confirmed")
+        self.assertEqual(corridor["geometry"], "parallel")
+        self.assertAlmostEqual(corridor["measured_heading_deg"], -5.71, delta=1.0)
+        self.assertAlmostEqual(corridor["width_m"], 0.53, delta=0.03)
+        boundaries = estimator.boundaries_payload()
+        self.assertEqual(boundaries["status"], "confirmed")
+        self.assertEqual(
+            [wall["evidence_kind"] for wall in boundaries["walls"]],
+            ["heatmap_edge", "heatmap_edge"],
+        )
+
+    def test_two_heatmap_edge_rows_cannot_invent_a_wall(self):
+        estimator = ReflectivityCorridorEstimator()
+        observations = cells([
+            (0.30, -0.24, 0.9),
+            (0.40, -0.25, 0.9),
+            (0.30, 0.29, 0.9),
+            (0.40, 0.28, 0.9),
+        ])
+        for index, observation in enumerate(observations):
+            observation["range_index"] = 5 + index % 2
+        for _ in range(5):
+            estimator.ingest([], edge_observations=observations)
+
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+        self.assertEqual(
+            estimator.boundaries_payload()["status"],
+            "unavailable",
+        )
+
+    def test_three_current_cfar_returns_confirm_a_short_near_wall(self):
+        estimator = ReflectivityCorridorEstimator()
+        point_observations = cells([
+            (0.223, 0.230, 0.525),
+            (0.351, 0.185, 0.625),
+            (0.413, 0.130, 0.567),
+        ])
+
+        for _ in range(3):
+            estimator.ingest([], point_observations=point_observations)
+
+        payload = estimator.boundaries_payload()
+        self.assertEqual(payload["status"], "confirmed")
+        self.assertEqual(len(payload["walls"]), 1)
+        wall = payload["walls"][0]
+        self.assertEqual(wall["side"], "right")
+        self.assertEqual(wall["evidence_kind"], "point")
+        self.assertEqual(wall["support_cells"], 3)
+        self.assertGreater(wall["span_m"], 0.20)
+        self.assertLess(wall["heading_deg"], -20.0)
+        self.assertGreater(wall["heading_deg"], -35.0)
+
+    def test_two_cfar_returns_cannot_invent_a_wall(self):
+        estimator = ReflectivityCorridorEstimator()
+        point_observations = cells([
+            (0.223, 0.230, 0.95),
+            (0.413, 0.130, 0.95),
+        ])
+
+        for _ in range(5):
+            estimator.ingest([], point_observations=point_observations)
+
+        self.assertEqual(
+            estimator.boundaries_payload()["status"],
+            "unavailable",
+        )
+
+    def test_point_boundary_is_mirror_equivariant(self):
+        points = [
+            (0.223, 0.230, 0.65),
+            (0.351, 0.185, 0.65),
+            (0.413, 0.130, 0.65),
+        ]
+        original = ReflectivityCorridorEstimator()
+        mirrored = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            original.ingest([], point_observations=cells(points))
+            mirrored.ingest([], point_observations=cells([
+                (forward, -lateral, intensity)
+                for forward, lateral, intensity in points
+            ]))
+
+        right = original.boundaries_payload()["walls"][0]
+        left = mirrored.boundaries_payload()["walls"][0]
+        self.assertEqual(right["side"], "right")
+        self.assertEqual(left["side"], "left")
+        self.assertAlmostEqual(
+            right["heading_deg"],
+            -left["heading_deg"],
+            places=6,
+        )
+
     def test_live_single_diagonal_confirms_as_boundary_not_corridor(self):
         estimator = ReflectivityCorridorEstimator()
         observed = cells(LIVE_SINGLE_RIGHT_DIAGONAL)
@@ -184,6 +310,7 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         self.assertEqual(len(boundary["walls"]), 1)
         wall = boundary["walls"][0]
         self.assertEqual(wall["side"], "right")
+        self.assertEqual(wall["evidence_kind"], "heatmap")
         self.assertEqual(wall["hits"], 3)
         self.assertGreater(wall["heading_deg"], -60.0)
         self.assertLess(wall["heading_deg"], -55.0)

@@ -102,7 +102,7 @@ class RadarSupervisorConfig:
     heatmap_range_step_m: float = 0.09765625
     first_frame_timeout_s: float = 3.0
     frame_timeout_s: float = 2.5
-    verification_timeout_s: float = 5.0
+    verification_timeout_s: float = 8.0
     verification_frames: int = 30
     retry_initial_s: float = 0.5
     retry_max_s: float = 5.0

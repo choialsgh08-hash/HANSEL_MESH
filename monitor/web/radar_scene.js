@@ -418,7 +418,15 @@
     }
     if (boundaries.walls.length < 1) return invalid();
     const walls = boundaries.walls.map((wall) => {
+      const pointEvidence = wall?.evidence_kind === "point";
+      const heatmapEvidence = wall?.evidence_kind === "heatmap";
+      const heatmapEdgeEvidence = wall?.evidence_kind === "heatmap_edge";
+      const minimumSupport = (pointEvidence || heatmapEdgeEvidence) ? 3 : 5;
+      const minimumSpanM = (pointEvidence || heatmapEdgeEvidence) ? 0.10 : 0.18;
+      const minimumIntensity = pointEvidence ? 0.50 :
+        (heatmapEdgeEvidence ? 0.30 : 0.90);
       if (!isPlainObject(wall) ||
+          (!pointEvidence && !heatmapEvidence && !heatmapEdgeEvidence) ||
           !["left", "right"].includes(wall.side) ||
           wall.wall_id !== `boundary_${wall.side}` ||
           !Number.isInteger(wall.hits) ||
@@ -428,10 +436,12 @@
           wall.confidence > 1 || !Number.isFinite(wall.heading_deg) ||
           Math.abs(wall.heading_deg) > 75 ||
           !Number.isFinite(wall.normal_offset_m) ||
-          !Number.isInteger(wall.support_cells) || wall.support_cells < 5 ||
-          !Number.isFinite(wall.span_m) || wall.span_m < 0.18 ||
+          !Number.isInteger(wall.support_cells) ||
+          wall.support_cells < minimumSupport ||
+          !Number.isFinite(wall.span_m) || wall.span_m < minimumSpanM ||
           !Number.isFinite(wall.mean_intensity) ||
-          wall.mean_intensity < 0.90 || wall.mean_intensity > 1 ||
+          wall.mean_intensity < minimumIntensity ||
+          wall.mean_intensity > 1 ||
           !validPointPair(wall.start) || !validPointPair(wall.end) ||
           wall.start[0] < 0 || wall.end[0] <= wall.start[0]) {
         return invalid();
@@ -458,6 +468,7 @@
       }
       return {
         wallId: wall.wall_id,
+        evidenceKind: wall.evidence_kind,
         side: wall.side,
         hits: wall.hits,
         confidence: wall.confidence,

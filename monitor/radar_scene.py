@@ -96,6 +96,12 @@ HEATMAP_ENTER_MIN_RESIDUAL_DB = 8.0
 HEATMAP_EXIT_MIN_RESIDUAL_DB = 5.0
 HEATMAP_ENTER_MAD_MULTIPLIER = 5.0
 HEATMAP_EXIT_MAD_MULTIPLIER = 3.0
+HEATMAP_EDGE_MIN_AZIMUTH_BINS = 24
+HEATMAP_EDGE_MIN_RANGE_M = 0.18
+HEATMAP_EDGE_MAX_RANGE_M = 0.55
+HEATMAP_EDGE_MIN_GRADIENT_DB = 0.20
+HEATMAP_EDGE_FULL_CONFIDENCE_DB = 2.0
+HEATMAP_EDGE_SIDE_CLEARANCE_M = 0.03
 HEATMAP_SINGLE_CELL_PEAK_DB = 16.0
 HEATMAP_TRACK_ASSOCIATION_M = 0.24
 HEATMAP_POINT_ASSOCIATION_M = 0.25
@@ -572,6 +578,7 @@ class RadarSceneEstimator:
             point_count += 1
 
         reflectivity_observations: List[Tuple[float, float, float]] = []
+        edge_observations: List[Dict[str, object]] = []
         if (
             frame.heatmap is not None
             and self.clutter_model is not None
@@ -583,6 +590,7 @@ class RadarSceneEstimator:
                 candidate_cell_count,
                 reflectivity_observations,
             ) = self._heatmap_clusters(frame)
+            edge_observations = self._heatmap_edge_observations(frame)
             point_supported_clusters = set()
             for point_forward, point_lateral in accepted_point_positions:
                 nearest_cluster_index = min(
@@ -642,6 +650,7 @@ class RadarSceneEstimator:
             self._reflectivity_surface.payload(now)["cells"],
             elapsed_frame_windows=heatmap_elapsed_frame_windows,
             point_observations=corridor_point_observations,
+            edge_observations=edge_observations,
         )
 
         self._update_probability_map(now)
@@ -2792,6 +2801,79 @@ class RadarSceneEstimator:
             range_m * math.cos(angle_rad),
             range_m * math.sin(angle_rad) * self.axes.lateral_sign,
         )
+
+    def _heatmap_edge_observations(
+        self,
+        frame: RadarFrame,
+    ) -> List[Dict[str, object]]:
+        """Extract static wall edges from absolute range-azimuth gradients.
+
+        A per-cell clutter baseline deliberately removes stationary objects,
+        including walls present during calibration.  Wall display therefore
+        uses only coherent azimuth edges from the current native heatmap; it
+        does not feed obstacle or hazard state.  Geometry and temporal gates
+        are applied later by ``ReflectivityCorridorEstimator``.
+        """
+        heatmap = frame.heatmap
+        if (
+            heatmap is None
+            or heatmap.azimuth_bins < HEATMAP_EDGE_MIN_AZIMUTH_BINS
+        ):
+            return []
+        span_db = heatmap.ceiling_db - heatmap.floor_db
+        observations: List[Dict[str, object]] = []
+        for range_index in range(1, heatmap.range_bins):
+            range_m = range_index * heatmap.range_step_m
+            if range_m < HEATMAP_EDGE_MIN_RANGE_M:
+                continue
+            if range_m > HEATMAP_EDGE_MAX_RANGE_M:
+                break
+            row = [
+                heatmap.floor_db
+                + heatmap.data[
+                    range_index * heatmap.azimuth_bins + azimuth_index
+                ] / 255.0 * span_db
+                for azimuth_index in range(heatmap.azimuth_bins)
+            ]
+            positions = [
+                self._heatmap_cell_position(
+                    range_m,
+                    azimuth_index,
+                    heatmap.azimuth_bins,
+                )
+                for azimuth_index in range(heatmap.azimuth_bins)
+            ]
+            for azimuth_index in range(heatmap.azimuth_bins - 1):
+                first = positions[azimuth_index]
+                second = positions[azimuth_index + 1]
+                if first[1] * second[1] <= 0.0:
+                    continue
+                if min(abs(first[1]), abs(second[1])) < (
+                    HEATMAP_EDGE_SIDE_CLEARANCE_M
+                ):
+                    continue
+                if abs(first[1]) < abs(second[1]):
+                    inner_index = azimuth_index
+                    outer_index = azimuth_index + 1
+                else:
+                    inner_index = azimuth_index + 1
+                    outer_index = azimuth_index
+                gradient_db = row[inner_index] - row[outer_index]
+                if gradient_db < HEATMAP_EDGE_MIN_GRADIENT_DB:
+                    continue
+                observations.append({
+                    "forward_m": (first[0] + second[0]) / 2.0,
+                    "lateral_m": (first[1] + second[1]) / 2.0,
+                    "intensity": max(
+                        0.30,
+                        min(
+                            1.0,
+                            gradient_db / HEATMAP_EDGE_FULL_CONFIDENCE_DB,
+                        ),
+                    ),
+                    "range_index": range_index,
+                })
+        return observations
 
     def _near_existing_heatmap_track(
         self,

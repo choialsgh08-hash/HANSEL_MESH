@@ -951,13 +951,13 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(args.output_root, REPOSITORY_ROOT)
         self.assertEqual(args.frame_timeout, 2.5)
         self.assertEqual(args.first_frame_timeout, 3.0)
-        self.assertEqual(args.verification_timeout, 5.0)
+        self.assertEqual(args.verification_timeout, 8.0)
         self.assertEqual(args.verify_frames, 30)
         self.assertEqual(args.http_port, 8081)
         self.assertIsNone(args.profile_id)
         self.assertEqual(
             args.cfg.name,
-            "iwrl6432_3d_operator_near_8hz.cfg",
+            "iwrl6432_2p5d_operator_nearwall_5hz.cfg",
         )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -976,9 +976,9 @@ class RadarStackLauncherTests(unittest.TestCase):
 
     def test_profile_id_resolution_keeps_known_cfg_pairs_consistent(self):
         launcher = load_launcher()
-        stable_id = (
-            "lsdk-05.05.04.02-presence-near-"
-            "heatmap16-elev8-cfar12-8hz-v2"
+        default_id = (
+            "lsdk-05.05.04.02-presence-nearwall-"
+            "heatmap32-elev4-cfar12-5hz-v4"
         )
         experimental_id = (
             "lsdk-05.05.04.02-presence-near-"
@@ -996,7 +996,13 @@ class RadarStackLauncherTests(unittest.TestCase):
                 launcher.DEFAULT_PROFILE.resolve(),
                 None,
             ),
-            stable_id,
+            default_id,
+        )
+        self.assertEqual(
+            launcher._resolve_heatmap_range_step_m(
+                launcher.DEFAULT_PROFILE.resolve(),
+            ),
+            0.05859375,
         )
         self.assertEqual(
             launcher._resolve_profile_id(
@@ -1011,7 +1017,7 @@ class RadarStackLauncherTests(unittest.TestCase):
         ):
             launcher._resolve_profile_id(
                 experimental_cfg.resolve(),
-                stable_id,
+                default_id,
             )
         with self.assertRaisesRegex(
             SystemExit,
@@ -1148,9 +1154,11 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertIsNone(config.reset_unavailable_reason)
         self.assertEqual(
             config.profile_id,
-            "lsdk-05.05.04.02-presence-near-"
-            "heatmap16-elev8-cfar12-8hz-v2",
+            "lsdk-05.05.04.02-presence-nearwall-"
+            "heatmap32-elev4-cfar12-5hz-v4",
         )
+        self.assertEqual(config.heatmap_range_step_m, 0.05859375)
+        self.assertEqual(config.heatmap_azimuth_bins, 32)
         self.assertEqual(config.data_baud, 1_250_000)
         self.assertEqual(config.http_bind, "127.0.0.1")
         self.assertIs(dependencies.port_provider, comports)
@@ -1206,9 +1214,9 @@ class RadarStackLauncherTests(unittest.TestCase):
             watchdog._expected,
             ExpectedRadarEvidence(
                 profile_id=config.profile_id,
-                heatmap_azimuth_bins=16,
+                heatmap_azimuth_bins=32,
                 heatmap_range_bins=128,
-                heatmap_range_step_m=0.09765625,
+                heatmap_range_step_m=0.05859375,
             ),
         )
 

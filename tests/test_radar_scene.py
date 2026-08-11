@@ -354,7 +354,111 @@ def saturated_near_heatmap_frame(frame_index: int) -> RadarFrame:
     )
 
 
+def near_wall_edge_fixture(
+    *,
+    frame_number: int,
+    uniform: bool = False,
+) -> tuple[RadarFrame, RadarClutterModel]:
+    range_bins = 128
+    azimuth_bins = 32
+    range_step_m = 0.05859375
+    data = bytearray([200] * (range_bins * azimuth_bins))
+    if not uniform:
+        for range_index in range(1, range_bins):
+            range_m = range_index * range_step_m
+            for azimuth_index in range(azimuth_bins):
+                argument = 2.0 * (
+                    azimuth_index - azimuth_bins / 2.0
+                ) / azimuth_bins
+                angle = max(
+                    math.radians(-60.0),
+                    min(
+                        math.radians(60.0),
+                        math.asin(max(-1.0, min(1.0, argument))),
+                    ),
+                )
+                lateral_m = range_m * math.sin(angle)
+                left_wall_m = -0.21 - 0.10 * range_m
+                right_wall_m = 0.32 - 0.10 * range_m
+                if left_wall_m <= lateral_m <= right_wall_m:
+                    data[
+                        range_index * azimuth_bins + azimuth_index
+                    ] = 212
+    heatmap = RadarHeatmap(
+        data=bytes(data),
+        range_bins=range_bins,
+        azimuth_bins=azimuth_bins,
+        range_step_m=range_step_m,
+        tlv_type=304,
+        motion_mode="major",
+        floor_db=0.0,
+        ceiling_db=100.0,
+    )
+    frame = radar_frame(
+        heatmap=heatmap,
+        frame_number=frame_number,
+    )
+    observed_db = tuple(value / 255.0 * 100.0 for value in data)
+    model = RadarClutterModel(
+        schema_version=1,
+        calibration_id=CALIBRATION_ID,
+        profile_id=PROFILE_ID,
+        axes=RadarAxes(),
+        range_bins=range_bins,
+        azimuth_bins=azimuth_bins,
+        range_step_m=range_step_m,
+        motion_mode="major",
+        point_clusters=(),
+        heatmap_median_db=observed_db,
+        heatmap_mad_db=(1.0,) * len(data),
+    )
+    return frame, model
+
+
 class RadarSceneEstimatorTests(unittest.TestCase):
+    def test_static_32_bin_heatmap_edges_recover_walls_removed_by_clutter_baseline(self):
+        first_frame, model = near_wall_edge_fixture(frame_number=1)
+        estimator = RadarSceneEstimator(RadarAxes(), model)
+        estimator.ingest(first_frame, received_at=1.0)
+        for frame_number in (2, 3):
+            frame, _ = near_wall_edge_fixture(frame_number=frame_number)
+            estimator.ingest(frame, received_at=1.0 + frame_number * 0.2)
+
+        scene = estimator.snapshot(now=1.6)
+        self.assertEqual(scene["reflectivity_surface"]["cells"], [])
+        self.assertEqual(scene["reflectivity_boundaries"]["status"], "confirmed")
+        self.assertEqual(
+            [
+                wall["evidence_kind"]
+                for wall in scene["reflectivity_boundaries"]["walls"]
+            ],
+            ["heatmap_edge", "heatmap_edge"],
+        )
+        self.assertEqual(scene["reflectivity_corridor"]["status"], "confirmed")
+        self.assertLess(
+            abs(scene["reflectivity_corridor"]["measured_heading_deg"]),
+            10.0,
+        )
+        self.assertGreater(scene["reflectivity_corridor"]["width_m"], 0.45)
+
+    def test_uniform_32_bin_heatmap_cannot_invent_edge_walls(self):
+        first_frame, model = near_wall_edge_fixture(
+            frame_number=1,
+            uniform=True,
+        )
+        estimator = RadarSceneEstimator(RadarAxes(), model)
+        estimator.ingest(first_frame, received_at=1.0)
+        for frame_number in (2, 3, 4, 5):
+            frame, _ = near_wall_edge_fixture(
+                frame_number=frame_number,
+                uniform=True,
+            )
+            estimator.ingest(frame, received_at=1.0 + frame_number * 0.2)
+
+        scene = estimator.snapshot(now=2.0)
+        self.assertEqual(scene["reflectivity_corridor"]["status"], "unavailable")
+        self.assertEqual(scene["reflectivity_boundaries"]["status"], "unavailable")
+
     def test_floor_return_stays_raw_but_never_enters_driving_evidence(self):
         estimator = calibrated_estimator()
         floor_point = RadarPoint(0.0, 0.08, -0.05, 0.0, 30.0)

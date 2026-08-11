@@ -43,9 +43,31 @@ DEFAULT_PROFILE = (
     REPOSITORY_ROOT
     / "configs"
     / "radar"
-    / "iwrl6432_3d_operator_near_8hz.cfg"
+    / "iwrl6432_2p5d_operator_nearwall_5hz.cfg"
 )
 DEFAULT_PROFILE_ID = (
+    "lsdk-05.05.04.02-presence-nearwall-"
+    "heatmap32-elev4-cfar12-5hz-v4"
+)
+DEFAULT_HEATMAP_RANGE_STEP_M = 0.05859375
+DEFAULT_HEATMAP_AZIMUTH_BINS = 32
+LEGACY_NEARWALL_PROFILE = (
+    REPOSITORY_ROOT
+    / "configs"
+    / "radar"
+    / "iwrl6432_3d_operator_nearwall_8hz.cfg"
+)
+LEGACY_NEARWALL_PROFILE_ID = (
+    "lsdk-05.05.04.02-presence-nearwall-"
+    "heatmap16-elev8-cfar12-8hz-v3"
+)
+LEGACY_STABLE_PROFILE = (
+    REPOSITORY_ROOT
+    / "configs"
+    / "radar"
+    / "iwrl6432_3d_operator_near_8hz.cfg"
+)
+LEGACY_STABLE_PROFILE_ID = (
     "lsdk-05.05.04.02-presence-near-"
     "heatmap16-elev8-cfar12-8hz-v2"
 )
@@ -61,7 +83,21 @@ EXPERIMENTAL_10HZ_PROFILE_ID = (
 )
 KNOWN_PROFILE_IDS = {
     DEFAULT_PROFILE.resolve(): DEFAULT_PROFILE_ID,
+    LEGACY_NEARWALL_PROFILE.resolve(): LEGACY_NEARWALL_PROFILE_ID,
+    LEGACY_STABLE_PROFILE.resolve(): LEGACY_STABLE_PROFILE_ID,
     EXPERIMENTAL_10HZ_PROFILE.resolve(): EXPERIMENTAL_10HZ_PROFILE_ID,
+}
+KNOWN_PROFILE_RANGE_STEPS_M = {
+    DEFAULT_PROFILE.resolve(): DEFAULT_HEATMAP_RANGE_STEP_M,
+    LEGACY_NEARWALL_PROFILE.resolve(): 0.05859375,
+    LEGACY_STABLE_PROFILE.resolve(): 0.09765625,
+    EXPERIMENTAL_10HZ_PROFILE.resolve(): 0.09765625,
+}
+KNOWN_PROFILE_AZIMUTH_BINS = {
+    DEFAULT_PROFILE.resolve(): DEFAULT_HEATMAP_AZIMUTH_BINS,
+    LEGACY_NEARWALL_PROFILE.resolve(): 16,
+    LEGACY_STABLE_PROFILE.resolve(): 16,
+    EXPERIMENTAL_10HZ_PROFILE.resolve(): 16,
 }
 RESET_SEARCH_ROOTS = (Path("C:/ti"),)
 
@@ -143,7 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verification-timeout",
         type=_positive_float,
-        default=5.0,
+        default=8.0,
     )
     parser.add_argument("--verify-frames", type=_positive_int, default=30)
     parser.add_argument(
@@ -179,6 +215,17 @@ def _resolve_profile_id(
             "--profile-id does not match the selected known --cfg"
         )
     return expected_profile_id
+
+
+def _resolve_heatmap_range_step_m(profile_path: Path) -> float:
+    return KNOWN_PROFILE_RANGE_STEPS_M.get(
+        profile_path.resolve(),
+        0.09765625,
+    )
+
+
+def _resolve_heatmap_azimuth_bins(profile_path: Path) -> int:
+    return KNOWN_PROFILE_AZIMUTH_BINS.get(profile_path.resolve(), 16)
 
 
 def _configure_profile(
@@ -303,6 +350,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not profile_path.is_file():
         raise SystemExit("--cfg must name an existing radar profile file")
     profile_id = _resolve_profile_id(profile_path, args.profile_id)
+    heatmap_range_step_m = _resolve_heatmap_range_step_m(profile_path)
+    heatmap_azimuth_bins = _resolve_heatmap_azimuth_bins(profile_path)
     if calibration_path is None or not calibration_path.is_file():
         raise SystemExit(
             "--clutter-calibration must name an existing calibration file"
@@ -332,6 +381,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         calibration_path=calibration_path,
         run_id=run_id,
         profile_id=profile_id,
+        heatmap_azimuth_bins=heatmap_azimuth_bins,
+        heatmap_range_step_m=heatmap_range_step_m,
         explicit_port=args.port,
         xds_serial=args.xds_serial,
         reset_executable=reset_executable,

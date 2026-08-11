@@ -94,7 +94,7 @@ class RadarSupervisorContractTests(unittest.TestCase):
         self.assertEqual(config.heatmap_range_step_m, 0.09765625)
         self.assertEqual(config.first_frame_timeout_s, 3.0)
         self.assertEqual(config.frame_timeout_s, 2.5)
-        self.assertEqual(config.verification_timeout_s, 5.0)
+        self.assertEqual(config.verification_timeout_s, 8.0)
         self.assertEqual(config.verification_frames, 30)
         self.assertEqual(config.retry_initial_s, 0.5)
         self.assertEqual(config.retry_max_s, 5.0)
