@@ -122,6 +122,17 @@ STRONG_CONVERGING_HEATMAP_CORRIDOR = [
     for lateral_m in (-half_width_m, half_width_m)
 ]
 
+# Quantized cells observed from the live right-hand cardboard wall on
+# 2026-08-11.  The first sampling gap is about 9 cm even though all five cells
+# lie on one strong physical boundary.
+LIVE_SINGLE_RIGHT_DIAGONAL = [
+    (0.325, 0.375, 1.0),
+    (0.375, 0.300, 1.0),
+    (0.425, 0.250, 0.9999),
+    (0.450, 0.175, 1.0),
+    (0.475, 0.125, 1.0),
+]
+
 
 def cells(rows):
     return [
@@ -156,6 +167,66 @@ def varied_quantized_scatter(seed, points_per_side):
 
 
 class ReflectivityCorridorEstimatorTests(unittest.TestCase):
+    def test_live_single_diagonal_confirms_as_boundary_not_corridor(self):
+        estimator = ReflectivityCorridorEstimator()
+        observed = cells(LIVE_SINGLE_RIGHT_DIAGONAL)
+
+        estimator.ingest(observed)
+        self.assertEqual(estimator.boundaries_payload()["status"], "unavailable")
+        estimator.ingest(observed)
+        self.assertEqual(estimator.boundaries_payload()["status"], "unavailable")
+        estimator.ingest(observed)
+
+        boundary = estimator.boundaries_payload()
+        self.assertEqual(estimator.payload()["status"], "unavailable")
+        self.assertEqual(boundary["status"], "confirmed")
+        self.assertEqual(boundary["method"], "independent_boundary_fit")
+        self.assertEqual(len(boundary["walls"]), 1)
+        wall = boundary["walls"][0]
+        self.assertEqual(wall["side"], "right")
+        self.assertEqual(wall["hits"], 3)
+        self.assertGreater(wall["heading_deg"], -60.0)
+        self.assertLess(wall["heading_deg"], -55.0)
+        self.assertGreater(wall["span_m"], 0.28)
+        self.assertGreater(wall["normal_offset_m"], 0.0)
+
+    def test_single_boundary_is_mirror_equivariant(self):
+        original = ReflectivityCorridorEstimator()
+        mirrored = ReflectivityCorridorEstimator()
+        for _ in range(3):
+            original.ingest(cells(LIVE_SINGLE_RIGHT_DIAGONAL))
+            mirrored.ingest(cells([
+                (forward, -lateral, intensity)
+                for forward, lateral, intensity in LIVE_SINGLE_RIGHT_DIAGONAL
+            ]))
+
+        original_wall = original.boundaries_payload()["walls"][0]
+        mirrored_wall = mirrored.boundaries_payload()["walls"][0]
+        self.assertEqual(original_wall["side"], "right")
+        self.assertEqual(mirrored_wall["side"], "left")
+        self.assertAlmostEqual(
+            original_wall["heading_deg"],
+            -mirrored_wall["heading_deg"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            original_wall["normal_offset_m"],
+            -mirrored_wall["normal_offset_m"],
+            places=6,
+        )
+
+    def test_dense_varied_scatter_never_confirms_a_single_boundary(self):
+        for seed, points_per_side in ((200, 30), (62, 80)):
+            with self.subTest(seed=seed, points_per_side=points_per_side):
+                estimator = ReflectivityCorridorEstimator()
+                observed = cells(varied_quantized_scatter(seed, points_per_side))
+                for _ in range(3):
+                    estimator.ingest(observed)
+                self.assertEqual(
+                    estimator.boundaries_payload()["status"],
+                    "unavailable",
+                )
+
     def test_heatmap_only_live_reflections_cannot_invent_a_far_diagonal_pair(self):
         estimator = ReflectivityCorridorEstimator()
 
@@ -450,10 +521,9 @@ class ReflectivityCorridorEstimatorTests(unittest.TestCase):
         ]
         self.assertEqual(len(occupied_semicircle), 649)
 
+        estimator = ReflectivityCorridorEstimator()
         started = time.perf_counter()
-        ReflectivityCorridorEstimator._independent_heatmap_candidate(
-            occupied_semicircle,
-        )
+        estimator.ingest(cells(occupied_semicircle))
         elapsed = time.perf_counter() - started
 
         self.assertLess(elapsed, 0.125)

@@ -1767,6 +1767,43 @@ class RadarSceneEstimatorTests(unittest.TestCase):
             places=6,
         )
 
+    def test_scene_exposes_one_confirmed_wall_without_steering_from_it(self):
+        estimator = calibrated_estimator()
+        wall_cells = [
+            {
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "intensity": intensity,
+            }
+            for forward_m, lateral_m, intensity in (
+                (0.325, 0.375, 1.0),
+                (0.375, 0.300, 1.0),
+                (0.425, 0.250, 0.9999),
+                (0.450, 0.175, 1.0),
+                (0.475, 0.125, 1.0),
+            )
+        ]
+        with patch.object(estimator, "_reflectivity_surface"):
+            estimator._reflectivity_surface.payload.return_value = {
+                "cells": wall_cells,
+            }
+            for frame_number in range(1, 4):
+                estimator.ingest(
+                    radar_frame([], frame_number=frame_number),
+                    received_at=9.0 + frame_number * 0.125,
+                )
+
+        scene = estimator.snapshot(now=9.375)
+
+        self.assertEqual(scene["reflectivity_corridor"]["status"], "unavailable")
+        self.assertEqual(scene["reflectivity_boundaries"]["status"], "confirmed")
+        self.assertEqual(len(scene["reflectivity_boundaries"]["walls"]), 1)
+        self.assertEqual(
+            scene["reflectivity_boundaries"]["walls"][0]["side"],
+            "right",
+        )
+        self.assertEqual(scene["planned_path"]["persistent_obstacles_used"], 0)
+
     def test_confirmed_narrowing_walls_cannot_leave_a_straight_clear_route(self):
         estimator = calibrated_estimator()
         wall_cells = [

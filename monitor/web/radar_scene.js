@@ -394,6 +394,94 @@
     };
   }
 
+  function parseReflectivityBoundaries(scene) {
+    const boundaries = scene.reflectivity_boundaries;
+    const invalid = () => {
+      throw new Error("invalid reflectivity boundary contract");
+    };
+    if (!isPlainObject(boundaries) ||
+        !["unavailable", "confirmed"].includes(boundaries.status) ||
+        boundaries.method !== "independent_boundary_fit" ||
+        boundaries.history_frames !== 5 || boundaries.required_hits !== 3 ||
+        !Array.isArray(boundaries.walls) || boundaries.walls.length > 2) {
+      return invalid();
+    }
+    if (boundaries.status === "unavailable") {
+      if (boundaries.walls.length !== 0) return invalid();
+      return {
+        status: boundaries.status,
+        method: boundaries.method,
+        historyFrames: boundaries.history_frames,
+        requiredHits: boundaries.required_hits,
+        walls: [],
+      };
+    }
+    if (boundaries.walls.length < 1) return invalid();
+    const walls = boundaries.walls.map((wall) => {
+      if (!isPlainObject(wall) ||
+          !["left", "right"].includes(wall.side) ||
+          wall.wall_id !== `boundary_${wall.side}` ||
+          !Number.isInteger(wall.hits) ||
+          wall.hits < boundaries.required_hits ||
+          wall.hits > boundaries.history_frames ||
+          !Number.isFinite(wall.confidence) || wall.confidence < 0 ||
+          wall.confidence > 1 || !Number.isFinite(wall.heading_deg) ||
+          Math.abs(wall.heading_deg) > 75 ||
+          !Number.isFinite(wall.normal_offset_m) ||
+          !Number.isInteger(wall.support_cells) || wall.support_cells < 5 ||
+          !Number.isFinite(wall.span_m) || wall.span_m < 0.18 ||
+          !Number.isFinite(wall.mean_intensity) ||
+          wall.mean_intensity < 0.90 || wall.mean_intensity > 1 ||
+          !validPointPair(wall.start) || !validPointPair(wall.end) ||
+          wall.start[0] < 0 || wall.end[0] <= wall.start[0]) {
+        return invalid();
+      }
+      const midpointLateral = (wall.start[1] + wall.end[1]) / 2;
+      if ((wall.side === "left" && midpointLateral >= 0) ||
+          (wall.side === "right" && midpointLateral <= 0)) {
+        return invalid();
+      }
+      const deltaForward = wall.end[0] - wall.start[0];
+      const deltaLateral = wall.end[1] - wall.start[1];
+      const endpointSpan = Math.hypot(deltaForward, deltaLateral);
+      const endpointHeading = Math.atan2(
+        deltaLateral, deltaForward,
+      ) * 180 / Math.PI;
+      const headingRad = wall.heading_deg * Math.PI / 180;
+      const endpointNormalOffset =
+        -Math.sin(headingRad) * wall.start[0] +
+        Math.cos(headingRad) * wall.start[1];
+      if (Math.abs(endpointSpan - wall.span_m) > 2e-5 ||
+          Math.abs(endpointHeading - wall.heading_deg) > 5e-4 ||
+          Math.abs(endpointNormalOffset - wall.normal_offset_m) > 2e-5) {
+        return invalid();
+      }
+      return {
+        wallId: wall.wall_id,
+        side: wall.side,
+        hits: wall.hits,
+        confidence: wall.confidence,
+        headingDeg: wall.heading_deg,
+        normalOffsetM: wall.normal_offset_m,
+        supportCells: wall.support_cells,
+        spanM: wall.span_m,
+        meanIntensity: wall.mean_intensity,
+        start: [...wall.start],
+        end: [...wall.end],
+      };
+    });
+    if (new Set(walls.map((wall) => wall.side)).size !== walls.length) {
+      return invalid();
+    }
+    return {
+      status: boundaries.status,
+      method: boundaries.method,
+      historyFrames: boundaries.history_frames,
+      requiredHits: boundaries.required_hits,
+      walls,
+    };
+  }
+
   function validateFilteredTrack(track) {
     if (!isPlainObject(track) || !Number.isInteger(track.track_id) ||
         track.track_id <= 0 || !Number.isInteger(track.age_ms) ||
@@ -641,6 +729,8 @@
       ? parseReflectivitySurface(scene) : null;
     const reflectivityCorridor = hasProbabilityMap
       ? parseReflectivityCorridor(scene) : null;
+    const reflectivityBoundaries = hasProbabilityMap
+      ? parseReflectivityBoundaries(scene) : null;
     const groundFilter = parseGroundFilter(scene.ground_filter, hasProbabilityMap);
     const diagnostics = parseDiagnostics(scene.diagnostics, hasProbabilityMap);
     const plannedPath = hasProbabilityMap
@@ -743,6 +833,7 @@
       probabilisticLocalMap,
       reflectivitySurface,
       reflectivityCorridor,
+      reflectivityBoundaries,
       groundFilter,
       filteredTracks: deepClone(filteredTracks),
       tracks: deepClone(tracks),

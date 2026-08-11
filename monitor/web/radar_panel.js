@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260811-independent-walls-r50";
+  const UI_BUILD_ID = "20260811-verified-boundaries-r51";
   const MAIN_MAX_RANGE_M = 0.5;
   const MAIN_HALF_WIDTH_M = 0.5;
   const CLOSE_MAX_RANGE_M = 0.5;
@@ -95,7 +95,10 @@
       this.pointCloud3dDrag = null;
       this.fullscreenButton = document.querySelector("#fullscreen-button");
       this.rawToggle = document.querySelector("#raw-toggle");
-      this.options = Object.assign({ endpoint: "/api/radar" }, options || {});
+      this.options = Object.assign({
+        endpoint: "/api/radar",
+        now: () => Date.now(),
+      }, options || {});
       this.snapshot = null;
       this.presentation = {
         blocked: true,
@@ -103,6 +106,10 @@
       };
       this.fetchFailed = false;
       this.lastError = null;
+      this.lastValidPresentation = null;
+      this.lastValidSnapshot = null;
+      this.lastValidAcceptedAtMs = null;
+      this.invalidSceneCount = 0;
 
       if (typeof ResizeObserver === "function") {
         this.resizeObserver = new ResizeObserver(() => this.draw());
@@ -184,6 +191,7 @@
         } catch (error) {
           this.fetchFailed = true;
           this.lastError = error;
+          this.clearTransientSceneHold();
           this.presentation = {
             blocked: true,
             reason: "http_lost",
@@ -209,23 +217,56 @@
         window.location.reload();
         return;
       }
-      this.snapshot = snapshot;
       this.fetchFailed = false;
       this.lastError = null;
       try {
-        this.presentation =
-          window.HanselRadarScene.parseRadarScene(snapshot);
+        const parsed = window.HanselRadarScene.parseRadarScene(snapshot);
+        this.presentation = parsed;
+        this.snapshot = snapshot;
+        if (parsed && !parsed.blocked) {
+          this.lastValidPresentation = parsed;
+          this.lastValidSnapshot = snapshot;
+          this.lastValidAcceptedAtMs = this.options.now();
+          this.invalidSceneCount = 0;
+        } else {
+          this.clearTransientSceneHold();
+        }
       } catch (error) {
-        this.presentation = {
-          blocked: true,
-          reason: "invalid_scene",
-          error,
-        };
+        this.invalidSceneCount += 1;
+        const nowMs = this.options.now();
+        const ageMs = this.lastValidAcceptedAtMs == null
+          ? Infinity : Math.max(0, nowMs - this.lastValidAcceptedAtMs);
+        if (this.lastValidPresentation &&
+            this.invalidSceneCount < 3 && ageMs <= 500) {
+          this.snapshot = this.lastValidSnapshot;
+          this.presentation = {
+            ...this.lastValidPresentation,
+            sceneVerification: {
+              attempt: this.invalidSceneCount,
+              limit: 3,
+              ageMs,
+            },
+          };
+        } else {
+          this.snapshot = snapshot;
+          this.presentation = {
+            blocked: true,
+            reason: "invalid_scene",
+            error,
+          };
+        }
       }
       this.updateText(this.presentation);
       this.updateDiagnostics(this.presentation);
       this.updateSectors(this.presentation);
       this.draw();
+    }
+
+    clearTransientSceneHold() {
+      this.lastValidPresentation = null;
+      this.lastValidSnapshot = null;
+      this.lastValidAcceptedAtMs = null;
+      this.invalidSceneCount = 0;
     }
 
     resizeCanvas(canvas) {
@@ -405,6 +446,12 @@
         scene.reflectivitySurface,
         { clipShape: "circle" },
       );
+      this.drawReflectivityBoundaries(
+        ctx,
+        transform,
+        scene.reflectivityBoundaries,
+        scene.reflectivityCorridor,
+      );
       this.drawReflectivityCorridor(
         ctx,
         transform,
@@ -475,6 +522,12 @@
         transform,
         scene.reflectivitySurface,
         { clipShape: "radial" },
+      );
+      this.drawReflectivityBoundaries(
+        ctx,
+        transform,
+        scene.reflectivityBoundaries,
+        scene.reflectivityCorridor,
       );
       this.drawReflectivityCorridor(
         ctx,
@@ -651,6 +704,47 @@
         labelX,
         labelY - 6,
       );
+      ctx.restore();
+    }
+
+    drawReflectivityBoundaries(ctx, transform, boundaries, corridor) {
+      const walls = boundaries && Array.isArray(boundaries.walls)
+        ? boundaries.walls : [];
+      if (!boundaries || boundaries.status !== "confirmed" ||
+          walls.length === 0 || (corridor && corridor.status === "confirmed" &&
+          Array.isArray(corridor.walls) && corridor.walls.length === 2)) {
+        return;
+      }
+      ctx.save();
+      ctx.lineCap = "round";
+      for (const wall of walls) {
+        const start = window.HanselRadarScene.projectMapPoint(
+          transform, wall.start[0], wall.start[1],
+        );
+        const end = window.HanselRadarScene.projectMapPoint(
+          transform, wall.end[0], wall.end[1],
+        );
+        const stroke = (color, width) => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = width;
+          ctx.beginPath();
+          ctx.moveTo(start.x, start.y);
+          ctx.lineTo(end.x, end.y);
+          ctx.stroke();
+        };
+        stroke("rgba(1, 8, 12, 0.90)", 6.0);
+        stroke("rgba(122, 238, 230, 0.98)", 2.8);
+        ctx.fillStyle = "rgba(201, 255, 249, 0.98)";
+        ctx.font = "750 10px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(
+          `MEASURED ${String(wall.side).toUpperCase()} WALL · ` +
+            `${Math.round(Number(wall.headingDeg))}°`,
+          (start.x + end.x) / 2,
+          (start.y + end.y) / 2 - 6,
+        );
+      }
       ctx.restore();
     }
 
@@ -1701,6 +1795,8 @@
     updateText(presentation) {
       const state = this.snapshot;
       const blocked = Boolean(presentation && presentation.blocked);
+      const sceneVerification = presentation && !blocked
+        ? presentation.sceneVerification : null;
       const presentationStatus =
         blocked &&
         [
@@ -1714,21 +1810,28 @@
           : blocked
             ? "sensor_fault"
             : null;
-      const status = presentationStatus || (this.fetchFailed
-        ? "fault"
-        : state
-          ? state.status
-          : "waiting");
+      const status = sceneVerification
+        ? "verifying"
+        : presentationStatus || (this.fetchFailed
+          ? "fault"
+          : state
+            ? state.status
+            : "waiting");
       const badge = document.querySelector("#radar-status");
       badge.dataset.status = status;
-      badge.textContent =
-        STATUS_LABELS[status] || String(status).toUpperCase();
+      badge.textContent = sceneVerification
+        ? `SCENE VERIFYING ${sceneVerification.attempt}/${sceneVerification.limit}`
+        : STATUS_LABELS[status] || String(status).toUpperCase();
       const warningStrip = document.querySelector("#warning-strip");
       if (warningStrip) {
         warningStrip.dataset.blocked = blocked ? "true" : "false";
       }
       const warning = document.querySelector("#warning-text");
-      if (presentation && presentation.blocked) {
+      if (sceneVerification) {
+        warning.textContent =
+          `SCENE VERIFYING ${sceneVerification.attempt}/${sceneVerification.limit}` +
+          " · LAST VALID MAP RETAINED";
+      } else if (presentation && presentation.blocked) {
         const message = blockedMessage(presentation.reason);
         const detail = presentation.error
           ? ` · ${presentation.error.message}`
@@ -1747,7 +1850,9 @@
 
       const mode = document.querySelector("#radar-mode");
       mode.textContent = presentation && !presentation.blocked
-        ? "CALIBRATED SCENE"
+        ? sceneVerification
+          ? "CALIBRATED SCENE · VERIFYING"
+          : "CALIBRATED SCENE"
         : "MAP BLOCKED";
 
       const hazard = presentation && !presentation.blocked

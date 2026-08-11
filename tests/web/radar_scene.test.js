@@ -170,6 +170,41 @@ function makeUnavailableReflectivityCorridor() {
   };
 }
 
+function makeReflectivityBoundaries(overrides = {}) {
+  return {
+    status: "confirmed",
+    method: "independent_boundary_fit",
+    history_frames: 5,
+    required_hits: 3,
+    walls: [
+      {
+        wall_id: "boundary_right",
+        side: "right",
+        hits: 3,
+        confidence: 0.81,
+        heading_deg: -58.324531,
+        normal_offset_m: 0.47486,
+        support_cells: 5,
+        span_m: 0.285656,
+        mean_intensity: 0.99998,
+        start: [0.325, 0.377586],
+        end: [0.475, 0.134483],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function makeUnavailableReflectivityBoundaries() {
+  return {
+    status: "unavailable",
+    method: "independent_boundary_fit",
+    history_frames: 5,
+    required_hits: 3,
+    walls: [],
+  };
+}
+
 function makeSnapshot(overrides = {}) {
   const grid = makeGrid(60, 60).payload;
   const diagnostics = Object.fromEntries(
@@ -206,6 +241,7 @@ function makeSnapshot(overrides = {}) {
         cells: [],
       },
       reflectivity_corridor: makeReflectivityCorridor(),
+      reflectivity_boundaries: makeReflectivityBoundaries(),
       probabilistic_local_map: {
         radius_m: 0.50,
         resolution_m: 0.05,
@@ -261,6 +297,7 @@ function makeLegacySnapshot(overrides = {}) {
   delete snapshot.scene.probabilistic_local_map;
   delete snapshot.scene.ground_filter;
   delete snapshot.scene.reflectivity_corridor;
+  delete snapshot.scene.reflectivity_boundaries;
   snapshot.scene.pose_mode = "robot_relative";
   for (const key of ADDITIVE_DIAGNOSTIC_KEYS) {
     delete snapshot.scene.diagnostics[key];
@@ -370,6 +407,77 @@ test("validates and detaches the display-only reflectivity surface", () => {
   });
   snapshot.scene.reflectivity_surface.cells[0].intensity = 0.1;
   assert.equal(parsed.reflectivitySurface.cells[0].intensity, 0.9);
+});
+
+test("validates and detaches one confirmed independent boundary", () => {
+  const snapshot = makeSnapshot();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivityBoundaries, {
+    status: "confirmed",
+    method: "independent_boundary_fit",
+    historyFrames: 5,
+    requiredHits: 3,
+    walls: [{
+      wallId: "boundary_right",
+      side: "right",
+      hits: 3,
+      confidence: 0.81,
+      headingDeg: -58.324531,
+      normalOffsetM: 0.47486,
+      supportCells: 5,
+      spanM: 0.285656,
+      meanIntensity: 0.99998,
+      start: [0.325, 0.377586],
+      end: [0.475, 0.134483],
+    }],
+  });
+  snapshot.scene.reflectivity_boundaries.walls[0].start[0] = 9.0;
+  assert.equal(parsed.reflectivityBoundaries.walls[0].start[0], 0.325);
+});
+
+test("accepts only canonical unavailable independent boundaries", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_boundaries = makeUnavailableReflectivityBoundaries();
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.deepEqual(parsed.reflectivityBoundaries.walls, []);
+  assert.equal(parsed.reflectivityBoundaries.status, "unavailable");
+});
+
+test("rejects malformed independent boundary contracts", async (t) => {
+  const cases = [
+    ["missing", (scene) => delete scene.reflectivity_boundaries],
+    ["method", (scene) => { scene.reflectivity_boundaries.method = "hough"; }],
+    ["candidate status", (scene) => { scene.reflectivity_boundaries.status = "candidate"; }],
+    ["too few hits", (scene) => { scene.reflectivity_boundaries.walls[0].hits = 2; }],
+    ["side", (scene) => { scene.reflectivity_boundaries.walls[0].side = "center"; }],
+    ["side geometry", (scene) => {
+      scene.reflectivity_boundaries.walls[0].side = "left";
+      scene.reflectivity_boundaries.walls[0].wall_id = "boundary_left";
+    }],
+    ["weak intensity", (scene) => { scene.reflectivity_boundaries.walls[0].mean_intensity = 0.89; }],
+    ["short span", (scene) => { scene.reflectivity_boundaries.walls[0].span_m = 0.17; }],
+    ["endpoint mismatch", (scene) => { scene.reflectivity_boundaries.walls[0].end[1] += 0.02; }],
+    ["duplicate side", (scene) => {
+      scene.reflectivity_boundaries.walls.push({
+        ...scene.reflectivity_boundaries.walls[0],
+      });
+    }],
+    ["unavailable walls", (scene) => {
+      scene.reflectivity_boundaries.status = "unavailable";
+    }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      mutate(snapshot.scene);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity boundary contract/,
+      );
+    });
+  }
 });
 
 test("validates and detaches the measured two-wall reflectivity corridor", () => {

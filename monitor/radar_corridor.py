@@ -20,8 +20,11 @@ INDEPENDENT_OFFSET_BIN_M = 0.025
 INDEPENDENT_MAX_HOUGH_SEEDS = 16
 INDEPENDENT_MAX_WALL_CANDIDATES = 16
 INDEPENDENT_MAX_FORWARD_GAP_M = 0.10
-INDEPENDENT_MAX_SUPPORT_GAP_M = 0.08
+INDEPENDENT_MAX_SUPPORT_GAP_M = 0.095
 INDEPENDENT_MIN_LOCAL_CONTRAST = 0.05
+BOUNDARY_ONLY_MIN_MEAN_INTENSITY = 0.90
+BOUNDARY_ONLY_MIN_CELL_INTENSITY = 0.90
+BOUNDARY_ONLY_MIN_ENVELOPE_RATIO = 0.80
 BOUNDARY_PROMINENCE_BAND_M = LINE_TOLERANCE_M + 0.010
 MIN_BOUNDARY_PROMINENCE = 0.55
 CONVERGING_MIN_ROWS = 4
@@ -88,9 +91,13 @@ class ReflectivityCorridorEstimator:
         self._history: Deque[Optional[Dict[str, object]]] = deque(
             maxlen=history_frames,
         )
+        self._boundary_history: Deque[Tuple[Dict[str, object], ...]] = deque(
+            maxlen=history_frames,
+        )
 
     def reset(self) -> None:
         self._history.clear()
+        self._boundary_history.clear()
 
     def ingest(
         self,
@@ -108,7 +115,124 @@ class ReflectivityCorridorEstimator:
             raise ValueError("elapsed_frame_windows must be positive")
         for _ in range(min(self._history_frames, elapsed_frame_windows) - 1):
             self._history.append(None)
+            self._boundary_history.append(())
         self._history.append(self._fit_pair(cells, point_observations))
+        self._boundary_history.append(tuple(
+            self._independent_boundary_candidates(self._points(cells))
+        ))
+
+    def boundaries_payload(self) -> Dict[str, object]:
+        confirmed: List[Dict[str, object]] = []
+        for side in ("left", "right"):
+            frames = [
+                [wall for wall in frame if wall["side"] == side]
+                for frame in self._boundary_history
+            ]
+            seeds = [wall for frame in frames for wall in frame]
+            clusters: List[List[Dict[str, object]]] = []
+            for seed in seeds:
+                cluster = []
+                for frame in frames:
+                    compatible = [
+                        wall for wall in frame
+                        if self._boundaries_are_compatible(wall, seed)
+                    ]
+                    if compatible:
+                        cluster.append(min(
+                            compatible,
+                            key=lambda wall: (
+                                -float(wall["mean_intensity"]),
+                                -int(wall["support_cells"]),
+                                float(wall["max_residual_m"]),
+                            ),
+                        ))
+                clusters.append(cluster)
+            if not clusters:
+                continue
+            cluster = max(
+                clusters,
+                key=lambda values: (
+                    len(values),
+                    sum(float(value["mean_intensity"]) for value in values),
+                    sum(float(value["span_m"]) for value in values),
+                ),
+            )
+            if len(cluster) < self._required_hits:
+                continue
+            confirmed.append(self._serialize_boundary(side, cluster))
+        return {
+            "status": "confirmed" if confirmed else "unavailable",
+            "method": "independent_boundary_fit",
+            "history_frames": self._history_frames,
+            "required_hits": self._required_hits,
+            "walls": confirmed,
+        }
+
+    @staticmethod
+    def _boundaries_are_compatible(
+        left: Mapping[str, object],
+        right: Mapping[str, object],
+    ) -> bool:
+        return (
+            left["side"] == right["side"]
+            and abs(
+                float(left["heading_deg"])
+                - float(right["heading_deg"])
+            ) <= COMPATIBLE_WALL_HEADING_DEG
+            and abs(
+                float(left["normal_offset_m"])
+                - float(right["normal_offset_m"])
+            ) <= COMPATIBLE_WALL_POSITION_M
+        )
+
+    def _serialize_boundary(
+        self,
+        side: str,
+        cluster: Sequence[Mapping[str, object]],
+    ) -> Dict[str, object]:
+        heading_deg = _median([
+            float(wall["heading_deg"]) for wall in cluster
+        ])
+        normal_offset_m = _median([
+            float(wall["normal_offset_m"]) for wall in cluster
+        ])
+        start_forward = _median([
+            float(wall["start"][0]) for wall in cluster
+        ])
+        end_forward = _median([
+            float(wall["end"][0]) for wall in cluster
+        ])
+        heading_rad = math.radians(heading_deg)
+        intercept = normal_offset_m / math.cos(heading_rad)
+        slope = math.tan(heading_rad)
+        start = [start_forward, intercept + slope * start_forward]
+        end = [end_forward, intercept + slope * end_forward]
+        span_m = math.hypot(end[0] - start[0], end[1] - start[1])
+        mean_intensity = _median([
+            float(wall["mean_intensity"]) for wall in cluster
+        ])
+        hits = len(cluster)
+        confidence = min(
+            1.0,
+            hits / self._history_frames * 0.45
+            + mean_intensity * 0.35
+            + min(1.0, span_m / 0.30) * 0.20,
+        )
+        return {
+            "wall_id": f"boundary_{side}",
+            "side": side,
+            "hits": hits,
+            "confidence": _rounded(confidence),
+            "heading_deg": _rounded(heading_deg),
+            "normal_offset_m": _rounded(normal_offset_m),
+            "support_cells": int(round(_median([
+                float(wall["support_cells"]) for wall in cluster
+            ]))),
+            "span_m": _rounded(span_m),
+            "mean_intensity": _rounded(mean_intensity),
+            "start": [_rounded(value) for value in start],
+            "end": [_rounded(value) for value in end],
+        }
 
     def payload(self) -> Dict[str, object]:
         fits = [fit for fit in self._history if fit is not None]
@@ -635,6 +759,55 @@ class ReflectivityCorridorEstimator:
                 float(wall["normal_offset_m"]),
             ),
         )[:INDEPENDENT_MAX_WALL_CANDIDATES]
+
+    @classmethod
+    def _independent_boundary_candidates(
+        cls,
+        heatmap_points: Sequence[Point],
+    ) -> List[Dict[str, object]]:
+        boundaries: List[Dict[str, object]] = []
+        for side, sign in (("left", -1.0), ("right", 1.0)):
+            side_points = [
+                point for point in heatmap_points
+                if sign * point[1] > CONVERGING_MIN_SIDE_CLEARANCE_M
+            ]
+            candidates = cls._independent_wall_candidates(side_points)
+            eligible = []
+            for wall in candidates:
+                support = list(wall["_support"])
+                if (
+                    float(wall["mean_intensity"])
+                    < BOUNDARY_ONLY_MIN_MEAN_INTENSITY
+                    or min(point[2] for point in support)
+                    < BOUNDARY_ONLY_MIN_CELL_INTENSITY
+                ):
+                    continue
+                envelope_hits = 0
+                for support_point in support:
+                    row = [
+                        point for point in side_points
+                        if abs(point[0] - support_point[0])
+                        <= INDEPENDENT_OFFSET_BIN_M / 2.0 + 1e-12
+                    ]
+                    extreme_lateral = (
+                        max(point[1] for point in row)
+                        if sign > 0.0
+                        else min(point[1] for point in row)
+                    )
+                    inward_delta = sign * (
+                        extreme_lateral - support_point[1]
+                    )
+                    if inward_delta <= INDEPENDENT_OFFSET_BIN_M + 1e-12:
+                        envelope_hits += 1
+                if (
+                    envelope_hits / len(support)
+                    < BOUNDARY_ONLY_MIN_ENVELOPE_RATIO
+                ):
+                    continue
+                eligible.append({**wall, "side": side})
+            if eligible:
+                boundaries.append(eligible[0])
+        return boundaries
 
     @staticmethod
     def _robust_line_support(

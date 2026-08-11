@@ -190,7 +190,7 @@ function makeCanvas(context) {
   };
 }
 
-function makeHarness() {
+function makeHarness(options = {}) {
   const mainContext = makeContext();
   const collisionContext = makeContext();
   const pointCloudContext = makeContext();
@@ -309,7 +309,7 @@ function makeHarness() {
     filename: PANEL_PATH,
   });
 
-  const panel = new window.HanselRadarPanel(root);
+  const panel = new window.HanselRadarPanel(root, options);
   panel.snapshot = {
     status: "live",
     warning: null,
@@ -376,6 +376,7 @@ function makeHarness() {
     panel,
     elements,
     contexts: [mainContext, collisionContext, pointCloudContext],
+    window,
   };
 }
 
@@ -429,6 +430,25 @@ function livePresentationWithProbabilityMap() {
         },
       ],
     },
+    reflectivityBoundaries: {
+      status: "confirmed",
+      method: "independent_boundary_fit",
+      historyFrames: 5,
+      requiredHits: 3,
+      walls: [{
+        wallId: "boundary_right",
+        side: "right",
+        hits: 3,
+        confidence: 0.81,
+        headingDeg: -58.324531,
+        normalOffsetM: 0.47486,
+        supportCells: 5,
+        spanM: 0.285656,
+        meanIntensity: 0.99998,
+        start: [0.325, 0.377586],
+        end: [0.475, 0.134483],
+      }],
+    },
     probabilisticLocalMap: {
       sourceField: "probabilistic_local_map",
       radiusM: 0.50,
@@ -455,6 +475,76 @@ function livePresentationWithProbabilityMap() {
     diagnostics: {},
   };
 }
+
+test("two transient invalid scenes retain the last valid map then the third blocks", () => {
+  let nowMs = 1000;
+  const { panel, window, elements } = makeHarness({ now: () => nowMs });
+  const valid = livePresentationWithProbabilityMap();
+  window.HanselRadarScene.parseRadarScene = (snapshot) => {
+    if (snapshot.invalid) throw new Error("transition frame");
+    return valid;
+  };
+
+  panel.acceptSnapshot({ status: "live" });
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.blocked, false);
+  assert.equal(panel.presentation.sceneVerification.attempt, 1);
+  assert.equal(panel.presentation.sceneVerification.limit, 3);
+  assert.equal(panel.presentation.sceneVerification.ageMs, 0);
+  assert.equal(elements.get("#radar-status").textContent, "SCENE VERIFYING 1/3");
+
+  nowMs += 125;
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.blocked, false);
+  assert.equal(panel.presentation.sceneVerification.attempt, 2);
+
+  nowMs += 125;
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.blocked, true);
+  assert.equal(panel.presentation.reason, "invalid_scene");
+});
+
+test("valid scene resets transient verification and 500ms is a hard hold limit", () => {
+  let nowMs = 2000;
+  const { panel, window } = makeHarness({ now: () => nowMs });
+  const valid = livePresentationWithProbabilityMap();
+  window.HanselRadarScene.parseRadarScene = (snapshot) => {
+    if (snapshot.invalid) throw new Error("transition frame");
+    return valid;
+  };
+
+  panel.acceptSnapshot({ status: "live" });
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  panel.acceptSnapshot({ status: "live" });
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.sceneVerification.attempt, 1);
+
+  panel.acceptSnapshot({ status: "live" });
+  nowMs += 501;
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.blocked, true);
+  assert.equal(panel.presentation.reason, "invalid_scene");
+});
+
+test("sensor fault bypasses and clears the transient scene hold", () => {
+  const { panel, window } = makeHarness({ now: () => 3000 });
+  const valid = livePresentationWithProbabilityMap();
+  window.HanselRadarScene.parseRadarScene = (snapshot) => {
+    if (snapshot.invalid) throw new Error("transition frame");
+    if (snapshot.fault) return { blocked: true, reason: "sensor_fault" };
+    return valid;
+  };
+
+  panel.acceptSnapshot({ status: "live" });
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.blocked, false);
+  panel.acceptSnapshot({ status: "fault", fault: true });
+  assert.equal(panel.presentation.blocked, true);
+  assert.equal(panel.presentation.reason, "sensor_fault");
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.blocked, true);
+  assert.equal(panel.presentation.reason, "invalid_scene");
+});
 
 test("main rolling-map transform keeps the radar at circle center", () => {
   const harness = makeHarness();
@@ -571,7 +661,7 @@ test("null probability map preserves both legacy layers in both map views", () =
   assert.equal(legacyCircleCalls, 2);
 });
 
-test("both map views invoke reflectivity corridor probability and robot-footprint renderers", () => {
+test("both map views invoke reflectivity boundary corridor probability and robot-footprint renderers", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -581,21 +671,24 @@ test("both map views invoke reflectivity corridor probability and robot-footprin
   };
   let probabilityCalls = 0;
   let reflectivityCalls = 0;
+  let boundaryCalls = 0;
   let corridorCalls = 0;
   let footprintCalls = 0;
   panel.drawReflectivitySurface = () => { reflectivityCalls += 1; };
+  panel.drawReflectivityBoundaries = () => { boundaryCalls += 1; };
   panel.drawReflectivityCorridor = () => { corridorCalls += 1; };
   panel.drawProbabilisticLocalMap = () => { probabilityCalls += 1; };
   panel.drawRobotFootprint = () => { footprintCalls += 1; };
   panel.drawLidarTopView(contexts[0], transform, presentation);
   panel.drawCollisionInset(contexts[1], transform, presentation);
   assert.equal(reflectivityCalls, 2);
+  assert.equal(boundaryCalls, 2);
   assert.equal(corridorCalls, 2);
   assert.equal(probabilityCalls, 2);
   assert.equal(footprintCalls, 2);
 });
 
-test("both map views draw surface corridor probability path then every track layer", () => {
+test("both map views draw surface boundary corridor probability path then every track layer", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -604,13 +697,14 @@ test("both map views draw surface corridor probability path then every track lay
     halfWidthM: 0.5, centeredCircle: true,
   };
   for (const [context, expected, render] of [
-    [contexts[0], ["reflectivity", "corridor", "probability", "path", "tracks", "tracks"],
+    [contexts[0], ["reflectivity", "boundary", "corridor", "probability", "path", "tracks", "tracks"],
       () => panel.drawLidarTopView(contexts[0], transform, presentation)],
-    [contexts[1], ["reflectivity", "corridor", "probability", "path", "tracks"],
+    [contexts[1], ["reflectivity", "boundary", "corridor", "probability", "path", "tracks"],
       () => panel.drawCollisionInset(contexts[1], transform, presentation)],
   ]) {
     const order = [];
     panel.drawReflectivitySurface = () => { order.push("reflectivity"); };
+    panel.drawReflectivityBoundaries = () => { order.push("boundary"); };
     panel.drawReflectivityCorridor = () => { order.push("corridor"); };
     panel.drawProbabilisticLocalMap = () => { order.push("probability"); };
     panel.drawPlannedPath = () => { order.push("path"); };
@@ -619,6 +713,49 @@ test("both map views draw surface corridor probability path then every track lay
     assert.deepEqual(order, expected);
     assert.ok(context);
   }
+});
+
+test("confirmed single boundary draws the measured right wall without inventing its pair", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  const transform = {
+    originX: 250, originY: 250, scale: 400,
+    width: 500, height: 500, forwardMaxM: 0.5,
+    halfWidthM: 0.5, centeredCircle: true,
+  };
+  const unavailableCorridor = { status: "unavailable", walls: [] };
+
+  panel.drawReflectivityBoundaries(
+    contexts[0], transform, presentation.reflectivityBoundaries,
+    unavailableCorridor,
+  );
+
+  const measured = contexts[0].strokeCalls.filter(
+    (call) => call.strokeStyle === "rgba(122, 238, 230, 0.98)",
+  );
+  assert.equal(measured.length, 1);
+  assert.deepEqual(
+    measured[0].path.filter((entry) => entry[0] !== "closePath"),
+    [
+      ["moveTo", 401.0344, 120],
+      ["lineTo", 303.7932, 60],
+    ],
+  );
+  assert.ok(contexts[0].fillTextCalls.some(
+    ([label]) => label === "MEASURED RIGHT WALL · -58°",
+  ));
+});
+
+test("confirmed corridor suppresses duplicate independent boundary strokes", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  panel.drawReflectivityBoundaries(
+    contexts[0],
+    { originX: 250, originY: 250, scale: 400 },
+    presentation.reflectivityBoundaries,
+    presentation.reflectivityCorridor,
+  );
+  assert.equal(contexts[0].strokeCalls.length, 0);
 });
 
 test("confirmed two-wall corridor draws measured walls region width and narrow label", () => {

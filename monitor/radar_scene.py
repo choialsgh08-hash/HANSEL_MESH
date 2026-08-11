@@ -737,6 +737,9 @@ class RadarSceneEstimator:
         stable_obstacles = self._stable_obstacle_payload(observed_at)
         reflectivity_surface = self._reflectivity_surface.payload(observed_at)
         reflectivity_corridor = self._reflectivity_corridor.payload()
+        reflectivity_boundaries = (
+            self._reflectivity_corridor.boundaries_payload()
+        )
         probability_map = self._probability_grid.payload(observed_at)
         occupied_probability_cells = self._probability_grid.occupied_cells(
             observed_at
@@ -813,6 +816,7 @@ class RadarSceneEstimator:
             "persistent_near_obstacles": persistent_near_obstacles,
             "reflectivity_surface": reflectivity_surface,
             "reflectivity_corridor": reflectivity_corridor,
+            "reflectivity_boundaries": reflectivity_boundaries,
             "probabilistic_local_map": probability_map,
             "rolling_local_map": {
                 "radius_m": 0.50,
