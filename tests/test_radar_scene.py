@@ -1699,6 +1699,111 @@ class RadarSceneEstimatorTests(unittest.TestCase):
         self.assertFalse(obstacles[0]["occupied"])
         self.assertAlmostEqual(obstacles[0]["probability"], 0.69, places=6)
 
+    def test_three_verified_adjacent_adc_peaks_form_left_near_wall(self):
+        surface = {
+            "range_step_m": 0.05859375,
+            "required_hits": 3,
+            "peaks": [
+                {
+                    "range_index": index,
+                    "range_m": distance,
+                    "azimuth_deg": azimuth,
+                    "confidence": confidence,
+                    "coherence": coherence,
+                    "relative_db": relative_db,
+                    "hits": 5,
+                    "verified": True,
+                    "angular_uncertainty_deg": 14.5,
+                }
+                for index, distance, azimuth, confidence, coherence, relative_db
+                in (
+                    (3, 0.18, -32.0, 0.86, 0.87, 6.92),
+                    (4, 0.23, -34.0, 0.96, 0.96, 8.74),
+                    (5, 0.29, -42.0, 0.90, 0.90, 8.20),
+                )
+            ],
+        }
+
+        obstacles = RadarSceneEstimator._verified_adc_wall_obstacles(surface)
+        path = RadarSceneEstimator._plan_path(obstacles)
+
+        self.assertEqual(len(obstacles), 3)
+        self.assertTrue(all(item["source"] == "adc_near_wall"
+                            for item in obstacles))
+        self.assertEqual(path["hard_obstacles_used"], 3)
+        self.assertGreater(path["goal_angle_deg"], 0.0)
+        self.assertGreater(path["points"][-1][1], 0.0)
+
+    def test_two_strong_adjacent_adc_peaks_become_collision_geometry(self):
+        surface = {
+            "range_step_m": 0.05859375,
+            "required_hits": 3,
+            "peaks": [
+                {
+                    "range_index": index,
+                    "range_m": distance,
+                    "azimuth_deg": -34.0,
+                    "confidence": 0.95,
+                    "coherence": 0.95,
+                    "relative_db": 9.0,
+                    "hits": 5,
+                    "verified": True,
+                }
+                for index, distance in ((3, 0.18), (4, 0.23))
+            ],
+        }
+
+        obstacles = RadarSceneEstimator._verified_adc_wall_obstacles(surface)
+
+        self.assertEqual(len(obstacles), 2)
+
+    def test_single_adc_peak_does_not_become_collision_geometry(self):
+        surface = {
+            "range_step_m": 0.05859375,
+            "required_hits": 3,
+            "peaks": [{
+                "range_index": 3,
+                "range_m": 0.18,
+                "azimuth_deg": -34.0,
+                "confidence": 0.95,
+                "coherence": 0.95,
+                "relative_db": 9.0,
+                "hits": 5,
+                "verified": True,
+            }],
+        }
+
+        obstacles = RadarSceneEstimator._verified_adc_wall_obstacles(surface)
+
+        self.assertEqual(obstacles, [])
+
+    def test_opposite_side_adc_peaks_cannot_combine_into_wall(self):
+        surface = {
+            "range_step_m": 0.05859375,
+            "required_hits": 3,
+            "peaks": [
+                {
+                    "range_index": index,
+                    "range_m": distance,
+                    "azimuth_deg": azimuth,
+                    "confidence": 0.95,
+                    "coherence": 0.95,
+                    "relative_db": 9.0,
+                    "hits": 5,
+                    "verified": True,
+                }
+                for index, distance, azimuth in (
+                    (3, 0.18, -30.0),
+                    (4, 0.23, 30.0),
+                    (5, 0.29, -34.0),
+                )
+            ],
+        }
+
+        obstacles = RadarSceneEstimator._verified_adc_wall_obstacles(surface)
+
+        self.assertEqual(obstacles, [])
+
     def test_forward_depth_planner_keeps_side_wall_beyond_thirty_cm_slant_range(self):
         estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
         estimator._probability_grid.observe(

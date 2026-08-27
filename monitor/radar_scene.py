@@ -97,6 +97,13 @@ PATH_DYNAMIC_GOAL_TOLERANCE_M = 0.04
 NEAR_OCCUPANCY_RESOLUTION_M = 0.025
 NEAR_OCCUPANCY_TTL_NS = 1_000_000_000
 NEAR_POINT_REACTIVE_MIN_CONFIDENCE = 0.85
+ADC_NEAR_WALL_MIN_RANGE_M = 0.10
+ADC_NEAR_WALL_MAX_RANGE_M = 0.30
+ADC_NEAR_WALL_MIN_CONFIDENCE = 0.75
+ADC_NEAR_WALL_MIN_COHERENCE = 0.70
+ADC_NEAR_WALL_MIN_RELATIVE_DB = 6.0
+ADC_NEAR_WALL_MIN_PEAKS = 2
+ADC_NEAR_WALL_MAX_AZIMUTH_DELTA_DEG = 20.0
 STABLE_OCCUPANCY_RESOLUTION_M = 0.05
 STABLE_OCCUPANCY_WALL_LINK_M = 0.18
 OBSTACLE_CLUSTER_LINK_M = 0.10
@@ -1720,6 +1727,9 @@ class RadarSceneEstimator:
     ) -> List[Dict[str, object]]:
         """Fuse immediate confirmed returns with motion-relative strong memory."""
         combined: Dict[Tuple[int, int], Dict[str, object]] = {}
+        adc_near_walls = self._verified_adc_wall_obstacles(
+            self._adc_angular_surface.payload(now)
+        )
         containers = (
             (
                 self._probability_grid.active_cells(now),
@@ -1730,6 +1740,11 @@ class RadarSceneEstimator:
                 self._near_obstacle_payload(now),
                 "reactive",
                 NEAR_OCCUPANCY_RESOLUTION_M / math.sqrt(2.0),
+            ),
+            (
+                adc_near_walls,
+                "adc_near_wall",
+                None,
             ),
         )
         for obstacles, evidence_kind, support_radius_m in containers:
@@ -1747,7 +1762,11 @@ class RadarSceneEstimator:
                 normalized = self._normalize_planning_obstacle({
                     **obstacle,
                     "evidence_kind": evidence_kind,
-                    "support_radius_m": support_radius_m,
+                    "support_radius_m": (
+                        obstacle.get("support_radius_m", 0.0)
+                        if support_radius_m is None
+                        else support_radius_m
+                    ),
                 })
                 forward = float(normalized["forward_m"])
                 lateral = float(normalized["lateral_m"])
@@ -1778,6 +1797,131 @@ class RadarSceneEstimator:
                     else self._merge_planning_obstacles(existing, normalized)
                 )
         return list(combined.values())
+
+    @staticmethod
+    def _verified_adc_wall_obstacles(
+        adc_surface: Dict[str, object],
+    ) -> List[Dict[str, object]]:
+        """Promote only a persistent, range-continuous ADC ridge to a wall.
+
+        One coarse UART ADC angle peak is too ambiguous to be collision
+        geometry.  Two or more adjacent range bins on the same side, each
+        verified over time with coherent antenna phase, are substantially
+        stronger evidence that a near wall occupies that side of the robot.
+        """
+
+        range_step_m = adc_surface.get("range_step_m")
+        if not isinstance(range_step_m, (int, float)) or isinstance(
+            range_step_m, bool
+        ):
+            return []
+        range_step_m = float(range_step_m)
+        if not math.isfinite(range_step_m) or range_step_m <= 0.0:
+            return []
+        required_hits = max(3, int(adc_surface.get("required_hits", 3)))
+        candidates: List[Dict[str, object]] = []
+        for raw_peak in adc_surface.get("peaks", ()):
+            if not isinstance(raw_peak, dict):
+                continue
+            try:
+                peak = dict(raw_peak)
+                range_m = float(peak["range_m"])
+                azimuth_deg = float(peak["azimuth_deg"])
+                confidence = float(peak["confidence"])
+                coherence = float(peak["coherence"])
+                relative_db = float(peak["relative_db"])
+                hits = int(peak["hits"])
+                range_index = int(peak["range_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            values = (
+                range_m,
+                azimuth_deg,
+                confidence,
+                coherence,
+                relative_db,
+            )
+            if (
+                any(not math.isfinite(value) for value in values)
+                or peak.get("verified") is not True
+                or not ADC_NEAR_WALL_MIN_RANGE_M <= range_m
+                <= ADC_NEAR_WALL_MAX_RANGE_M
+                or confidence < ADC_NEAR_WALL_MIN_CONFIDENCE
+                or coherence < ADC_NEAR_WALL_MIN_COHERENCE
+                or relative_db < ADC_NEAR_WALL_MIN_RELATIVE_DB
+                or hits < required_hits
+            ):
+                continue
+            peak.update({
+                "range_m": range_m,
+                "azimuth_deg": azimuth_deg,
+                "confidence": confidence,
+                "coherence": coherence,
+                "relative_db": relative_db,
+                "hits": hits,
+                "range_index": range_index,
+            })
+            candidates.append(peak)
+
+        # Split left, centre, and right so opposite-side lobes cannot combine
+        # into an invented wall.  The centre band still detects a frontal wall.
+        side_groups: Dict[int, List[Dict[str, object]]] = {-1: [], 0: [], 1: []}
+        for peak in candidates:
+            azimuth_deg = float(peak["azimuth_deg"])
+            side = -1 if azimuth_deg < -10.0 else 1 if azimuth_deg > 10.0 else 0
+            side_groups[side].append(peak)
+
+        qualifying: List[Dict[str, object]] = []
+        for side_peaks in side_groups.values():
+            ordered = sorted(side_peaks, key=lambda item: int(item["range_index"]))
+            runs: List[List[Dict[str, object]]] = []
+            for peak in ordered:
+                if not runs:
+                    runs.append([peak])
+                    continue
+                previous = runs[-1][-1]
+                adjacent_range = (
+                    int(peak["range_index"]) - int(previous["range_index"]) == 1
+                )
+                consistent_angle = abs(
+                    float(peak["azimuth_deg"])
+                    - float(previous["azimuth_deg"])
+                ) <= ADC_NEAR_WALL_MAX_AZIMUTH_DELTA_DEG
+                if adjacent_range and consistent_angle:
+                    runs[-1].append(peak)
+                else:
+                    runs.append([peak])
+            for run in runs:
+                if len(run) >= ADC_NEAR_WALL_MIN_PEAKS:
+                    qualifying.extend(run)
+
+        obstacles: List[Dict[str, object]] = []
+        for peak in qualifying:
+            range_m = float(peak["range_m"])
+            azimuth_deg = float(peak["azimuth_deg"])
+            angle_rad = math.radians(azimuth_deg)
+            angular_uncertainty_deg = float(
+                peak.get("angular_uncertainty_deg", 14.5)
+            )
+            obstacles.append({
+                "forward_m": range_m * math.cos(angle_rad),
+                "lateral_m": range_m * math.sin(angle_rad),
+                "range_uncertainty_m": range_step_m / 2.0,
+                "lateral_uncertainty_m": max(
+                    0.025,
+                    range_m * math.sin(math.radians(angular_uncertainty_deg)),
+                ),
+                "support_radius_m": range_step_m / 2.0,
+                "confidence": float(peak["confidence"]),
+                "source": "adc_near_wall",
+                "hits": int(peak["hits"]),
+                "verified": True,
+                "range_index": int(peak["range_index"]),
+                "azimuth_deg": azimuth_deg,
+                "relative_db": float(peak["relative_db"]),
+                "coherence": float(peak["coherence"]),
+            })
+        return obstacles
 
     @staticmethod
     def _neutral_planned_path(status: str) -> Dict[str, object]:
@@ -1828,12 +1972,14 @@ class RadarSceneEstimator:
 
     @staticmethod
     def _is_hard_obstacle(obstacle: Dict[str, object]) -> bool:
-        """Only Cartesian point-backed evidence is collision geometry.
+        """Use point-backed or verified ADC-ridge evidence as geometry.
 
         A range-azimuth heatmap lobe has no elevation and a 29-degree angular
         footprint on this board.  It remains useful as a continuous steering
         cost, but treating its whole footprint as a solid wall creates false
-        near-field stops.  A mixed cell is point-backed and stays hard.
+        near-field stops.  A verified ADC ridge is emitted under a distinct
+        source after temporal and range-continuity checks.  A mixed cell is
+        point- or ADC-backed and stays hard.
         """
 
         return str(obstacle.get("source", "unknown")) != "heatmap"
