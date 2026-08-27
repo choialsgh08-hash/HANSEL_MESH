@@ -22,9 +22,13 @@ class PathSelectionHysteresis:
     def _same_route(left, right) -> bool:
         if left is None or right is None:
             return False
-        left_stopped = left.get("status") == "blocked_near_field"
-        right_stopped = right.get("status") == "blocked_near_field"
-        return left_stopped == right_stopped and abs(
+        def route_state(candidate):
+            status = candidate.get("status")
+            return status if status in {
+                "blocked_near_field", "turn_side_unresolved",
+            } else "moving"
+
+        return route_state(left) == route_state(right) and abs(
             float(left.get("curvature_per_m", 0.0))
             - float(right.get("curvature_per_m", 0.0))
         ) <= 1e-9
@@ -55,7 +59,10 @@ class PathSelectionHysteresis:
 
         repeated_stop = (
             current_blocked
-            and self._selected.get("status") == "blocked_near_field"
+            and self._selected.get("status") in {
+                "blocked_near_field", "turn_side_unresolved",
+            }
+            and self._selected.get("status") == candidate.get("status")
             and self._same_route(self._selected, candidate)
         )
         if repeated_stop:

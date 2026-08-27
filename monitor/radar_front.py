@@ -37,6 +37,7 @@ from common.sensor_contract import (  # noqa: E402
     SensorHealth,
 )
 from monitor.radar_ground import RadarMountGeometry  # noqa: E402
+from monitor.radar_adc import adc_range_profile  # noqa: E402
 from monitor.radar_scene import RadarSceneEstimator  # noqa: E402
 from sensors.mission_log import (  # noqa: E402
     DEFAULT_MAX_LINE_BYTES,
@@ -50,9 +51,12 @@ from sensors.radar_parent_lease import (  # noqa: E402
 
 
 WEB_ROOT = Path(__file__).resolve().parent / "web"
+DEFAULT_SPI_PROFILE = (
+    REPO_ROOT / "configs" / "radar" / "iwrl6432_spi_near_30cm.cfg"
+)
 RADAR_STREAM_ID = "radar/front"
 API_VERSION = 1
-UI_BUILD_ID = "20260811-calibrated-contours-r54"
+UI_BUILD_ID = "20260826-turn-confidence-r75"
 RADAR_VALID_MIN_RANGE_M = 0.07
 SUPERVISOR_BLOCKED_WARNING = "RADAR RECONNECTING \u00b7 DRIVE STOP"
 
@@ -285,6 +289,7 @@ class RadarFrontState:
                 default=None,
             )
             source_heatmap = getattr(record, "heatmap", None)
+            source_adc = getattr(record, "adc_snapshot", None)
             native_heatmap_axes = self.axes.supports_native_heatmap()
             heatmap = (
                 self._heatmap_payload(source_heatmap)
@@ -303,6 +308,15 @@ class RadarFrontState:
                 heatmap_status = "available"
             if self.source_mode == "demo" and heatmap is not None:
                 heatmap_status = "synthetic"
+            adc_profile = None
+            if source_adc is not None and source_heatmap is not None:
+                try:
+                    adc_profile = adc_range_profile(
+                        source_adc,
+                        range_step_m=float(source_heatmap.range_step_m),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    adc_profile = None
             self._frame = {
                 "number": record.frame_number,
                 "subframe": record.subframe_number,
@@ -349,6 +363,12 @@ class RadarFrontState:
                 "points": display_points,
                 "heatmap": heatmap,
                 "heatmap_status": heatmap_status,
+                "adc_range_profile": adc_profile,
+                "adc_status": (
+                    "available" if adc_profile is not None
+                    else "not_provided" if source_adc is None
+                    else "invalid_metadata"
+                ),
             }
             self._frame_received_at = now
             self._arrival_times.append(now)
@@ -1155,6 +1175,25 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MISSION.jsonl",
         help="replay a completed mission log",
     )
+    source.add_argument(
+        "--spi-live",
+        action="store_true",
+        help="capture complete BPM ADC frames through C232HM-DDHSL-0",
+    )
+    parser.add_argument(
+        "--spi-port",
+        help="XDS110 Application/User UART (auto-detected when omitted)",
+    )
+    parser.add_argument("--xds-serial", help="select one XDS110 by serial")
+    parser.add_argument(
+        "--spi-cfg",
+        type=Path,
+        default=DEFAULT_SPI_PROFILE,
+        help="near-field adcLogging=2 profile",
+    )
+    parser.add_argument("--ftdi-index", type=int, default=0)
+    parser.add_argument("--spi-window-frames", type=int, default=8)
+    parser.add_argument("--spi-processing-stride", type=int, default=2)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8081)
     parser.add_argument("--max-points", type=int, default=2048)
@@ -1276,6 +1315,19 @@ def parse_args(
         parser.error("--demo-rate-hz must be finite and positive")
     if not math.isfinite(args.speed) or args.speed < 0:
         parser.error("--speed must be finite and non-negative")
+    if args.ftdi_index < 0:
+        parser.error("--ftdi-index must be non-negative")
+    if args.spi_window_frames < 4 or args.spi_window_frames > 32:
+        parser.error("--spi-window-frames must be between 4 and 32")
+    if (
+        args.spi_processing_stride < 1
+        or args.spi_processing_stride > args.spi_window_frames
+    ):
+        parser.error(
+            "--spi-processing-stride must be between 1 and the SPI window"
+        )
+    if args.spi_live and not args.spi_cfg.is_file():
+        parser.error("--spi-cfg must name an existing profile")
     if args.forward_axis == args.lateral_axis:
         parser.error("--forward-axis and --lateral-axis must differ")
     try:
@@ -1309,16 +1361,27 @@ def run(args: argparse.Namespace) -> int:
         lateral_axis=args.lateral_axis,
         lateral_sign=args.lateral_sign,
     )
-    mode = "demo" if args.demo else ("follow" if args.follow else "replay")
+    mode = (
+        "demo"
+        if args.demo
+        else "spi"
+        if args.spi_live
+        else "follow"
+        if args.follow
+        else "replay"
+    )
     clutter_model = (
         None
         if args.clutter_calibration is None
-        else load_clutter_model(Path(args.clutter_calibration))
+        else load_clutter_model(
+            Path(args.clutter_calibration),
+            axes=axes,
+        )
     )
     scene_estimator = RadarSceneEstimator(
         axes=axes,
         clutter_model=clutter_model,
-        require_calibration=(mode != "demo"),
+        require_calibration=(mode not in {"demo", "spi"}),
         synthetic=(mode == "demo"),
         mount_geometry=RadarMountGeometry(
             sensor_height_m=args.sensor_height_m,
@@ -1346,6 +1409,21 @@ def run(args: argparse.Namespace) -> int:
             stop_event,
             args.demo_rate_hz,
             args.seed,
+        ).run
+    elif args.spi_live:
+        from sensors.ti_spi_live import SpiRadarLiveSource
+
+        source_runner = SpiRadarLiveSource(
+            port=args.spi_port,
+            xds_serial=args.xds_serial,
+            cfg=args.spi_cfg,
+            ftdi_index=args.ftdi_index,
+            stop_event=stop_event,
+            ingest=state.ingest,
+            note=state.set_source_note,
+            error=state.set_source_error,
+            window_frames=args.spi_window_frames,
+            processing_stride=args.spi_processing_stride,
         ).run
     elif args.follow:
         source_runner = MissionLogFollower(

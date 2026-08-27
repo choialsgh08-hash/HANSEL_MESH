@@ -171,7 +171,7 @@ class ConfigureTiRadarTest(unittest.TestCase):
         self.assertIn("frameCfg 2 8 600 16 125 0", profile.before_baud)
         self.assertEqual(profile.after_baud, ("sensorStart 0 0 0 0",))
 
-    def test_near_wall_2p5d_profile_trades_elevation_for_azimuth_resolution(self):
+    def test_near_wall_2p5d_profile_streams_uart_safe_heatmap_and_adc(self):
         root = Path(__file__).resolve().parent.parent / "configs" / "radar"
         profile = MODULE.partition_at_baud(MODULE.load_commands(
             root / "iwrl6432_2p5d_operator_nearwall_5hz.cfg"
@@ -179,7 +179,11 @@ class ConfigureTiRadarTest(unittest.TestCase):
 
         self.assertIn("chirpTimingCfg 6 24 0 125 60.5", profile.before_baud)
         self.assertIn(
-            "sigProcChainCfg 32 4 1 2 8 4 0 0.3 0",
+            "sigProcChainCfg 16 4 1 2 8 4 0 0.3 0",
+            profile.before_baud,
+        )
+        self.assertIn(
+            "guiMonitor 2 0 0 1 0 1 0 1 0 0 0",
             profile.before_baud,
         )
         self.assertIn(

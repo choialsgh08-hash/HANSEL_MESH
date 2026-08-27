@@ -18,6 +18,7 @@
     "ground_rejected_count",
     "ground_fringe_rejected_count",
     "reflectivity_surface_cell_count",
+    "heatmap_cells_observed",
     "self_clutter_rejected_count",
     "quality_gate_rejected_count",
     "tentative_point_track_count",
@@ -153,7 +154,9 @@
           cell.range_uncertainty_m < 0 ||
           !Number.isFinite(cell.lateral_uncertainty_m) ||
           cell.lateral_uncertainty_m < 0 ||
-          !["point", "heatmap", "mixed"].includes(cell.source)) {
+          ![
+            "point", "heatmap", "mixed", "adc_heatmap_fused",
+          ].includes(cell.source)) {
         throw new Error("invalid probabilistic map contract");
       }
       return deepClone(cell);
@@ -173,6 +176,90 @@
 
   function parseReflectivitySurface(scene) {
     const surface = scene.reflectivity_surface;
+    if (isPlainObject(surface) &&
+        surface.source === "full_range_azimuth_heatmap") {
+      if (surface.radius_m !== 0.50 ||
+          Object.prototype.hasOwnProperty.call(surface, "resolution_m") ||
+          (!Number.isFinite(surface.range_step_m) &&
+            !(surface.range_step_m === null && surface.cells?.length === 0)) ||
+          (Number.isFinite(surface.range_step_m) && surface.range_step_m <= 0) ||
+          surface.angular_resolution_deg !== 29.0 ||
+          surface.history_frames !== 5 || surface.required_hits !== 3 ||
+          surface.retention !== "continuous_five_frame_evidence" ||
+          surface.pose_mode !== "sensor_relative_short_memory" ||
+          !(
+            (surface.calibrated === true && surface.normalization ===
+              "current_range_common_mode_physical_beam") ||
+            (surface.calibrated === false && surface.normalization ===
+              "per_frame_median_polish")
+          ) ||
+          surface.room_baseline_used !== false ||
+          surface.valid_min_range_m !== 0.12 ||
+          surface.independent_beam_count !== 5 ||
+          !Array.isArray(surface.cells)) {
+        throw new Error("invalid reflectivity surface contract");
+      }
+      const occupiedKeys = new Set();
+      const cells = surface.cells.map((cell) => {
+        if (!isPlainObject(cell) || !Number.isInteger(cell.range_index) ||
+            cell.range_index < 1 || !Number.isInteger(cell.azimuth_index) ||
+            cell.azimuth_index < 0 || !Number.isFinite(cell.range_m) ||
+            cell.range_m <= 0 || cell.range_m > surface.radius_m + 1e-9 ||
+            !Number.isFinite(cell.azimuth_deg) ||
+            Math.abs(cell.azimuth_deg) > 60.0 + 1e-9 ||
+            !Number.isFinite(cell.forward_m) || cell.forward_m < 0 ||
+            !Number.isFinite(cell.lateral_m) ||
+            Math.abs(Math.hypot(cell.forward_m, cell.lateral_m) -
+              cell.range_m) > 2e-5 || !Number.isFinite(cell.intensity) ||
+            cell.intensity < 0 || cell.intensity > 1 ||
+            !Number.isFinite(cell.confidence) || cell.confidence < 0 ||
+            cell.confidence > 1 || !Number.isFinite(cell.persistence) ||
+            cell.persistence <= 0 || cell.persistence > 1 ||
+            !Number.isInteger(cell.hits) || cell.hits < 1 ||
+            cell.hits > surface.history_frames ||
+            Math.abs(cell.persistence - cell.hits / surface.history_frames) >
+              1e-8 || typeof cell.verified !== "boolean" ||
+            cell.verified !== (cell.hits >= surface.required_hits) ||
+            !Number.isInteger(cell.age_ms) || cell.age_ms < 0 ||
+            !Number.isFinite(cell.relative_db) ||
+            !Number.isFinite(cell.calibrated_residual_db) ||
+            Math.abs(
+              cell.calibrated_residual_db - cell.relative_db
+            ) > 1e-9 ||
+            !Number.isFinite(cell.range_uncertainty_m) ||
+            cell.range_uncertainty_m <= 0 ||
+            cell.angular_uncertainty_deg !== 14.5 ||
+            !Number.isFinite(cell.scene_change_score) ||
+            cell.scene_change_score < 0 || cell.scene_change_score > 1 ||
+            (Object.prototype.hasOwnProperty.call(
+              cell, "baseline_delta_db",
+            ) && !Number.isFinite(cell.baseline_delta_db))) {
+          throw new Error("invalid reflectivity surface contract");
+        }
+        const key = `${cell.range_index}:${cell.azimuth_index}`;
+        if (occupiedKeys.has(key)) {
+          throw new Error("invalid reflectivity surface contract");
+        }
+        occupiedKeys.add(key);
+        return deepClone(cell);
+      });
+      return {
+        radiusM: surface.radius_m,
+        rangeStepM: surface.range_step_m,
+        angularResolutionDeg: surface.angular_resolution_deg,
+        historyFrames: surface.history_frames,
+        requiredHits: surface.required_hits,
+        retention: surface.retention,
+        poseMode: surface.pose_mode,
+        source: surface.source,
+        normalization: surface.normalization,
+        calibrated: surface.calibrated,
+        roomBaselineUsed: surface.room_baseline_used,
+        validMinRangeM: surface.valid_min_range_m,
+        independentBeamCount: surface.independent_beam_count,
+        cells,
+      };
+    }
     if (!isPlainObject(surface) || surface.radius_m !== 0.50 ||
         surface.resolution_m !== 0.025 || surface.history_frames !== 5 ||
         surface.required_hits !== 3 ||
@@ -226,6 +313,216 @@
     };
   }
 
+  function rawHeatmapEvidenceSurface(snapshot) {
+    const heatmap = snapshot && snapshot.frame && snapshot.frame.heatmap;
+    if (!isPlainObject(heatmap) || heatmap.encoding !== "log-u8" ||
+        !Number.isInteger(heatmap.range_bins) || heatmap.range_bins < 1 ||
+        !Number.isInteger(heatmap.azimuth_bins) || heatmap.azimuth_bins < 1 ||
+        !Number.isFinite(heatmap.range_step_m) || heatmap.range_step_m <= 0) {
+      throw new Error("no usable current heatmap evidence");
+    }
+    const bytes = decodeBase64(heatmap.data_base64);
+    if (bytes.length !== heatmap.range_bins * heatmap.azimuth_bins) {
+      throw new Error("current heatmap evidence shape mismatch");
+    }
+    const cells = [];
+    for (let rangeIndex = 1; rangeIndex < heatmap.range_bins; rangeIndex += 1) {
+      const rangeM = rangeIndex * heatmap.range_step_m;
+      if (rangeM < 0.07 || rangeM > 0.50 + 1e-9) continue;
+      for (let azimuthIndex = 0; azimuthIndex < heatmap.azimuth_bins;
+        azimuthIndex += 1) {
+        const intensity = bytes[
+          rangeIndex * heatmap.azimuth_bins + azimuthIndex
+        ] / 255;
+        const spatialFrequency = Math.max(-1, Math.min(
+          1,
+          2 * (azimuthIndex - heatmap.azimuth_bins / 2) /
+            heatmap.azimuth_bins,
+        ));
+        const azimuthDeg = Math.asin(spatialFrequency) * 180 / Math.PI;
+        if (Math.abs(azimuthDeg) > 60 + 1e-9) continue;
+        const angleRad = azimuthDeg * Math.PI / 180;
+        cells.push({
+          range_index: rangeIndex,
+          azimuth_index: azimuthIndex,
+          range_m: rangeM,
+          azimuth_deg: azimuthDeg,
+          forward_m: rangeM * Math.cos(angleRad),
+          lateral_m: rangeM * Math.sin(angleRad),
+          intensity,
+          confidence: intensity,
+          persistence: 0.2,
+          hits: 1,
+          verified: false,
+          age_ms: 0,
+          relative_db: intensity,
+          calibrated_residual_db: intensity,
+          range_uncertainty_m: heatmap.range_step_m / 2,
+          angular_uncertainty_deg: 14.5,
+        });
+      }
+    }
+    return {
+      radiusM: 0.50,
+      rangeStepM: heatmap.range_step_m,
+      angularResolutionDeg: 29.0,
+      historyFrames: 5,
+      requiredHits: 3,
+      retention: "current_frame_unverified_evidence",
+      poseMode: "sensor_relative_current_frame",
+      source: "full_range_azimuth_heatmap",
+      normalization: "firmware_log_u8_current_frame",
+      calibrated: false,
+      roomBaselineUsed: false,
+      validMinRangeM: 0.07,
+      independentBeamCount: 5,
+      cells,
+    };
+  }
+
+  function parseAdcRangeAngleSurface(scene) {
+    if (!Object.prototype.hasOwnProperty.call(
+      scene, "adc_range_angle_surface",
+    )) {
+      return null;
+    }
+    const surface = scene.adc_range_angle_surface;
+    const invalid = () => {
+      throw new Error("invalid adc_range_angle_surface contract");
+    };
+    if (!isPlainObject(surface) ||
+        surface.source !== "uart_last_chirp_pair_adc" ||
+        surface.direction_semantics !== "range_azimuth" ||
+        surface.processing !== "bpm_decode_hann_range_fft_four_element_das" ||
+        !["evm_design_default", "measured"].includes(
+          surface.phase_calibration,
+        ) || surface.history_frames !== 5 || surface.required_hits !== 3 ||
+        surface.retention !== "three_of_five_complete_frames" ||
+        !Number.isFinite(surface.range_step_m) || surface.range_step_m <= 0 ||
+        surface.angle_min_deg !== -60 || surface.angle_max_deg !== 60 ||
+        surface.angle_step_deg !== 2 ||
+        surface.angular_resolution_deg !== 29 ||
+        surface.complete_frame_adc !== false ||
+        !Array.isArray(surface.cells) || !Array.isArray(surface.peaks)) {
+      return invalid();
+    }
+    const validatePosition = (item) => {
+      const radians = item.azimuth_deg * Math.PI / 180;
+      return Number.isFinite(item.range_m) && item.range_m > 0 &&
+        item.range_m <= 0.30 + 1e-9 &&
+        Number.isFinite(item.azimuth_deg) &&
+        item.azimuth_deg >= surface.angle_min_deg - 1e-9 &&
+        item.azimuth_deg <= surface.angle_max_deg + 1e-9 &&
+        Number.isFinite(item.forward_m) && item.forward_m >= 0 &&
+        Number.isFinite(item.lateral_m) &&
+        Math.abs(item.forward_m - item.range_m * Math.cos(radians)) <= 2e-5 &&
+        Math.abs(item.lateral_m - item.range_m * Math.sin(radians)) <= 2e-5;
+    };
+    const occupiedCells = new Set();
+    const cells = surface.cells.map((cell) => {
+      if (!isPlainObject(cell) || !Number.isInteger(cell.range_index) ||
+          cell.range_index < 1 || !Number.isInteger(cell.azimuth_index) ||
+          cell.azimuth_index < 0 || cell.azimuth_index > 60 ||
+          !validatePosition(cell) || !Number.isFinite(cell.intensity) ||
+          cell.intensity < 0 || cell.intensity > 1 ||
+          !Number.isFinite(cell.relative_db) ||
+          !Number.isFinite(cell.coherence) || cell.coherence < 0 ||
+          cell.coherence > 1) {
+        return invalid();
+      }
+      const key = `${cell.range_index}:${cell.azimuth_index}`;
+      if (occupiedCells.has(key)) return invalid();
+      occupiedCells.add(key);
+      return deepClone(cell);
+    });
+    const peaks = surface.peaks.map((peak) => {
+      if (!isPlainObject(peak) || !Number.isInteger(peak.range_index) ||
+          peak.range_index < 3 || !validatePosition(peak) ||
+          !Number.isFinite(peak.relative_db) ||
+          !Number.isFinite(peak.coherence) || peak.coherence < 0 ||
+          peak.coherence > 1 || !Number.isFinite(peak.confidence) ||
+          peak.confidence < 0 || peak.confidence > 1 ||
+          !Number.isInteger(peak.hits) || peak.hits < 1 ||
+          peak.hits > surface.history_frames ||
+          typeof peak.verified !== "boolean" ||
+          peak.verified !== (peak.hits >= surface.required_hits) ||
+          !Number.isInteger(peak.age_ms) || peak.age_ms < 0 ||
+          peak.angular_uncertainty_deg !== 14.5) {
+        return invalid();
+      }
+      return deepClone(peak);
+    });
+    return {
+      source: surface.source,
+      directionSemantics: surface.direction_semantics,
+      processing: surface.processing,
+      phaseCalibration: surface.phase_calibration,
+      historyFrames: surface.history_frames,
+      requiredHits: surface.required_hits,
+      retention: surface.retention,
+      rangeStepM: surface.range_step_m,
+      angleMinDeg: surface.angle_min_deg,
+      angleMaxDeg: surface.angle_max_deg,
+      angleStepDeg: surface.angle_step_deg,
+      angularResolutionDeg: surface.angular_resolution_deg,
+      completeFrameAdc: surface.complete_frame_adc,
+      cells,
+      peaks,
+    };
+  }
+
+  function parseRadarEvidenceFallback(snapshot, cause) {
+    if (!snapshot || !["live", "degraded"].includes(snapshot.status)) {
+      throw new Error("evidence fallback requires a live radar transport");
+    }
+    let surface;
+    try {
+      surface = parseReflectivitySurface(snapshot.scene || {});
+    } catch (_surfaceError) {
+      surface = rawHeatmapEvidenceSurface(snapshot);
+    }
+    if (!surface || !Array.isArray(surface.cells) || surface.cells.length < 1) {
+      throw new Error("no current radar evidence for fallback");
+    }
+    let adcRangeAngleSurface = null;
+    try {
+      adcRangeAngleSurface = parseAdcRangeAngleSurface(snapshot.scene || {});
+    } catch (_adcError) {
+      // The display-only ADC overlay must never suppress valid heatmap evidence.
+    }
+    return {
+      blocked: false,
+      evidenceOnly: true,
+      sceneContractFallback: true,
+      poseMode: "sensor_relative_current_frame",
+      grid: null,
+      gridMeta: null,
+      probabilisticLocalMap: null,
+      reflectivitySurface: surface,
+      adcRangeAngleSurface,
+      reflectivityCorridor: { status: "unavailable", walls: [] },
+      reflectivityBoundaries: { status: "unavailable", walls: [] },
+      reflectivityContours: { status: "unavailable", segments: [] },
+      sceneWarnings: ["scene_contract_evidence_fallback"],
+      groundFilter: null,
+      filteredTracks: [], tracks: [], referenceTracks: [],
+      diagnostics: deepClone(snapshot.scene?.diagnostics || {}),
+      plannedPath: {
+        status: "unavailable", stability_status: "evidence_only",
+        length_m: 0, points: [], minimum_passage_width_m: 0.21,
+        blocked_previous_path: null,
+      },
+      motionCompensation: { status: "unavailable", applied: false },
+      accumulatedObstacles: [], rollingMapObstacles: [], rollingMap: null,
+      travelTrail: { radiusM: 0.50, resolutionM: 0.01,
+        source: "unavailable", points: [[0, 0]] },
+      obstacleMemoryWindowMs: 0,
+      hazard: { level: "UNKNOWN", threshold_m: 0.10,
+        nearest_confirmed_m: null, reason: "scene_contract_fallback" },
+      hazardCopy: "CURRENT RADAR EVIDENCE ONLY · PATH/HAZARD UNVERIFIED",
+    };
+  }
+
   function parseReflectivityContours(scene) {
     const contours = scene.reflectivity_contours;
     const invalid = () => {
@@ -266,7 +563,7 @@
           !Number.isFinite(segment.span_m) || segment.span_m < 0.030 ||
           segment.span_m > contours.max_range_m ||
           !Number.isFinite(segment.mean_prominence_db) ||
-          segment.mean_prominence_db < 2.0 ||
+          segment.mean_prominence_db <= 0.0 ||
           !validPointPair(segment.start) || !validPointPair(segment.end) ||
           segment.start[0] < 0 || segment.end[0] < 0 ||
           Math.hypot(...segment.start) > contours.max_range_m + 1e-9 ||
@@ -451,7 +748,11 @@
       const nearWidth = nearLaterals[1] - nearLaterals[0];
       const farWidth = farLaterals[1] - farLaterals[0];
       const centerHeading = centerlineHeading();
-      if (overlapEnd - overlapStart < 0.075 - 2e-5 ||
+      // A steep but physically valid wall pair can span four independent
+      // range rows while projecting to less than 7.5 cm on the forward axis.
+      // The backend already verifies row count, wall span, residual and width
+      // reduction, so only reject pairs with no common forward interval here.
+      if (overlapEnd <= overlapStart ||
           nearWidth <= 0 || farWidth < 0 ||
           nearWidth - farWidth < 0.075 - 2e-5 ||
           Math.abs(farWidth - corridor.width_m) > 2e-5 ||
@@ -711,7 +1012,8 @@
 
   function parseNewPlannedPath(path, diagnostics) {
     const pathStatuses = new Set([
-      "clear", "limited", "blocked_near_field", "initializing", "reset",
+      "clear", "limited", "blocked_near_field", "turn_side_unresolved",
+      "initializing", "reset",
     ]);
     const stabilityStatuses = new Set([
       "replanned", "initialized", "stable", "holding_candidate",
@@ -746,8 +1048,37 @@
             point[1] - path.points[index][1],
           ) - 0.01) > 0.001) ||
         (neutral && (path.length_m !== 0 || path.points.length !== 1)) ||
-        (path.status === "blocked_near_field" &&
+        (["blocked_near_field", "turn_side_unresolved"].includes(path.status) &&
           (path.length_m !== 0 || path.points.length !== 1))) {
+      throw new Error("invalid planned path contract");
+    }
+    const rawTurnCandidates = path.turn_candidates == null
+      ? [] : path.turn_candidates;
+    if (!Array.isArray(rawTurnCandidates) ||
+        rawTurnCandidates.some((candidate) =>
+          !isPlainObject(candidate) ||
+          !["left", "right"].includes(candidate.direction) ||
+          !Number.isFinite(candidate.angle_deg) ||
+          !Number.isFinite(candidate.cost) || candidate.cost < 0 ||
+          !Number.isFinite(candidate.goal_forward_m) ||
+          !Number.isFinite(candidate.goal_lateral_m) ||
+          !Array.isArray(candidate.points) || candidate.points.length < 2 ||
+          candidate.points.some((point) => !validPointPair(point)) ||
+          Math.abs(candidate.points[0][0]) > 1e-9 ||
+          Math.abs(candidate.points[0][1]) > 1e-9 ||
+          candidate.points.slice(1).some((point, index) =>
+            Math.abs(Math.hypot(
+              point[0] - candidate.points[index][0],
+              point[1] - candidate.points[index][1],
+            ) - 0.01) > 0.001) ||
+          (candidate.direction === "left" && candidate.angle_deg >= 0) ||
+          (candidate.direction === "right" && candidate.angle_deg <= 0))) {
+      throw new Error("invalid planned path contract");
+    }
+    if (path.status === "turn_side_unresolved" &&
+        (rawTurnCandidates.length !== 2 ||
+          new Set(rawTurnCandidates.map((candidate) => candidate.direction))
+            .size !== 2)) {
       throw new Error("invalid planned path contract");
     }
     const routeChanged = [
@@ -762,6 +1093,7 @@
     }
     return {
       ...deepClone(path),
+      turn_candidates: deepClone(rawTurnCandidates),
       blocked_previous_path: parseBlockedPreviousPath(
         path.blocked_previous_path,
       ),
@@ -794,12 +1126,83 @@
     if (!["live", "degraded"].includes(snapshot.status)) {
       return { blocked: true, reason: snapshot.status };
     }
-    if (!["ok", "synthetic"].includes(scene.calibration_status)) {
-      return { blocked: true, reason: scene.calibration_status };
-    }
     const hasProbabilityMap = Object.prototype.hasOwnProperty.call(
       scene, "probabilistic_local_map",
     );
+    if (!["ok", "synthetic", "spi_raw"].includes(scene.calibration_status)) {
+      try {
+        const surface = hasProbabilityMap
+          ? parseReflectivitySurface(scene) : null;
+        if (surface && surface.source === "full_range_azimuth_heatmap" &&
+            surface.cells.length > 0) {
+          const grid = decodeSceneV1Grid(scene.grid);
+          let adcRangeAngleSurface = null;
+          const sceneWarnings = [`${scene.calibration_status}_evidence_only`];
+          try {
+            adcRangeAngleSurface = parseAdcRangeAngleSurface(scene);
+          } catch (_adcError) {
+            sceneWarnings.push("adc_range_angle_surface_invalid");
+          }
+          return {
+            blocked: false,
+            evidenceOnly: true,
+            calibrationStatus: scene.calibration_status,
+            poseMode: scene.pose_mode,
+            grid,
+            gridMeta: deepClone(scene.grid),
+            probabilisticLocalMap: null,
+            reflectivitySurface: surface,
+            adcRangeAngleSurface,
+            reflectivityCorridor: {
+              status: "unavailable", walls: [],
+            },
+            reflectivityBoundaries: {
+              status: "unavailable", walls: [],
+            },
+            reflectivityContours: {
+              status: "unavailable", segments: [],
+            },
+            sceneWarnings,
+            groundFilter: parseGroundFilter(
+              scene.ground_filter, hasProbabilityMap,
+            ),
+            filteredTracks: [],
+            tracks: [],
+            referenceTracks: [],
+            diagnostics: deepClone(scene.diagnostics || {}),
+            plannedPath: {
+              status: "unavailable",
+              stability_status: "evidence_only",
+              length_m: 0,
+              points: [],
+              minimum_passage_width_m: 0.21,
+              blocked_previous_path: null,
+            },
+            motionCompensation: { status: "unavailable", applied: false },
+            accumulatedObstacles: [],
+            rollingMapObstacles: [],
+            rollingMap: null,
+            travelTrail: {
+              radiusM: 0.50,
+              resolutionM: 0.01,
+              source: "unavailable",
+              points: [[0, 0]],
+            },
+            obstacleMemoryWindowMs: 0,
+            hazard: {
+              level: "UNKNOWN",
+              threshold_m: 0.10,
+              nearest_confirmed_m: null,
+              reason: scene.calibration_status,
+            },
+            hazardCopy: "반사강도만 표시 · 충돌 판단은 미검증",
+          };
+        }
+      } catch (_error) {
+        // A malformed evidence payload remains blocked below.
+      }
+      return { blocked: true, reason: scene.calibration_status };
+    }
     if (scene.pose_mode !== (hasProbabilityMap
       ? "robot_relative_short_memory" : "robot_relative")) {
       throw new Error("invalid pose contract");
@@ -816,12 +1219,71 @@
       ? parseProbabilisticLocalMap(scene) : null;
     const reflectivitySurface = hasProbabilityMap
       ? parseReflectivitySurface(scene) : null;
-    const reflectivityCorridor = hasProbabilityMap
-      ? parseReflectivityCorridor(scene) : null;
-    const reflectivityBoundaries = hasProbabilityMap
-      ? parseReflectivityBoundaries(scene) : null;
-    const reflectivityContours = hasProbabilityMap
-      ? parseReflectivityContours(scene) : null;
+    const sceneWarnings = [];
+    let adcRangeAngleSurface = null;
+    try {
+      adcRangeAngleSurface = parseAdcRangeAngleSurface(scene);
+    } catch (_error) {
+      sceneWarnings.push("adc_range_angle_surface_invalid");
+    }
+    let reflectivityCorridor = null;
+    let reflectivityBoundaries = null;
+    if (hasProbabilityMap) {
+      try {
+        reflectivityCorridor = parseReflectivityCorridor(scene);
+      } catch (error) {
+        if (reflectivitySurface?.source !==
+            "full_range_azimuth_heatmap") {
+          throw error;
+        }
+        reflectivityCorridor = {
+          status: "unavailable",
+          method: "deterministic_boundary_fit",
+          geometry: null,
+          historyFrames: 5,
+          requiredHits: 3,
+          hits: 0,
+          measuredHeadingDeg: null,
+          guidanceHeadingDeg: null,
+          widthM: null,
+          confidence: 0,
+          walls: [],
+        };
+        sceneWarnings.push("reflectivity_corridor_invalid");
+      }
+      try {
+        reflectivityBoundaries = parseReflectivityBoundaries(scene);
+      } catch (error) {
+        if (reflectivitySurface?.source !==
+            "full_range_azimuth_heatmap") {
+          throw error;
+        }
+        reflectivityBoundaries = {
+          status: "unavailable",
+          method: "independent_boundary_fit",
+          historyFrames: 5,
+          requiredHits: 3,
+          walls: [],
+        };
+        sceneWarnings.push("reflectivity_boundaries_invalid");
+      }
+    }
+    let reflectivityContours = null;
+    if (hasProbabilityMap) {
+      try {
+        reflectivityContours = parseReflectivityContours(scene);
+      } catch (_error) {
+        reflectivityContours = {
+          status: "unavailable",
+          method: "calibrated_nearest_reflection_segments",
+          historyFrames: 5,
+          requiredHits: 3,
+          maxRangeM: 0.30,
+          segments: [],
+        };
+        sceneWarnings.push("reflectivity_contours_invalid");
+      }
+    }
     const groundFilter = parseGroundFilter(scene.ground_filter, hasProbabilityMap);
     const diagnostics = parseDiagnostics(scene.diagnostics, hasProbabilityMap);
     const plannedPath = hasProbabilityMap
@@ -923,9 +1385,11 @@
       gridMeta: deepClone(scene.grid),
       probabilisticLocalMap,
       reflectivitySurface,
+      adcRangeAngleSurface,
       reflectivityCorridor,
       reflectivityBoundaries,
       reflectivityContours,
+      sceneWarnings,
       groundFilter,
       filteredTracks: deepClone(filteredTracks),
       tracks: deepClone(tracks),
@@ -990,6 +1454,8 @@
     decodeOccupancyGrid,
     filterFreshTracks,
     parseRadarScene,
+    parseRadarEvidenceFallback,
+    parseAdcRangeAngleSurface,
     makeMapTransform,
     projectMapPoint,
   };

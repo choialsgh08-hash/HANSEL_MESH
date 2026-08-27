@@ -114,6 +114,12 @@ class RadarMountGeometry:
         planar_distance = math.hypot(robot_forward, robot_lateral)
         if robot_forward < 0.0 or planar_distance > self.filter_range_m:
             return None
+        # A return cannot physically be far below the floor.  With the
+        # IWRL6432BOOST's coarse elevation aperture, side-wall lobes can be
+        # assigned a strongly negative z value.  Calling those returns floor
+        # erases exactly the close lateral boundary needed for driving.
+        if robot_height < -self.ground_uncertainty_m:
+            return None
         if robot_height <= self.ground_rejection_height_m:
             return "ground"
         if robot_height <= (

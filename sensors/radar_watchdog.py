@@ -25,6 +25,9 @@ class ExpectedRadarEvidence:
     heatmap_azimuth_bins: int
     heatmap_range_bins: int
     heatmap_range_step_m: float
+    adc_samples_per_chirp: int | None = None
+    adc_rx_channels: int | None = None
+    adc_chirps: int | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +240,17 @@ class RadarEpochWatchdog:
 
     def _qualifies(self, frame: RadarFrame) -> bool:
         heatmap = frame.heatmap
+        adc = frame.adc_snapshot
+        adc_qualifies = (
+            self._expected.adc_samples_per_chirp is None
+            or (
+                adc is not None
+                and adc.samples_per_chirp
+                == self._expected.adc_samples_per_chirp
+                and adc.rx_channels == self._expected.adc_rx_channels
+                and adc.chirps == self._expected.adc_chirps
+            )
+        )
         return (
             frame.complete
             and frame.profile_id == self._expected.profile_id
@@ -246,6 +260,7 @@ class RadarEpochWatchdog:
             and heatmap.range_bins == self._expected.heatmap_range_bins
             and heatmap.range_step_m
             == self._expected.heatmap_range_step_m
+            and adc_qualifies
         )
 
     def _apply_deadlines(self, now_s: float) -> None:

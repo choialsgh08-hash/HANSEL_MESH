@@ -220,6 +220,9 @@ def command_radar_bin(args: argparse.Namespace) -> int:
             "heatmap_range_step_m",
             None,
         ),
+        adc_samples_per_chirp=getattr(args, "adc_samples_per_chirp", None),
+        adc_rx_channels=getattr(args, "adc_rx_channels", None),
+        adc_chirps=getattr(args, "adc_chirps", None),
         tlv_length_includes_header=args.tlv_length_includes_header,
         allow_elided_empty_point_tlv=getattr(
             args,
@@ -502,6 +505,11 @@ def command_radar_live(args: argparse.Namespace) -> int:
                     "heatmap_range_step_m",
                     None,
                 ),
+                adc_samples_per_chirp=getattr(
+                    args, "adc_samples_per_chirp", None,
+                ),
+                adc_rx_channels=getattr(args, "adc_rx_channels", None),
+                adc_chirps=getattr(args, "adc_chirps", None),
                 stop_requested=(
                     None
                     if parent_watcher is None
@@ -712,6 +720,9 @@ def build_parser() -> argparse.ArgumentParser:
             "--heatmap-azimuth-bins and --heatmap-range-bins"
         ),
     )
+    radar.add_argument("--adc-samples-per-chirp", type=int)
+    radar.add_argument("--adc-rx-channels", type=int)
+    radar.add_argument("--adc-chirps", type=int)
     radar.add_argument("--tlv-length-includes-header", action="store_true")
     radar.add_argument(
         "--allow-elided-empty-point-tlv",
@@ -858,6 +869,9 @@ def build_parser() -> argparse.ArgumentParser:
             "--heatmap-azimuth-bins and --heatmap-range-bins"
         ),
     )
+    live.add_argument("--adc-samples-per-chirp", type=int)
+    live.add_argument("--adc-rx-channels", type=int)
+    live.add_argument("--adc-chirps", type=int)
     live.add_argument(
         "--allow-elided-empty-point-tlv",
         action="store_true",
@@ -926,6 +940,20 @@ def main() -> int:
         or heatmap_range_step_m <= 0
     ):
         parser.error("--heatmap-range-step-m must be positive")
+    adc_configuration = (
+        getattr(args, "adc_samples_per_chirp", None),
+        getattr(args, "adc_rx_channels", None),
+        getattr(args, "adc_chirps", None),
+    )
+    if any(value is not None for value in adc_configuration) and not all(
+        value is not None for value in adc_configuration
+    ):
+        parser.error(
+            "--adc-samples-per-chirp, --adc-rx-channels, and --adc-chirps "
+            "must be supplied together"
+        )
+    if any(value is not None and value < 1 for value in adc_configuration):
+        parser.error("ADC dimensions must be positive")
     try:
         return int(args.func(args))
     except (OSError, RuntimeError, ValueError) as exc:

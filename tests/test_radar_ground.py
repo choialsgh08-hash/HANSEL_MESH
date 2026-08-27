@@ -60,6 +60,20 @@ class RadarMountGeometryTests(unittest.TestCase):
         self.assertFalse(geometry.is_ground(-0.01, 0.0, -0.065))
         self.assertFalse(geometry.is_ground(0.61, 0.0, -0.065))
 
+    def test_physically_impossible_below_floor_height_is_not_called_ground(self):
+        geometry = RadarMountGeometry()
+
+        # IWRL6432BOOST elevation is coarse.  This is the live-wall failure
+        # mode: a 20 cm side reflection aliases to z=-15 cm even though the
+        # sensor is only 6.5 cm above the floor.  It must remain 2D evidence.
+        self.assertIsNone(
+            geometry.ground_classification(0.18, 0.19, -0.15)
+        )
+        self.assertEqual(
+            geometry.ground_classification(0.18, 0.19, -0.055),
+            "ground",
+        )
+
     def test_nonfinite_point_height_is_not_treated_as_ground(self):
         geometry = RadarMountGeometry()
 

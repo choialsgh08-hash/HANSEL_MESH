@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import heapq
 import math
 import statistics
 import time
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from common.radar_geometry import RadarAxes
 from common.sensor_contract import RadarFrame
@@ -16,6 +17,10 @@ from monitor.radar_local_map import ProbabilisticRollingGrid
 from monitor.radar_motion import RadarMotionEstimator
 from monitor.radar_path import PathSelectionHysteresis
 from monitor.radar_ground import RadarMountGeometry
+from monitor.radar_inverse_sensor import first_surface_measurements
+from monitor.radar_adc import (
+    RadarAdcAngularSurface,
+)
 from monitor.radar_corridor import ReflectivityCorridorEstimator
 from monitor.radar_contour import CalibratedContourEstimator
 from monitor.radar_reflectivity import RadarReflectivitySurface
@@ -24,7 +29,6 @@ from monitor.radar_tracking import (
     POINT_HAZARD_CONFIRM_HITS,
     POINT_HAZARD_WINDOW_FRAMES,
     POINT_HISTORY_FRAMES,
-    POINT_MIN_QUALITY,
     POINT_POSITION_RESIDUAL_LIMIT_M,
     POINT_STRONG_QUALITY,
     height_band,
@@ -61,19 +65,38 @@ PATH_CURVATURES = (
     0.0,
     2.0 * PATH_HEADING_STEP_RAD / PATH_SEARCH_STEP_M,
 )
-PATH_LOCAL_MAX_RANGE_M = 0.60
+PATH_LOCAL_MAX_RANGE_M = 0.30
+SPI_REFLECTIVITY_VALID_MIN_RANGE_M = 0.12
+REFLECTIVITY_STEER_MIN_RANGE_M = 0.16
+REFLECTIVITY_NEAR_STEER_MIN_RANGE_M = 0.12
+REFLECTIVITY_NEAR_STEER_MAX_RANGE_M = 0.16
+REFLECTIVITY_NEAR_BLOCK_MIN_GAIN = 0.10
+# Enough to make a close bend influence the route without allowing one broad
+# 29-degree near-field beam to command an unrealistic +/-40 degree turn.
+REFLECTIVITY_NEAR_BLOCK_COST_WEIGHT = 0.18
+# A side is advisory only when its accumulated reflectivity cost separates
+# from the opposite side by more than the measured frame-to-frame ambiguity.
+# Below this floor the radar proves a bend, but not which branch is open.
+REFLECTIVITY_SIDE_RESOLUTION_MIN_GAP = 0.04
+REFLECTIVITY_STEER_MIN_GAIN = 0.055
+REFLECTIVITY_STEER_MIN_RELATIVE_GAIN = 0.09
+REFLECTIVITY_POINT_STEER_WEIGHT = 0.015
+REFLECTIVITY_PROFILE_MEAN_WEIGHT = 0.25
+REFLECTIVITY_PROFILE_UPPER_WEIGHT = 0.75
+REFLECTIVITY_SCORE_HISTORY_FRAMES = 7
+REFLECTIVITY_FORWARD_BLOCK_UPPER = 0.58
+REFLECTIVITY_FORWARD_BLOCK_EXCESS = 0.07
+EVIDENCE_CONTEXT_RADIUS_M = 0.50
 PATH_FOV_AZIMUTH_DEG = 60.0
 PATH_PREFERRED_GOAL_MAX_DEG = 55.0
 PATH_SEARCH_MAX_ARC_M = 1.20
 PATH_SEARCH_MAX_EXPANSIONS = 12_000
 PATH_GOAL_FORWARD_M = 0.55
-PATH_DYNAMIC_GOAL_RANGE_M = 0.50
+PATH_DYNAMIC_GOAL_RANGE_M = 0.28
 PATH_DYNAMIC_GOAL_TOLERANCE_M = 0.04
 NEAR_OCCUPANCY_RESOLUTION_M = 0.025
 NEAR_OCCUPANCY_TTL_NS = 1_000_000_000
-NEAR_POINT_MIN_CONFIDENCE = 0.50
 NEAR_POINT_REACTIVE_MIN_CONFIDENCE = 0.85
-NEAR_HEATMAP_MIN_CONFIDENCE = 0.85
 STABLE_OCCUPANCY_RESOLUTION_M = 0.05
 STABLE_OCCUPANCY_WALL_LINK_M = 0.18
 OBSTACLE_CLUSTER_LINK_M = 0.10
@@ -83,7 +106,6 @@ OBSTACLE_CLUSTER_MAX_RANGE_DELTA_M = 0.10
 STABLE_OCCUPANCY_MIN_HITS = 2
 STABLE_OCCUPANCY_TTL_NS = 5_000_000_000
 SHORT_MEMORY_RADIUS_M = 0.50
-CORRIDOR_POINT_MIN_QUALITY = 0.40
 TRAVEL_TRAIL_RESOLUTION_M = 0.01
 ACCUMULATED_OBSTACLE_TTL_S = 5.0
 ACCUMULATED_OBSTACLE_TTL_NS = 5_000_000_000
@@ -98,20 +120,13 @@ HEATMAP_ENTER_MIN_RESIDUAL_DB = 8.0
 HEATMAP_EXIT_MIN_RESIDUAL_DB = 5.0
 HEATMAP_ENTER_MAD_MULTIPLIER = 5.0
 HEATMAP_EXIT_MAD_MULTIPLIER = 3.0
-CONTOUR_MIN_AZIMUTH_BINS = 24
-CONTOUR_MIN_RANGE_M = 0.10
-CONTOUR_MAX_RANGE_M = 0.30
-CONTOUR_TRUSTED_AZIMUTH_DEG = 60.0
-CONTOUR_MIN_RESIDUAL_DB = 0.50
-CONTOUR_MIN_ROW_PROMINENCE_DB = 2.0
 HEATMAP_SINGLE_CELL_PEAK_DB = 16.0
-HEATMAP_TRACK_ASSOCIATION_M = 0.24
-HEATMAP_POINT_ASSOCIATION_M = 0.25
+HEATMAP_TRACK_ASSOCIATION_M = 0.12
 HEATMAP_CONFIRM_HITS = 3
 HEATMAP_POINT_CONFIRM_HITS = 2
 HEATMAP_HISTORY_FRAMES = 5
-HEATMAP_MAX_POSITION_JITTER_M = 0.15
-HEATMAP_MAX_CLUSTER_RADIUS_M = 0.30
+HEATMAP_MAX_POSITION_JITTER_M = 0.12
+HEATMAP_MAX_CLUSTER_RADIUS_M = 0.15
 HEATMAP_MAX_CLUSTERS_PER_FRAME = 64
 DANGER_ENTER_M = 0.10
 DANGER_EXIT_M = 0.13
@@ -122,7 +137,7 @@ FAULT_SOURCE_STATUSES = {
     "replay_end",
     "replay_loop_restart",
 }
-TRUSTED_CALIBRATION_STATUSES = {"ok", "synthetic"}
+TRUSTED_CALIBRATION_STATUSES = {"ok", "synthetic", "spi_raw"}
 
 
 class RadarHazardEvaluator:
@@ -275,6 +290,7 @@ class RadarSceneEstimator:
         self._ground_rejected_count = 0
         self._ground_fringe_rejected_count = 0
         self._heatmap_cells_accepted = 0
+        self._heatmap_cells_observed = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
         self._heatmap_reflection_count = 0
@@ -289,7 +305,7 @@ class RadarSceneEstimator:
         self._stable_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
         self._near_cells: Dict[Tuple[int, int], Dict[str, object]] = {}
         self._probability_grid = ProbabilisticRollingGrid(
-            radius_m=0.50,
+            radius_m=EVIDENCE_CONTEXT_RADIUS_M,
             resolution_m=0.05,
             occupied_threshold=0.75,
             decay_half_life_s=1.0,
@@ -297,12 +313,23 @@ class RadarSceneEstimator:
             hit_probability=0.80,
             maximum_probability=0.97,
         )
-        self._reflectivity_surface = RadarReflectivitySurface()
+        self._reflectivity_surface = RadarReflectivitySurface(
+            radius_m=EVIDENCE_CONTEXT_RADIUS_M,
+            clutter_model=clutter_model,
+            # The compact SPI chirp's first complete range-resolution cell is
+            # centred at 11.9 cm.  Publishing the zero-filled 10 cm display
+            # row let median polish turn blind data into artificial ridges.
+            valid_min_range_m=SPI_REFLECTIVITY_VALID_MIN_RANGE_M,
+        )
+        self._adc_angular_surface = RadarAdcAngularSurface()
         self._reflectivity_corridor = ReflectivityCorridorEstimator()
         self._reflectivity_contours = CalibratedContourEstimator()
         self._scene_epoch = 0
         self._travel_trail: List[Tuple[float, float]] = [(0.0, 0.0)]
         self._path_selector = PathSelectionHysteresis(confirm_frames=3)
+        self._opening_score_history: Deque[Dict[float, float]] = deque(
+            maxlen=REFLECTIVITY_SCORE_HISTORY_FRAMES - 1,
+        )
         self._planned_path = self._neutral_planned_path("initializing")
         self._path_stability_status = "initializing"
 
@@ -322,6 +349,7 @@ class RadarSceneEstimator:
         self._ground_rejected_count = 0
         self._ground_fringe_rejected_count = 0
         self._heatmap_cells_accepted = 0
+        self._heatmap_cells_observed = 0
         self._heatmap_candidate_cells = 0
         self._heatmap_cluster_count = 0
         self._heatmap_reflection_count = 0
@@ -334,10 +362,12 @@ class RadarSceneEstimator:
         self._near_cells = {}
         self._probability_grid.clear()
         self._reflectivity_surface.reset()
+        self._adc_angular_surface.reset()
         self._reflectivity_corridor.reset()
         self._reflectivity_contours.reset()
         self._travel_trail = [(0.0, 0.0)]
         self._path_selector.reset()
+        self._opening_score_history.clear()
         self._planned_path = self._neutral_planned_path("reset")
         self._path_stability_status = "reset"
         self._last_reset_reason = reason
@@ -368,10 +398,43 @@ class RadarSceneEstimator:
         self._quality_gate_rejected_count = 0
         self._ground_rejected_count = 0
         self._ground_fringe_rejected_count = 0
+        previous_calibration_status = self._calibration_status
         self._calibration_status = self._binding_status(frame)
+        heatmap_elapsed_frame_windows = min(
+            HEATMAP_HISTORY_FRAMES,
+            frame.dropped_frames_since_previous + 1,
+        )
         if self._calibration_status not in TRUSTED_CALIBRATION_STATUSES:
-            self._clear_evidence(self._calibration_status)
-            self._raw_point_count = len(frame.points)
+            # Clear prior driving state once when trust changes, but retain
+            # consecutive full heatmaps while the same untrusted status
+            # persists.  Calibration controls safety authorization; it must
+            # not make the operator evidence flicker or remain forever new.
+            if previous_calibration_status != self._calibration_status:
+                calibration_status = self._calibration_status
+                self._clear_evidence(calibration_status)
+                self._raw_point_count = len(frame.points)
+                self._calibration_status = calibration_status
+            if (
+                frame.heatmap is not None
+                and self.axes.supports_native_heatmap()
+            ):
+                self._reflectivity_surface.ingest_heatmap(
+                    frame.heatmap,
+                    now,
+                    lateral_sign=self.axes.lateral_sign,
+                    elapsed_frame_windows=heatmap_elapsed_frame_windows,
+                )
+                self._heatmap_cells_observed = len(
+                    self._reflectivity_surface.payload(now)["cells"]
+                )
+                if frame.adc_snapshot is not None:
+                    self._adc_angular_surface.ingest(
+                        frame.adc_snapshot,
+                        range_step_m=frame.heatmap.range_step_m,
+                        received_at=now,
+                        elapsed_frame_windows=heatmap_elapsed_frame_windows,
+                        lateral_sign=self.axes.lateral_sign,
+                    )
             return
         self._expire_tracks(now)
         heatmap_range_step_m = (
@@ -394,7 +457,7 @@ class RadarSceneEstimator:
             synthetic=self.synthetic,
         )
         accepted_points: List[Tuple[object, float, float, float, float]] = []
-        corridor_point_observations: List[Dict[str, float]] = []
+        ground_positions: List[Tuple[float, float]] = []
         rejected = 0
         for point in frame.points:
             forward_m, lateral_m = self.axes.map_point(point)
@@ -410,23 +473,13 @@ class RadarSceneEstimator:
                 )
             )
             quality_score = point_quality_score(point.snr_db, point.noise_db)
-            if (
-                not calibrated_clutter
-                and quality_score >= CORRIDOR_POINT_MIN_QUALITY
-                and math.hypot(forward_m, lateral_m)
-                <= SHORT_MEMORY_RADIUS_M
-            ):
-                corridor_point_observations.append({
-                    "forward_m": forward_m,
-                    "lateral_m": lateral_m,
-                    "intensity": quality_score,
-                })
             ground_classification = self.mount_geometry.ground_classification(
                 forward_m,
                 lateral_m,
                 point.z_m,
             )
             if ground_classification is not None:
+                ground_positions.append((forward_m, lateral_m))
                 if ground_classification == "ground":
                     self._ground_rejected_count += 1
                 else:
@@ -436,9 +489,6 @@ class RadarSceneEstimator:
                 rejected += 1
                 continue
             if range_step_m is None:
-                self._quality_gate_rejected_count += 1
-                continue
-            if quality_score < POINT_MIN_QUALITY:
                 self._quality_gate_rejected_count += 1
                 continue
             accepted_points.append(
@@ -521,10 +571,6 @@ class RadarSceneEstimator:
             POINT_HISTORY_FRAMES,
             frame.dropped_frames_since_previous + 1,
         )
-        heatmap_elapsed_frame_windows = min(
-            HEATMAP_HISTORY_FRAMES,
-            frame.dropped_frames_since_previous + 1,
-        )
         for track in self._tracks:
             hits = track["_point_hits"]
             assert isinstance(hits, list)
@@ -581,8 +627,41 @@ class RadarSceneEstimator:
             accepted_point_positions.append((forward_m, lateral_m))
             point_count += 1
 
-        reflectivity_observations: List[Tuple[float, float, float]] = []
-        contour_observations: List[Dict[str, object]] = []
+        corridor_point_observations = [
+            {
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "intensity": quality_score,
+            }
+            for _, forward_m, lateral_m, _, quality_score in accepted_points
+            if math.hypot(forward_m, lateral_m) <= SHORT_MEMORY_RADIUS_M
+        ]
+
+        if (
+            frame.heatmap is not None
+            and self.axes.supports_native_heatmap()
+        ):
+            self._reflectivity_surface.ingest_heatmap(
+                frame.heatmap,
+                now,
+                lateral_sign=self.axes.lateral_sign,
+                elapsed_frame_windows=heatmap_elapsed_frame_windows,
+            )
+        if (
+            frame.adc_snapshot is not None
+            and frame.heatmap is not None
+            and self.axes.supports_native_heatmap()
+        ):
+            self._adc_angular_surface.ingest(
+                frame.adc_snapshot,
+                range_step_m=frame.heatmap.range_step_m,
+                received_at=now,
+                elapsed_frame_windows=heatmap_elapsed_frame_windows,
+                lateral_sign=self.axes.lateral_sign,
+            )
+        reflectivity_surface = self._reflectivity_surface.payload(now)
+        adc_range_angle_surface = self._adc_angular_surface.payload(now)
+        self._heatmap_cells_observed = len(reflectivity_surface["cells"])
         if (
             frame.heatmap is not None
             and self.clutter_model is not None
@@ -592,11 +671,8 @@ class RadarSceneEstimator:
             (
                 clusters,
                 candidate_cell_count,
-                reflectivity_observations,
+                _,
             ) = self._heatmap_clusters(frame)
-            contour_observations = self._calibrated_contour_observations(
-                frame
-            )
             point_supported_clusters = set()
             for point_forward, point_lateral in accepted_point_positions:
                 nearest_cluster_index = min(
@@ -610,12 +686,12 @@ class RadarSceneEstimator:
                 if nearest_cluster_index is None:
                     continue
                 cluster = clusters[nearest_cluster_index]
-                if math.hypot(
-                    point_forward - float(cluster["forward_m"]),
-                    point_lateral - float(cluster["lateral_m"]),
-                ) <= max(
-                    HEATMAP_POINT_ASSOCIATION_M,
-                    frame.heatmap.range_step_m * 1.5,
+                if self._heatmap_point_matches(
+                    float(cluster["forward_m"]),
+                    float(cluster["lateral_m"]),
+                    point_forward,
+                    point_lateral,
+                    frame.heatmap.range_step_m,
                 ):
                     point_supported_clusters.add(nearest_cluster_index)
             for cluster_index, cluster in enumerate(clusters):
@@ -647,22 +723,40 @@ class RadarSceneEstimator:
             self._heatmap_candidate_cells = 0
             self._heatmap_cluster_count = 0
 
-        self._reflectivity_surface.ingest(
-            reflectivity_observations,
-            now,
-            elapsed_frame_windows=heatmap_elapsed_frame_windows,
+        # Retain the complete heatmap as a soft operator surface, but fit
+        # geometry only to its range ridge.  Feeding every measured cell into
+        # a line fitter makes the rectangular sampling lattice look like
+        # walls even when no reflector occupies those cells.
+        surface_ridge = (
+            self._surface_contour_observations(
+                reflectivity_surface["cells"]
+            )
+            if self._calibration_status == "spi_raw"
+            else []
         )
-        self._reflectivity_corridor.ingest(
-            self._reflectivity_surface.payload(now)["cells"],
-            elapsed_frame_windows=heatmap_elapsed_frame_windows,
-            point_observations=corridor_point_observations,
-        )
-        self._reflectivity_contours.ingest(
-            contour_observations,
-            elapsed_frame_windows=heatmap_elapsed_frame_windows,
-        )
+        if self._calibration_status == "spi_raw":
+            # Full-frame SPI mode guides on the complete reflectivity trend.
+            # Fitting short bright fragments into walls made a scene-specific
+            # geometric hypothesis look more certain than the measurements.
+            self._reflectivity_corridor.reset()
+            self._reflectivity_contours.reset()
+        else:
+            self._reflectivity_corridor.ingest(
+                surface_ridge,
+                elapsed_frame_windows=heatmap_elapsed_frame_windows,
+                point_observations=corridor_point_observations,
+            )
+            self._reflectivity_contours.ingest(
+                surface_ridge,
+                elapsed_frame_windows=heatmap_elapsed_frame_windows,
+            )
 
-        self._update_probability_map(now)
+        self._update_probability_map(
+            now,
+            reflectivity_surface["cells"],
+            ground_positions,
+            adc_range_angle_surface,
+        )
         self._scene_point_count = point_count
         self._clutter_points_rejected = rejected
         self._heatmap_cells_accepted = self._heatmap_candidate_cells
@@ -754,6 +848,7 @@ class RadarSceneEstimator:
         ]
         stable_obstacles = self._stable_obstacle_payload(observed_at)
         reflectivity_surface = self._reflectivity_surface.payload(observed_at)
+        adc_range_angle_surface = self._adc_angular_surface.payload(observed_at)
         reflectivity_corridor = self._reflectivity_corridor.payload()
         reflectivity_boundaries = (
             self._reflectivity_corridor.boundaries_payload()
@@ -834,6 +929,15 @@ class RadarSceneEstimator:
             "accumulated_obstacles": accumulated_obstacles,
             "persistent_near_obstacles": persistent_near_obstacles,
             "reflectivity_surface": reflectivity_surface,
+            # The UART last-chirp ADC overlay is optional.  Full-frame SPI
+            # mode already supplies its own range/angle surface and never
+            # populates this legacy accumulator, so do not serialize a
+            # deliberately incomplete placeholder as if it were evidence.
+            **(
+                {"adc_range_angle_surface": adc_range_angle_surface}
+                if adc_range_angle_surface.get("range_step_m") is not None
+                else {}
+            ),
             "reflectivity_corridor": reflectivity_corridor,
             "reflectivity_boundaries": reflectivity_boundaries,
             "reflectivity_contours": reflectivity_contours,
@@ -902,6 +1006,7 @@ class RadarSceneEstimator:
                     reflectivity_surface["cells"]
                 ),
                 "heatmap_cells_accepted": self._heatmap_cells_accepted,
+                "heatmap_cells_observed": self._heatmap_cells_observed,
                 "heatmap_candidate_cells": self._heatmap_candidate_cells,
                 "heatmap_cluster_count": self._heatmap_cluster_count,
                 "heatmap_confirmed_obstacles": (
@@ -1237,6 +1342,7 @@ class RadarSceneEstimator:
         self,
         *,
         require_point_map_confirmation: bool = True,
+        include_heatmap: bool = True,
     ) -> List[Dict[str, object]]:
         strong: List[Dict[str, object]] = []
         for track in self._tracks:
@@ -1261,6 +1367,8 @@ class RadarSceneEstimator:
                 ):
                     continue
             elif (
+                not include_heatmap
+                or
                 confidence < ACCUMULATED_HEATMAP_MIN_CONFIDENCE
                 or float(track.get("peak_residual_db", 0.0))
                 < ACCUMULATED_HEATMAP_MIN_PEAK_DB
@@ -1300,8 +1408,18 @@ class RadarSceneEstimator:
             cell["source"] = str(track["source"])
             cell["_last_seen_ns"] = received_at_ns
 
-    def _update_probability_map(self, received_at: float) -> None:
-        for track in self._strong_updated_tracks():
+    def _update_probability_map(
+        self,
+        received_at: float,
+        reflectivity_cells: Sequence[Dict[str, object]] = (),
+        ground_positions: Sequence[Tuple[float, float]] = (),
+        adc_range_angle_surface: Optional[Dict[str, object]] = None,
+    ) -> None:
+        # Heatmap tracks come from the old CFAR/clustering compatibility
+        # path.  They must not bypass the range-ordered inverse model and add
+        # a stronger multipath lobe as a hard map hit.  Point tracks remain an
+        # independent corroborating sensor source.
+        for track in self._strong_updated_tracks(include_heatmap=False):
             self._probability_grid.add_hit(
                 float(track["forward_m"]),
                 float(track["lateral_m"]),
@@ -1311,6 +1429,67 @@ class RadarSceneEstimator:
                 float(track.get("lateral_uncertainty_m", 0.0)),
                 received_at,
             )
+
+        measurements: List[Dict[str, object]] = []
+        for surface in first_surface_measurements(
+            reflectivity_cells,
+            minimum_range_m=self._reflectivity_surface.valid_min_range_m,
+            maximum_range_m=EVIDENCE_CONTEXT_RADIUS_M,
+            corroborating_peaks=(
+                adc_range_angle_surface.get("peaks", ())
+                if isinstance(adc_range_angle_surface, dict)
+                else ()
+            ),
+            exclude_near_boundary=self._calibration_status == "spi_raw",
+        ):
+            forward_m = float(surface["forward_m"])
+            lateral_m = float(surface["lateral_m"])
+            distance_m = float(surface["range_m"])
+            range_uncertainty_m = float(surface["range_uncertainty_m"])
+            lateral_uncertainty_m = max(
+                GRID_RESOLUTION_M / 2.0,
+                distance_m * math.sin(math.radians(
+                    float(surface["angular_uncertainty_deg"])
+                )),
+            )
+            if self.clutter_model is not None and any(
+                math.hypot(
+                    forward_m - cluster.forward_m,
+                    lateral_m - cluster.lateral_m,
+                ) <= cluster.radius_m + max(
+                    range_uncertainty_m,
+                    lateral_uncertainty_m,
+                ) + GRID_RESOLUTION_M / math.sqrt(2.0)
+                for cluster in self.clutter_model.point_clusters
+            ):
+                continue
+            if any(
+                math.hypot(
+                    forward_m - ground_forward,
+                    lateral_m - ground_lateral,
+                ) <= max(
+                    GRID_RESOLUTION_M,
+                    range_uncertainty_m * 2.0,
+                    lateral_uncertainty_m + GRID_RESOLUTION_M / 2.0,
+                )
+                for ground_forward, ground_lateral in ground_positions
+            ):
+                continue
+            measurements.append({
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "measurement_probability": float(
+                    surface["measurement_probability"]
+                ),
+                "confidence": float(surface["confidence"]),
+                "source": "heatmap",
+                "range_uncertainty_m": range_uncertainty_m,
+                "lateral_uncertainty_m": lateral_uncertainty_m,
+            })
+        # The UART ADC TLV contains only the final chirp pair from the same
+        # frame that produced the range-azimuth heatmap. Its phase surface is
+        # display diagnostics, not an independent occupancy observation.
+        self._probability_grid.observe_frame(measurements, received_at)
 
     def _travel_trail_payload(self) -> List[List[float]]:
         points = list(self._travel_trail)
@@ -1330,19 +1509,18 @@ class RadarSceneEstimator:
             if source == "point":
                 confirmed = track.get("point_confirmed") is True
                 updated = bool(track.get("_updated_by_point"))
-            elif source == "heatmap":
-                confirmed = track.get("heatmap_confirmed") is True
-                updated = bool(track.get("_updated_by_heatmap"))
             else:
                 continue
             if not confirmed or not updated:
                 continue
             confidence = float(track["confidence"])
             if source == "point":
-                if confidence < NEAR_POINT_MIN_CONFIDENCE:
+                # A two-frame point is useful visual evidence at 0.50, but
+                # reactive collision geometry needs the stronger directional
+                # evidence threshold.  This prevents low-directionality SPI
+                # coupling lobes from stopping the path at the sensor.
+                if confidence < NEAR_POINT_REACTIVE_MIN_CONFIDENCE:
                     continue
-            elif confidence < NEAR_HEATMAP_MIN_CONFIDENCE:
-                continue
             forward = float(track["forward_m"])
             lateral = float(track["lateral_m"])
             distance = math.hypot(forward, lateral)
@@ -1458,24 +1636,29 @@ class RadarSceneEstimator:
 
     def _update_stable_path(self, now: float) -> None:
         obstacles = self._planning_obstacle_payload(now)
-        contours = self._reflectivity_contours.payload()
-        corridor = self._reflectivity_corridor.payload()
-        if contours["status"] == "confirmed":
-            obstacles.extend(self._reflectivity_contour_obstacles(contours))
-        elif corridor["status"] == "confirmed":
-            obstacles.extend(self._reflectivity_corridor_obstacles(corridor))
-        preferred_goal_angle_deg = (
-            corridor["guidance_heading_deg"]
-            if (
-                contours["status"] != "confirmed"
-                and corridor["status"] == "confirmed"
+        now_ns = self._seconds_to_ns(now)
+        confirmed_stop = any(
+            track.get("source") == "point"
+            and track.get("point_confirmed") is True
+            and now_ns - int(track["_received_at_ns"]) < TRACK_TTL_NS
+            and float(track.get("hazard_distance_m", track["distance_m"]))
+            <= DANGER_ENTER_M
+            for track in self._tracks
+        )
+        if self._calibration_status == "spi_raw":
+            reflectivity = self._reflectivity_surface.payload(now)
+            candidate = self._plan_reflectivity_opening(
+                reflectivity.get("cells", ()),
+                obstacles,
+                confirmed_stop=confirmed_stop,
+                score_history=tuple(self._opening_score_history),
             )
-            else None
-        )
-        candidate = self._plan_path(
-            obstacles,
-            preferred_goal_angle_deg=preferred_goal_angle_deg,
-        )
+            self._opening_score_history.append({
+                float(item["angle_deg"]): float(item["cost"])
+                for item in candidate["instant_opening_scores"]
+            })
+        else:
+            candidate = self._plan_path(obstacles)
         motion_factor = {
             "ok": 1.0,
             "stabilizing": 0.85,
@@ -1496,11 +1679,33 @@ class RadarSceneEstimator:
             else "medium" if confidence >= 0.55
             else "low"
         )
-        now_ns = self._seconds_to_ns(now)
-        blocked_segments = self._path_collision_segments(
-            self._planned_path,
-            obstacles,
-        )
+        if self._calibration_status == "spi_raw":
+            blocked_segments = (
+                [{
+                    "start_index": 0,
+                    "end_index": max(
+                        0,
+                        len(self._planned_path.get("points", ())) - 1,
+                    ),
+                    "reason": "confirmed_point_inside_10cm",
+                }]
+                if confirmed_stop
+                else [{
+                    "start_index": 0,
+                    "end_index": max(
+                        0,
+                        len(self._planned_path.get("points", ())) - 1,
+                    ),
+                    "reason": "turn_side_unresolved",
+                }]
+                if candidate["status"] == "turn_side_unresolved"
+                else []
+            )
+        else:
+            blocked_segments = self._path_collision_segments(
+                self._planned_path,
+                obstacles,
+            )
         selected = self._path_selector.select(
             candidate,
             bool(blocked_segments),
@@ -1508,86 +1713,6 @@ class RadarSceneEstimator:
             now_ns,
         )
         self._set_planned_path(selected, now_ns)
-
-    @staticmethod
-    def _reflectivity_contour_obstacles(
-        contours: Dict[str, object],
-    ) -> List[Dict[str, object]]:
-        obstacles: List[Dict[str, object]] = []
-        for segment in contours["segments"]:
-            start_forward, start_lateral = map(float, segment["start"])
-            end_forward, end_lateral = map(float, segment["end"])
-            length = math.hypot(
-                end_forward - start_forward,
-                end_lateral - start_lateral,
-            )
-            sample_count = max(
-                1,
-                math.ceil(length / NEAR_OCCUPANCY_RESOLUTION_M),
-            )
-            for sample_index in range(sample_count + 1):
-                ratio = sample_index / sample_count
-                obstacles.append({
-                    "forward_m": (
-                        start_forward
-                        + (end_forward - start_forward) * ratio
-                    ),
-                    "lateral_m": (
-                        start_lateral
-                        + (end_lateral - start_lateral) * ratio
-                    ),
-                    "range_uncertainty_m": 0.0,
-                    "lateral_uncertainty_m": 0.0,
-                    "support_radius_m": (
-                        NEAR_OCCUPANCY_RESOLUTION_M / math.sqrt(2.0)
-                    ),
-                    "confidence": float(segment["confidence"]),
-                    "hits": int(segment["hits"]),
-                    "evidence_kind": "reflectivity_contour",
-                    "source": "heatmap",
-                })
-        return obstacles
-
-    @staticmethod
-    def _reflectivity_corridor_obstacles(
-        corridor: Dict[str, object],
-    ) -> List[Dict[str, object]]:
-        obstacles: List[Dict[str, object]] = []
-        confidence = float(corridor["confidence"])
-        hits = int(corridor["hits"])
-        for wall in corridor["walls"]:
-            start_forward, start_lateral = map(float, wall["start"])
-            end_forward, end_lateral = map(float, wall["end"])
-            length = math.hypot(
-                end_forward - start_forward,
-                end_lateral - start_lateral,
-            )
-            sample_count = max(
-                1,
-                math.ceil(length / NEAR_OCCUPANCY_RESOLUTION_M),
-            )
-            for sample_index in range(sample_count + 1):
-                ratio = sample_index / sample_count
-                obstacles.append({
-                    "forward_m": (
-                        start_forward
-                        + (end_forward - start_forward) * ratio
-                    ),
-                    "lateral_m": (
-                        start_lateral
-                        + (end_lateral - start_lateral) * ratio
-                    ),
-                    "range_uncertainty_m": 0.0,
-                    "lateral_uncertainty_m": 0.0,
-                    "support_radius_m": (
-                        NEAR_OCCUPANCY_RESOLUTION_M / math.sqrt(2.0)
-                    ),
-                    "confidence": confidence,
-                    "hits": hits,
-                    "evidence_kind": "reflectivity_corridor",
-                    "source": "heatmap",
-                })
-        return obstacles
 
     def _planning_obstacle_payload(
         self,
@@ -1597,7 +1722,7 @@ class RadarSceneEstimator:
         combined: Dict[Tuple[int, int], Dict[str, object]] = {}
         containers = (
             (
-                self._probability_grid.occupied_cells(now),
+                self._probability_grid.active_cells(now),
                 "probability",
                 GRID_RESOLUTION_M / math.sqrt(2.0),
             ),
@@ -1609,6 +1734,16 @@ class RadarSceneEstimator:
         )
         for obstacles, evidence_kind, support_radius_m in containers:
             for obstacle in obstacles:
+                # Only heatmap evidence remains meaningful as a continuous
+                # sub-threshold cost.  A decayed point/mixed cell must not be
+                # resurrected as hard collision geometry.
+                if (
+                    evidence_kind == "probability"
+                    and
+                    str(obstacle.get("source", "unknown")) != "heatmap"
+                    and obstacle.get("occupied") is not True
+                ):
+                    continue
                 normalized = self._normalize_planning_obstacle({
                     **obstacle,
                     "evidence_kind": evidence_kind,
@@ -1616,12 +1751,12 @@ class RadarSceneEstimator:
                 })
                 forward = float(normalized["forward_m"])
                 lateral = float(normalized["lateral_m"])
-                distance = math.hypot(forward, lateral)
                 if (
                     not math.isfinite(forward)
                     or not math.isfinite(lateral)
                     or forward < 0.0
-                    or distance > PATH_LOCAL_MAX_RANGE_M
+                    or forward > PATH_LOCAL_MAX_RANGE_M
+                    or abs(lateral) > PATH_LOCAL_MAX_RANGE_M
                     or abs(math.degrees(math.atan2(lateral, forward)))
                     > PATH_FOV_AZIMUTH_DEG
                 ):
@@ -1690,6 +1825,56 @@ class RadarSceneEstimator:
         )
         normalized["source"] = str(obstacle.get("source", "unknown"))
         return normalized
+
+    @staticmethod
+    def _is_hard_obstacle(obstacle: Dict[str, object]) -> bool:
+        """Only Cartesian point-backed evidence is collision geometry.
+
+        A range-azimuth heatmap lobe has no elevation and a 29-degree angular
+        footprint on this board.  It remains useful as a continuous steering
+        cost, but treating its whole footprint as a solid wall creates false
+        near-field stops.  A mixed cell is point-backed and stays hard.
+        """
+
+        return str(obstacle.get("source", "unknown")) != "heatmap"
+
+    @staticmethod
+    def _heatmap_point_matches(
+        heatmap_forward_m: float,
+        heatmap_lateral_m: float,
+        point_forward_m: float,
+        point_lateral_m: float,
+        range_step_m: float,
+    ) -> bool:
+        values = (
+            heatmap_forward_m,
+            heatmap_lateral_m,
+            point_forward_m,
+            point_lateral_m,
+            range_step_m,
+        )
+        if any(not math.isfinite(float(value)) for value in values):
+            return False
+        if range_step_m <= 0.0:
+            return False
+        heatmap_range = math.hypot(heatmap_forward_m, heatmap_lateral_m)
+        point_range = math.hypot(point_forward_m, point_lateral_m)
+        radial_match = abs(heatmap_range - point_range) <= (
+            range_step_m * 0.75 + 1e-9
+        )
+        if heatmap_range <= 1e-9 or point_range <= 1e-9:
+            return radial_match
+        angular_delta = abs(math.degrees(math.atan2(
+            math.sin(
+                math.atan2(heatmap_lateral_m, heatmap_forward_m)
+                - math.atan2(point_lateral_m, point_forward_m)
+            ),
+            math.cos(
+                math.atan2(heatmap_lateral_m, heatmap_forward_m)
+                - math.atan2(point_lateral_m, point_forward_m)
+            ),
+        )))
+        return radial_match and angular_delta <= 14.5 + 1e-9
 
     @staticmethod
     def _merge_planning_obstacles(
@@ -1830,10 +2015,12 @@ class RadarSceneEstimator:
         include_grid_padding: bool,
     ) -> Tuple[float, float]:
         normalized = RadarSceneEstimator._normalize_planning_obstacle(obstacle)
-        base_radius = (
+        support_radius = float(normalized["support_radius_m"])
+        radial_base = PATH_SAFETY_MARGIN_M + support_radius
+        tangential_base = (
             PATH_ROBOT_WIDTH_M / 2.0
             + PATH_SAFETY_MARGIN_M
-            + float(normalized["support_radius_m"])
+            + support_radius
         )
         padding = (
             PATH_COLLISION_GRID_M / math.sqrt(2.0)
@@ -1841,8 +2028,10 @@ class RadarSceneEstimator:
             else 0.0
         )
         return (
-            base_radius + float(normalized["range_uncertainty_m"]) + padding,
-            base_radius + float(normalized["lateral_uncertainty_m"]) + padding,
+            radial_base + float(normalized["range_uncertainty_m"]) + padding,
+            tangential_base
+            + float(normalized["lateral_uncertainty_m"])
+            + padding,
         )
 
     @staticmethod
@@ -1883,7 +2072,11 @@ class RadarSceneEstimator:
         obstacles: Sequence[Dict[str, object]],
     ) -> List[Dict[str, object]]:
         interpolated, _ = RadarSceneEstimator._interpolate_wall_obstacles(
-            obstacles
+            tuple(
+                obstacle
+                for obstacle in obstacles
+                if RadarSceneEstimator._is_hard_obstacle(obstacle)
+            )
         )
         blocked_indices: List[Tuple[int, str]] = []
         for index, point in enumerate(path.get("points", [])):
@@ -1954,6 +2147,563 @@ class RadarSceneEstimator:
         }
 
     @staticmethod
+    def _plan_reflectivity_opening(
+        reflectivity_cells: Sequence[Dict[str, object]],
+        obstacle_tracks: Sequence[Dict[str, object]],
+        *,
+        confirmed_stop: bool = False,
+        score_history: Sequence[Dict[float, float]] = (),
+    ) -> Dict[str, object]:
+        """Build an advisory centreline through the lowest-reflection sector.
+
+        Every valid range/azimuth cell contributes continuously.  No cell is
+        promoted into a wall and no absolute signal threshold declares free
+        space.  The result is therefore a relative steering aid, while the
+        independent confirmed-point 10 cm guard remains the stop authority.
+        """
+        candidates = tuple(float(angle) for angle in range(-40, 41, 5))
+        cells: List[Tuple[float, float, float, float]] = []
+        for cell in reflectivity_cells:
+            try:
+                range_m = float(cell["range_m"])
+                azimuth_deg = float(cell["azimuth_deg"])
+                intensity = float(cell["intensity"])
+                confidence = float(cell.get("confidence", 1.0))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                not all(math.isfinite(value) for value in (
+                    range_m, azimuth_deg, intensity, confidence,
+                ))
+                or not SPI_REFLECTIVITY_VALID_MIN_RANGE_M
+                <= range_m <= PATH_LOCAL_MAX_RANGE_M
+                or abs(azimuth_deg) > PATH_FOV_AZIMUTH_DEG
+            ):
+                continue
+            cells.append((
+                range_m,
+                azimuth_deg,
+                max(0.0, min(1.0, intensity)),
+                max(0.0, min(1.0, confidence)),
+            ))
+
+        normalized_obstacles = [
+            RadarSceneEstimator._normalize_planning_obstacle(obstacle)
+            for obstacle in obstacle_tracks
+        ]
+
+        def angular_difference(left: float, right: float) -> float:
+            return abs((left - right + 180.0) % 360.0 - 180.0)
+
+        def directional_profile_metrics(
+            candidate_deg: float,
+            minimum_range_m: float,
+            maximum_range_m: float,
+        ) -> Tuple[float, float, int]:
+            range_profiles: Dict[float, List[float]] = {}
+            for range_m, azimuth_deg, intensity, confidence in cells:
+                if not minimum_range_m <= range_m <= maximum_range_m:
+                    continue
+                angle_weight = math.exp(
+                    -0.5
+                    * (
+                        angular_difference(azimuth_deg, candidate_deg) / 15.0
+                    )
+                    ** 2
+                )
+                weight = angle_weight * (0.55 + 0.45 * confidence)
+                bucket = range_profiles.setdefault(range_m, [0.0, 0.0])
+                bucket[0] += weight * intensity
+                bucket[1] += weight
+            directional_profile = [
+                energy / weight
+                for energy, weight in range_profiles.values()
+                if weight > 1e-9
+            ]
+            profile_mean = (
+                statistics.mean(directional_profile)
+                if directional_profile
+                else 1.0
+            )
+            profile_upper = (
+                statistics.quantiles(
+                    directional_profile,
+                    n=5,
+                    method="inclusive",
+                )[3]
+                if len(directional_profile) >= 2
+                else profile_mean
+            )
+            return profile_mean, profile_upper, len(directional_profile)
+
+        scored: List[Tuple[float, float, float, float]] = []
+        profile_metrics: Dict[float, Tuple[float, float]] = {}
+        near_profile_metrics: Dict[float, Tuple[float, float, int]] = {}
+        for candidate_deg in candidates:
+            profile_mean, profile_upper, _ = directional_profile_metrics(
+                candidate_deg,
+                REFLECTIVITY_STEER_MIN_RANGE_M,
+                PATH_LOCAL_MAX_RANGE_M,
+            )
+            # Preserve the range profile instead of averaging a wall away.
+            # A far wall can occupy only the last few 2 cm bins; the upper
+            # profile statistic keeps it visible while a single noisy bin
+            # still cannot dominate the route.
+            surface_cost = (
+                profile_mean * REFLECTIVITY_PROFILE_MEAN_WEIGHT
+                + profile_upper * REFLECTIVITY_PROFILE_UPPER_WEIGHT
+            )
+            profile_metrics[candidate_deg] = (profile_mean, profile_upper)
+
+            near_profile_metrics[candidate_deg] = directional_profile_metrics(
+                candidate_deg,
+                REFLECTIVITY_NEAR_STEER_MIN_RANGE_M,
+                REFLECTIVITY_NEAR_STEER_MAX_RANGE_M,
+            )
+
+        near_costs = {
+            angle: (
+                metrics[0] * REFLECTIVITY_PROFILE_MEAN_WEIGHT
+                + metrics[1] * REFLECTIVITY_PROFILE_UPPER_WEIGHT
+            )
+            for angle, metrics in near_profile_metrics.items()
+        }
+        near_straight_cost = near_costs.get(0.0, 1.0)
+        near_side_cost = min(
+            (
+                cost
+                for angle, cost in near_costs.items()
+                if abs(angle) >= 20.0
+            ),
+            default=near_straight_cost,
+        )
+        near_profile_range_count = near_profile_metrics.get(
+            0.0,
+            (1.0, 1.0, 0),
+        )[2]
+        near_steering_gain = max(
+            0.0,
+            near_straight_cost - near_side_cost,
+        )
+        near_field_blockage_evidence = (
+            near_profile_range_count >= 2
+            and near_steering_gain >= REFLECTIVITY_NEAR_BLOCK_MIN_GAIN
+        )
+
+        for candidate_deg in candidates:
+            profile_mean, profile_upper = profile_metrics[candidate_deg]
+            surface_cost = (
+                profile_mean * REFLECTIVITY_PROFILE_MEAN_WEIGHT
+                + profile_upper * REFLECTIVITY_PROFILE_UPPER_WEIGHT
+            )
+            near_cost = near_costs.get(candidate_deg, 1.0)
+            if near_field_blockage_evidence:
+                surface_cost += (
+                    near_cost * REFLECTIVITY_NEAR_BLOCK_COST_WEIGHT
+                )
+
+            point_cost = 0.0
+            for obstacle in normalized_obstacles:
+                forward_m = float(obstacle["forward_m"])
+                lateral_m = float(obstacle["lateral_m"])
+                distance_m = math.hypot(forward_m, lateral_m)
+                if distance_m <= 1e-9 or distance_m > PATH_LOCAL_MAX_RANGE_M:
+                    continue
+                obstacle_angle = math.degrees(
+                    math.atan2(lateral_m, forward_m)
+                )
+                angle_weight = math.exp(
+                    -0.5
+                    * (
+                        angular_difference(obstacle_angle, candidate_deg)
+                        / 14.0
+                    )
+                    ** 2
+                )
+                distance_weight = math.exp(-distance_m / 0.20)
+                point_cost += (
+                    max(0.0, min(1.0, float(obstacle["confidence"])))
+                    * angle_weight
+                    * distance_weight
+                )
+            point_cost = min(1.5, point_cost)
+            turn_cost = abs(candidate_deg) / 40.0 * 0.045
+            # Sparse Cartesian points are valuable for the independent 10 cm
+            # stop guard, but their azimuth jumps between frames in a static
+            # near-field scene.  Above the stop distance they provide only a
+            # small tie-breaker; the five-frame full reflectivity surface
+            # remains the steering authority.
+            total_cost = (
+                surface_cost
+                + point_cost * REFLECTIVITY_POINT_STEER_WEIGHT
+                + turn_cost
+            )
+            scored.append((
+                total_cost,
+                candidate_deg,
+                surface_cost,
+                point_cost,
+            ))
+
+        if not cells:
+            scored = [(1.0, 0.0, 1.0, 0.0)]
+        instant_scored = list(scored)
+        instant_best = min(
+            instant_scored,
+            key=lambda item: (item[0], abs(item[1])),
+        )
+        if score_history:
+            scored = [
+                (
+                    statistics.median([
+                        cost,
+                        *(
+                            float(history[angle])
+                            for history in score_history
+                            if angle in history
+                        ),
+                    ]),
+                    angle,
+                    surface_cost,
+                    point_cost,
+                )
+                for cost, angle, surface_cost, point_cost in instant_scored
+            ]
+        raw_best = min(scored, key=lambda item: (item[0], abs(item[1])))
+        left_best = min(
+            (item for item in scored if item[1] <= -15.0),
+            key=lambda item: (item[0], abs(item[1])),
+            default=None,
+        )
+        right_best = min(
+            (item for item in scored if item[1] >= 15.0),
+            key=lambda item: (item[0], abs(item[1])),
+            default=None,
+        )
+        side_cost_gap = (
+            abs(left_best[0] - right_best[0])
+            if left_best is not None and right_best is not None
+            else math.inf
+        )
+        turn_side_unresolved = (
+            near_field_blockage_evidence
+            and left_best is not None
+            and right_best is not None
+            and side_cost_gap < REFLECTIVITY_SIDE_RESOLUTION_MIN_GAP
+        )
+        if near_field_blockage_evidence and abs(raw_best[1]) < 15.0:
+            # The close range profile already proves that the centre ray is
+            # not the continuation of the opening.  Do not let the generic
+            # turn-effort prior pull the advisory line back through that
+            # bend; choose either side exclusively from measured cost.
+            raw_best = min(
+                (
+                    item for item in scored
+                    if abs(item[1]) >= 15.0
+                ),
+                key=lambda item: (item[0], abs(item[1])),
+            )
+        straight = min(scored, key=lambda item: abs(item[1]))
+        steering_gain = max(0.0, straight[0] - raw_best[0])
+        steering_relative_gain = steering_gain / max(straight[0], 0.05)
+        straight_profile_mean, straight_profile_upper = profile_metrics.get(
+            straight[1],
+            (straight[2], straight[2]),
+        )
+        straight_profile_excess = max(
+            0.0,
+            straight_profile_upper - straight_profile_mean,
+        )
+        straight_blockage_evidence = (
+            near_field_blockage_evidence
+            or (
+                straight_profile_upper >= REFLECTIVITY_FORWARD_BLOCK_UPPER
+                and straight_profile_excess
+                >= REFLECTIVITY_FORWARD_BLOCK_EXCESS
+            )
+        )
+        straight_preferred = (
+            abs(raw_best[1]) > 1e-9
+            and (
+                steering_gain < REFLECTIVITY_STEER_MIN_GAIN
+                or steering_relative_gain
+                < REFLECTIVITY_STEER_MIN_RELATIVE_GAIN
+            )
+            and not straight_blockage_evidence
+        )
+        best = straight if straight_preferred else raw_best
+        best_cost, goal_angle_deg, surface_cost, point_cost = best
+        profile_mean, profile_upper = profile_metrics.get(
+            goal_angle_deg,
+            (surface_cost, surface_cost),
+        )
+        median_cost = statistics.median(item[0] for item in scored)
+        tolerance = max(0.015, (median_cost - best_cost) * 0.30)
+        open_angles = sorted(
+            item[1] for item in scored
+            if item[0] <= best_cost + tolerance
+        )
+        goal_corridor_width_deg = 5.0
+        if open_angles:
+            connected = [goal_angle_deg]
+            cursor = goal_angle_deg - 5.0
+            while cursor in open_angles:
+                connected.insert(0, cursor)
+                cursor -= 5.0
+            cursor = goal_angle_deg + 5.0
+            while cursor in open_angles:
+                connected.append(cursor)
+                cursor += 5.0
+            goal_corridor_width_deg = max(
+                5.0,
+                connected[-1] - connected[0] + 5.0,
+            )
+
+        goal_range_m = 0.26
+        # A near bend must become visible before the old 7 cm straight
+        # tangent.  Far-field guidance keeps the gentler curve.
+        tangent_m = 0.025 if near_field_blockage_evidence else 0.07
+
+        def sampled_curve(angle_deg: float) -> Tuple[
+            Tuple[float, float], List[List[float]]
+        ]:
+            angle_rad = math.radians(angle_deg)
+            curve_goal = (
+                goal_range_m * math.cos(angle_rad),
+                goal_range_m * math.sin(angle_rad),
+            )
+            control = (
+                (0.0, 0.0),
+                (tangent_m, 0.0),
+                (
+                    curve_goal[0] - tangent_m * math.cos(angle_rad),
+                    curve_goal[1] - tangent_m * math.sin(angle_rad),
+                ),
+                curve_goal,
+            )
+
+            def bezier(t: float) -> Tuple[float, float]:
+                u = 1.0 - t
+                return (
+                    u**3 * control[0][0]
+                    + 3.0 * u * u * t * control[1][0]
+                    + 3.0 * u * t * t * control[2][0]
+                    + t**3 * control[3][0],
+                    u**3 * control[0][1]
+                    + 3.0 * u * u * t * control[1][1]
+                    + 3.0 * u * t * t * control[2][1]
+                    + t**3 * control[3][1],
+                )
+
+            dense = [bezier(index / 200.0) for index in range(201)]
+            cumulative = [0.0]
+            for curve_left, curve_right in zip(dense, dense[1:]):
+                cumulative.append(
+                    cumulative[-1]
+                    + math.hypot(
+                        curve_right[0] - curve_left[0],
+                        curve_right[1] - curve_left[1],
+                    )
+                )
+            sample_count = math.floor(
+                (cumulative[-1] + 1e-9) / PATH_RESOLUTION_M
+            )
+            curve_points: List[List[float]] = [[0.0, 0.0]]
+            dense_index = 0
+            for sample_index in range(1, sample_count + 1):
+                target = sample_index * PATH_RESOLUTION_M
+                while (
+                    dense_index + 1 < len(cumulative)
+                    and cumulative[dense_index + 1] < target
+                ):
+                    dense_index += 1
+                if dense_index + 1 >= len(dense):
+                    break
+                span = cumulative[dense_index + 1] - cumulative[dense_index]
+                ratio = 0.0 if span <= 1e-12 else (
+                    target - cumulative[dense_index]
+                ) / span
+                curve_left = dense[dense_index]
+                curve_right = dense[dense_index + 1]
+                curve_points.append([
+                    round(
+                        curve_left[0]
+                        + (curve_right[0] - curve_left[0]) * ratio,
+                        4,
+                    ),
+                    round(
+                        curve_left[1]
+                        + (curve_right[1] - curve_left[1]) * ratio,
+                        4,
+                    ),
+                ])
+            return curve_goal, curve_points
+
+        goal, points = sampled_curve(goal_angle_deg)
+        turn_candidates: List[Dict[str, object]] = []
+        if turn_side_unresolved:
+            for direction, candidate in (
+                ("left", left_best),
+                ("right", right_best),
+            ):
+                candidate_goal, candidate_points = sampled_curve(candidate[1])
+                turn_candidates.append({
+                    "direction": direction,
+                    "angle_deg": round(candidate[1], 1),
+                    "cost": round(candidate[0], 4),
+                    "goal_forward_m": round(candidate_goal[0], 3),
+                    "goal_lateral_m": round(candidate_goal[1], 3),
+                    "points": candidate_points,
+                })
+
+        if confirmed_stop or turn_side_unresolved:
+            points = [[0.0, 0.0]]
+        length_m = (len(points) - 1) * PATH_RESOLUTION_M
+        contrast = max(
+            0.0,
+            min(1.0, (median_cost - best_cost) / max(median_cost, 0.05)),
+        )
+        persistence = (
+            statistics.mean(cell[3] for cell in cells) if cells else 0.0
+        )
+        geometry_confidence = min(
+            0.92,
+            0.40 + contrast * 1.8 + persistence * 0.18,
+        )
+        curvature = (
+            0.0
+            if confirmed_stop or turn_side_unresolved
+            else 2.0 * math.radians(goal_angle_deg) / goal_range_m
+        )
+        path_status = (
+            "blocked_near_field"
+            if confirmed_stop
+            else "turn_side_unresolved"
+            if turn_side_unresolved
+            else "clear"
+        )
+        return {
+            "status": path_status,
+            "resolution_m": PATH_RESOLUTION_M,
+            "length_m": round(length_m, 2),
+            "curvature_per_m": round(curvature, 3),
+            "planner_mode": "full_reflectivity_opening",
+            "search_resolution_m": 5.0,
+            "heading_resolution_deg": 5.0,
+            "minimum_turn_radius_m": round(
+                1.0 / max(abs(curvature), 1e-9), 3
+            ) if abs(curvature) > 1e-9 else None,
+            "goal_reached": not confirmed_stop and not turn_side_unresolved,
+            "search_expansions": len(scored),
+            "turn_count": (
+                0
+                if turn_side_unresolved or abs(goal_angle_deg) < 2.5
+                else 1
+            ),
+            "direction_changes": 0,
+            "receding_horizon_m": goal_range_m,
+            "local_max_range_m": PATH_LOCAL_MAX_RANGE_M,
+            "fov_azimuth_deg": PATH_FOV_AZIMUTH_DEG,
+            "smoothed": not confirmed_stop and not turn_side_unresolved,
+            "minimum_clearance_m": None,
+            "geometry_confidence": round(geometry_confidence, 3),
+            "maximum_heading_step_deg": 5.0,
+            "confidence_scope": "relative_reflectivity_opening_not_free_space_proof",
+            "robot_width_m": PATH_ROBOT_WIDTH_M,
+            "safety_margin_m": PATH_SAFETY_MARGIN_M,
+            "minimum_passage_width_m": (
+                PATH_ROBOT_WIDTH_M + PATH_SAFETY_MARGIN_M * 2.0
+            ),
+            "obstacle_wall_link_m": 0.0,
+            "obstacle_wall_segments": 0,
+            "obstacle_object_clusters": 0,
+            "largest_object_cluster_cells": 0,
+            "obstacle_cross_source_link_m": 0.0,
+            "near_field_exclusion_m": 0.0,
+            "near_field_excluded": 0,
+            "range_uncertainty_lateral_inflation_m": 0.0,
+            "obstacle_support_radius_m": 0.0,
+            "collision_grid_padding_m": 0.0,
+            "maximum_collision_radius_m": DANGER_ENTER_M,
+            "maximum_collision_radial_m": DANGER_ENTER_M,
+            "maximum_collision_tangential_m": DANGER_ENTER_M,
+            "goal_forward_m": round(goal[0], 3),
+            "goal_lateral_m": round(goal[1], 3),
+            "goal_angle_deg": round(goal_angle_deg, 1),
+            "goal_corridor_width_deg": round(goal_corridor_width_deg, 1),
+            "goal_selection_mode": (
+                "turn_required_side_unresolved"
+                if turn_side_unresolved
+                else "minimum_reflection_trend"
+            ),
+            "instant_best_angle_deg": round(instant_best[1], 1),
+            "raw_best_angle_deg": round(raw_best[1], 1),
+            "straight_preferred": straight_preferred,
+            "straight_blockage_evidence": straight_blockage_evidence,
+            "near_field_blockage_evidence": near_field_blockage_evidence,
+            "near_profile_range_count": near_profile_range_count,
+            "near_straight_cost": round(near_straight_cost, 4),
+            "near_side_cost": round(near_side_cost, 4),
+            "near_steering_gain": round(near_steering_gain, 4),
+            "near_steering_min_gain": REFLECTIVITY_NEAR_BLOCK_MIN_GAIN,
+            "near_cost_weight": REFLECTIVITY_NEAR_BLOCK_COST_WEIGHT,
+            "turn_side_unresolved": turn_side_unresolved,
+            "turn_side_cost_gap": (
+                round(side_cost_gap, 4)
+                if math.isfinite(side_cost_gap)
+                else None
+            ),
+            "turn_side_resolution_min_gap": (
+                REFLECTIVITY_SIDE_RESOLUTION_MIN_GAP
+            ),
+            "turn_candidates": turn_candidates,
+            "path_initial_tangent_m": tangent_m,
+            "straight_profile_mean": round(straight_profile_mean, 4),
+            "straight_profile_upper": round(straight_profile_upper, 4),
+            "straight_profile_excess": round(straight_profile_excess, 4),
+            "steering_gain": round(steering_gain, 4),
+            "steering_relative_gain": round(steering_relative_gain, 4),
+            "steering_min_gain": REFLECTIVITY_STEER_MIN_GAIN,
+            "steering_min_relative_gain": (
+                REFLECTIVITY_STEER_MIN_RELATIVE_GAIN
+            ),
+            "hard_obstacles_used": 1 if confirmed_stop else 0,
+            "soft_obstacles_used": len(normalized_obstacles),
+            "persistent_obstacles_used": len(normalized_obstacles),
+            "reflectivity_cells_used": len(cells),
+            "opening_surface_cost": round(surface_cost, 4),
+            "opening_profile_mean": round(profile_mean, 4),
+            "opening_profile_upper": round(profile_upper, 4),
+            "opening_profile_mean_weight": REFLECTIVITY_PROFILE_MEAN_WEIGHT,
+            "opening_profile_upper_weight": (
+                REFLECTIVITY_PROFILE_UPPER_WEIGHT
+            ),
+            "opening_steer_min_range_m": REFLECTIVITY_STEER_MIN_RANGE_M,
+            "opening_point_cost": round(point_cost, 4),
+            "opening_point_steer_weight": REFLECTIVITY_POINT_STEER_WEIGHT,
+            "opening_contrast": round(contrast, 4),
+            "opening_scores": [
+                {
+                    "angle_deg": angle,
+                    "cost": round(cost, 4),
+                }
+                for cost, angle, _, _ in scored
+            ],
+            "instant_opening_scores": [
+                {
+                    "angle_deg": angle,
+                    "cost": round(cost, 4),
+                }
+                for cost, angle, _, _ in instant_scored
+            ],
+            "opening_score_history_frames": min(
+                REFLECTIVITY_SCORE_HISTORY_FRAMES,
+                len(score_history) + 1,
+            ),
+            "points": points,
+        }
+
+    @staticmethod
     def _plan_path(
         obstacle_tracks: Sequence[Dict[str, object]],
         curvatures: Sequence[float] = PATH_CURVATURES,
@@ -1983,10 +2733,22 @@ class RadarSceneEstimator:
             for obstacle in normalized_obstacles
             if math.isfinite(float(obstacle["forward_m"]))
             and math.isfinite(float(obstacle["lateral_m"]))
-            and math.hypot(
-                float(obstacle["forward_m"]),
+            and 0.0 <= float(obstacle["forward_m"]) <= PATH_LOCAL_MAX_RANGE_M
+            and abs(float(obstacle["lateral_m"])) <= PATH_LOCAL_MAX_RANGE_M
+            and abs(math.degrees(math.atan2(
                 float(obstacle["lateral_m"]),
-            ) <= PATH_LOCAL_MAX_RANGE_M
+                float(obstacle["forward_m"]),
+            ))) <= PATH_FOV_AZIMUTH_DEG
+        ]
+        hard_obstacles = [
+            obstacle
+            for obstacle in observed_obstacles
+            if RadarSceneEstimator._is_hard_obstacle(obstacle)
+        ]
+        soft_obstacles = [
+            obstacle
+            for obstacle in observed_obstacles
+            if not RadarSceneEstimator._is_hard_obstacle(obstacle)
         ]
         cluster_parents = list(range(len(observed_obstacles)))
 
@@ -2019,7 +2781,7 @@ class RadarSceneEstimator:
         largest_object_cluster = max(cluster_sizes.values(), default=0)
         obstacles, wall_segment_count = (
             RadarSceneEstimator._interpolate_wall_obstacles(
-                observed_obstacles
+                hard_obstacles
             )
         )
         blocked_collision_cells: set[Tuple[int, int]] = set()
@@ -2083,13 +2845,18 @@ class RadarSceneEstimator:
             )
 
         def select_dynamic_goal() -> Tuple[float, float, float, float]:
-            if not observed_obstacles:
+            desired_angle = (
+                preferred_goal_angle_deg
+                if preferred_goal_angle_deg is not None
+                else 0.0
+            )
+            if not hard_obstacles:
                 return goal_from_angle(
-                    preferred_goal_angle_deg or 0.0,
+                    desired_angle,
                     PATH_FOV_AZIMUTH_DEG * 2.0,
                 )
             occupied: List[Tuple[float, float]] = []
-            for obstacle in observed_obstacles:
+            for obstacle in hard_obstacles:
                 forward = float(obstacle["forward_m"])
                 lateral = float(obstacle["lateral_m"])
                 distance = math.hypot(forward, lateral)
@@ -2136,7 +2903,7 @@ class RadarSceneEstimator:
                     preferred_goal_angle_deg or 0.0,
                     0.0,
                 )
-            if preferred_goal_angle_deg is None:
+            if preferred_goal_angle_deg is None and not soft_obstacles:
                 best_interval = max(
                     free_intervals,
                     key=lambda interval: (
@@ -2156,13 +2923,13 @@ class RadarSceneEstimator:
                     upper = interval[1] - inset
                     return max(
                         lower,
-                        min(upper, preferred_goal_angle_deg),
+                        min(upper, desired_angle),
                     )
 
                 best_interval = min(
                     free_intervals,
                     key=lambda interval: (
-                        abs(guided_angle(interval) - preferred_goal_angle_deg),
+                        abs(guided_angle(interval) - desired_angle),
                         -(interval[1] - interval[0]),
                         abs(guided_angle(interval)),
                     ),
@@ -2205,10 +2972,7 @@ class RadarSceneEstimator:
                 and abs(lateral) < PATH_LOCAL_MAX_RANGE_M
             ):
                 return False
-            distance = math.hypot(forward, lateral)
-            if distance > PATH_LOCAL_MAX_RANGE_M + 1e-9:
-                return False
-            if distance <= 1e-9:
+            if math.hypot(forward, lateral) <= 1e-9:
                 return True
             return abs(math.degrees(math.atan2(lateral, forward))) <= (
                 PATH_FOV_AZIMUTH_DEG
@@ -2228,6 +2992,35 @@ class RadarSceneEstimator:
                 ) in blocked_collision_cells:
                     return False
             return True
+
+        def soft_evidence_cost(forward: float, lateral: float) -> float:
+            """Continuous path cost from every repeated heatmap return.
+
+            Heatmap cells do not become collision geometry, but a candidate
+            path crossing a strong current reflection must cost more than a
+            similarly smooth path through the measured opening.
+            """
+            total = 0.0
+            for obstacle in soft_obstacles:
+                confidence = max(
+                    0.0, min(1.0, float(obstacle["confidence"]))
+                )
+                influence_m = min(
+                    0.11,
+                    0.035
+                    + max(
+                        float(obstacle.get("range_uncertainty_m", 0.0)),
+                        float(obstacle.get("lateral_uncertainty_m", 0.0)),
+                    ),
+                )
+                distance_m = math.hypot(
+                    forward - float(obstacle["forward_m"]),
+                    lateral - float(obstacle["lateral_m"]),
+                )
+                total += confidence * math.exp(
+                    -0.5 * (distance_m / max(0.025, influence_m)) ** 2
+                )
+            return total
 
         State = Tuple[int, int, int]
         start: State = (0, 0, 0)
@@ -2313,6 +3106,9 @@ class RadarSceneEstimator:
                     + step_distance
                     + turn_cost
                     + center_recovery_cost
+                    + soft_evidence_cost(
+                        next_forward, next_lateral
+                    ) * 0.012
                 )
                 next_arc = arc_lengths[state] + step_distance
                 if next_arc > PATH_SEARCH_MAX_ARC_M + 1e-9:
@@ -2676,6 +3472,8 @@ class RadarSceneEstimator:
                 if preferred_goal_angle_deg is not None
                 else "widest_motion_relative_corridor"
             ),
+            "hard_obstacles_used": len(hard_obstacles),
+            "soft_obstacles_used": len(soft_obstacles),
             "persistent_obstacles_used": len(obstacle_tracks),
             "points": points,
         }
@@ -2858,89 +3656,6 @@ class RadarSceneEstimator:
             range_m * math.sin(angle_rad) * self.axes.lateral_sign,
         )
 
-    def _calibrated_contour_observations(
-        self,
-        frame: RadarFrame,
-    ) -> List[Dict[str, object]]:
-        """Extract the nearest calibrated reflection independently per ray.
-
-        Each range row is normalized by its trusted-FOV median so changes in
-        receiver gain do not become walls.  No left/right, parallel, or
-        converging-wall assumption is made here; adjacent rays and actual
-        range discontinuities define the later contour segments.
-        """
-        heatmap = frame.heatmap
-        model = self.clutter_model
-        if (
-            heatmap is None
-            or model is None
-            or heatmap.azimuth_bins < CONTOUR_MIN_AZIMUTH_BINS
-        ):
-            return []
-        span_db = heatmap.ceiling_db - heatmap.floor_db
-        nearest_by_azimuth: Dict[int, Dict[str, object]] = {}
-        for range_index in range(1, heatmap.range_bins):
-            range_m = range_index * heatmap.range_step_m
-            if range_m < CONTOUR_MIN_RANGE_M:
-                continue
-            if range_m > CONTOUR_MAX_RANGE_M + 1e-12:
-                break
-            row_residuals: Dict[int, float] = {}
-            for azimuth_index in range(heatmap.azimuth_bins):
-                argument = 2.0 * (
-                    azimuth_index - heatmap.azimuth_bins / 2.0
-                ) / heatmap.azimuth_bins
-                azimuth_deg = math.degrees(math.asin(
-                    max(-1.0, min(1.0, argument))
-                ))
-                if abs(azimuth_deg) > CONTOUR_TRUSTED_AZIMUTH_DEG:
-                    continue
-                flat_index = (
-                    range_index * heatmap.azimuth_bins + azimuth_index
-                )
-                if flat_index >= len(model.heatmap_median_db):
-                    continue
-                observed_db = (
-                    heatmap.floor_db
-                    + heatmap.data[flat_index] / 255.0 * span_db
-                )
-                row_residuals[azimuth_index] = (
-                    observed_db - model.heatmap_median_db[flat_index]
-                )
-            if not row_residuals:
-                continue
-            row_baseline_db = statistics.median(row_residuals.values())
-            for azimuth_index, residual_db in row_residuals.items():
-                prominence_db = residual_db - row_baseline_db
-                if (
-                    residual_db < CONTOUR_MIN_RESIDUAL_DB
-                    or prominence_db < CONTOUR_MIN_ROW_PROMINENCE_DB
-                ):
-                    continue
-                existing = nearest_by_azimuth.get(azimuth_index)
-                if (
-                    existing is not None
-                    and int(existing["range_index"]) < range_index
-                ):
-                    continue
-                forward_m, lateral_m = self._heatmap_cell_position(
-                    range_m,
-                    azimuth_index,
-                    heatmap.azimuth_bins,
-                )
-                nearest_by_azimuth[azimuth_index] = {
-                    "forward_m": forward_m,
-                    "lateral_m": lateral_m,
-                    "azimuth_index": azimuth_index,
-                    "range_index": range_index,
-                    "residual_db": residual_db,
-                    "prominence_db": prominence_db,
-                }
-        return [
-            nearest_by_azimuth[index]
-            for index in sorted(nearest_by_azimuth)
-        ]
-
     def _near_existing_heatmap_track(
         self,
         forward_m: float,
@@ -2958,6 +3673,8 @@ class RadarSceneEstimator:
     def _binding_status(self, frame: RadarFrame) -> str:
         if self.synthetic:
             return "synthetic"
+        if frame.source_format == "ti-fccsp-spi-raw-bpm-v1":
+            return "spi_raw"
         if self.clutter_model is None:
             return (
                 "calibration_required"
@@ -2979,6 +3696,89 @@ class RadarSceneEstimator:
             frame.heatmap,
             self.axes,
         )
+
+    @staticmethod
+    def _surface_contour_observations(
+        cells: Sequence[Dict[str, object]],
+    ) -> List[Dict[str, object]]:
+        """Extract every directional radial ridge from the raw SPI image.
+
+        The old implementation selected the globally strongest cell on each
+        azimuth ray.  Range compensation then made the end of the 30 cm view
+        win on most rays, and the contour fitter connected that clipped arc
+        into two walls.  A radar surface is instead a *local* maximum in
+        range.  ``relative_db`` has the per-range common mode removed, so a
+        broad coupling ring or range gain cannot become directional geometry.
+        All positive local ridges remain available; line continuity and time,
+        rather than a scene-specific amplitude cutoff, decide which become a
+        displayed wall.
+        """
+
+        grouped: Dict[int, List[Dict[str, object]]] = {}
+        for cell in cells:
+            try:
+                azimuth_index = int(cell["azimuth_index"])
+                range_m = float(cell["range_m"])
+                measured_db = float(cell.get("measured_db", float("nan")))
+                relative_db = float(cell["relative_db"])
+                intensity = float(cell["intensity"])
+                range_index = int(cell["range_index"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if not (
+                0.10 <= range_m <= PATH_LOCAL_MAX_RANGE_M
+                and math.isfinite(intensity)
+                and math.isfinite(measured_db)
+                and math.isfinite(relative_db)
+                and range_index >= 0
+            ):
+                continue
+            grouped.setdefault(azimuth_index, []).append(cell)
+
+        observations: List[Dict[str, object]] = []
+        for azimuth_index, ray in sorted(grouped.items()):
+            ordered = sorted(ray, key=lambda cell: int(cell["range_index"]))
+            for index, ridge in enumerate(ordered):
+                # Maxima at either edge are censored: the actual peak can lie
+                # inside the rejected coupling band or beyond the operator
+                # view.  Without a neighbour on both sides they are not a
+                # measurable radial ridge and must not become wall geometry.
+                if index == 0 or index + 1 >= len(ordered):
+                    continue
+                value_db = float(ridge["relative_db"])
+                left_db = float(ordered[index - 1]["relative_db"])
+                right_db = float(ordered[index + 1]["relative_db"])
+                if value_db <= 0.0 or value_db < right_db:
+                    continue
+                if value_db < left_db:
+                    continue
+                if not (
+                    value_db > right_db
+                    or value_db > left_db
+                ):
+                    continue
+                local_floor_db = max(
+                    right_db,
+                    left_db,
+                )
+                prominence_db = value_db - local_floor_db
+                if prominence_db <= 1e-9:
+                    continue
+                ridge_intensity = 0.30 + 0.70 * (
+                    1.0 - math.exp(-prominence_db / 3.0)
+                )
+                observations.append(
+                    {
+                        "forward_m": float(ridge["forward_m"]),
+                        "lateral_m": float(ridge["lateral_m"]),
+                        "intensity": ridge_intensity,
+                        "prominence_db": prominence_db,
+                        "residual_db": value_db,
+                        "azimuth_index": azimuth_index,
+                        "range_index": int(ridge["range_index"]),
+                    }
+                )
+        return observations
 
     @staticmethod
     def _in_scene(forward_m: float, lateral_m: float) -> bool:

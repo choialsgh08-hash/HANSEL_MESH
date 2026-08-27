@@ -10,6 +10,7 @@ import subprocess
 import sys
 from typing import Callable, Literal
 
+from common.radar_geometry import RadarAxes
 from sensors.radar_parent_lease import (
     RADAR_PARENT_LEASE_ROOT,
     ParentDeathLease,
@@ -127,7 +128,10 @@ def build_capture_command(
     *,
     parent_lease_path: Path | None = None,
 ) -> list[str]:
-    clutter_model = load_clutter_model(config.calibration_path)
+    clutter_model = load_clutter_model(
+        config.calibration_path,
+        axes=RadarAxes(),
+    )
     command = [
         sys.executable,
         "-m",
@@ -145,6 +149,12 @@ def build_capture_command(
         str(config.heatmap_range_bins),
         "--heatmap-range-step-m",
         str(config.heatmap_range_step_m),
+        "--adc-samples-per-chirp",
+        str(config.adc_samples_per_chirp),
+        "--adc-rx-channels",
+        str(config.adc_rx_channels),
+        "--adc-chirps",
+        str(config.adc_chirps),
         "--output",
         str(paths.mission),
         "--raw-output",
@@ -178,7 +188,10 @@ def build_viewer_command(
     *,
     parent_lease_path: Path | None = None,
 ) -> list[str]:
-    clutter_model = load_clutter_model(config.calibration_path)
+    clutter_model = load_clutter_model(
+        config.calibration_path,
+        axes=RadarAxes(),
+    )
     axes = clutter_model.axes
     command = [
         sys.executable,

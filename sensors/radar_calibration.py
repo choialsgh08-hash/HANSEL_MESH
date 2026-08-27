@@ -302,6 +302,126 @@ def build_clutter_model(
     )
 
 
+def resample_clutter_model_azimuth(
+    model: RadarClutterModel,
+    *,
+    target_azimuth_bins: int,
+    target_profile_id: str,
+) -> RadarClutterModel:
+    """Bind a baseline to a lower, commensurate spatial-FFT size.
+
+    A target bin selects the source bin at the same normalized spatial
+    frequency.  For the deployed 32-to-16 change this is source bin ``2*j``;
+    interpolation would mix different physical look directions and is
+    deliberately not used.
+    """
+
+    if not isinstance(model, RadarClutterModel):
+        raise ValueError("model must be a RadarClutterModel")
+    if (
+        isinstance(target_azimuth_bins, bool)
+        or not isinstance(target_azimuth_bins, int)
+        or target_azimuth_bins < 1
+        or target_azimuth_bins > model.azimuth_bins
+        or model.azimuth_bins % target_azimuth_bins != 0
+    ):
+        raise ValueError(
+            "target_azimuth_bins must be an integer divisor of source bins"
+        )
+    if not isinstance(target_profile_id, str) or not target_profile_id.strip():
+        raise ValueError("target_profile_id must be a non-empty string")
+    stride = model.azimuth_bins // target_azimuth_bins
+
+    def select_matching_bins(values: Tuple[float, ...]) -> Tuple[float, ...]:
+        return tuple(
+            values[range_index * model.azimuth_bins + target_index * stride]
+            for range_index in range(model.range_bins)
+            for target_index in range(target_azimuth_bins)
+        )
+
+    without_id = RadarClutterModel(
+        schema_version=model.schema_version,
+        calibration_id="",
+        profile_id=target_profile_id,
+        axes=model.axes,
+        range_bins=model.range_bins,
+        azimuth_bins=target_azimuth_bins,
+        range_step_m=model.range_step_m,
+        motion_mode=model.motion_mode,
+        point_clusters=model.point_clusters,
+        heatmap_median_db=select_matching_bins(model.heatmap_median_db),
+        heatmap_mad_db=select_matching_bins(model.heatmap_mad_db),
+    )
+    calibration_id = (
+        "radar-clutter-"
+        + hashlib.sha256(_payload_without_id(without_id)).hexdigest()[:16]
+    )
+    return RadarClutterModel(
+        **{
+            **without_id.__dict__,
+            "calibration_id": calibration_id,
+        }
+    )
+
+
+def reorient_clutter_model(
+    model: RadarClutterModel,
+    axes: RadarAxes,
+) -> RadarClutterModel:
+    """Rebind robot coordinates without changing native heatmap baselines.
+
+    Heatmap arrays are stored in the sensor's native FFT order.  Only the
+    robot-relative point-clutter coordinates therefore need remapping when a
+    mounting-axis sign is corrected.
+    """
+
+    if not isinstance(model, RadarClutterModel):
+        raise ValueError("model must be a RadarClutterModel")
+    if not isinstance(axes, RadarAxes):
+        raise ValueError("axes must be RadarAxes")
+
+    def remap(cluster: ClutterPointCluster) -> ClutterPointCluster:
+        native = {
+            model.axes.forward_axis: (
+                cluster.forward_m / model.axes.forward_sign
+            ),
+            model.axes.lateral_axis: (
+                cluster.lateral_m / model.axes.lateral_sign
+            ),
+        }
+        return ClutterPointCluster(
+            forward_m=native[axes.forward_axis] * axes.forward_sign,
+            lateral_m=native[axes.lateral_axis] * axes.lateral_sign,
+            height_m=cluster.height_m,
+            radius_m=cluster.radius_m,
+            observation_fraction=cluster.observation_fraction,
+        )
+
+    without_id = RadarClutterModel(
+        schema_version=model.schema_version,
+        calibration_id="",
+        profile_id=model.profile_id,
+        axes=axes,
+        range_bins=model.range_bins,
+        azimuth_bins=model.azimuth_bins,
+        range_step_m=model.range_step_m,
+        motion_mode=model.motion_mode,
+        point_clusters=tuple(remap(cluster) for cluster in model.point_clusters),
+        heatmap_median_db=model.heatmap_median_db,
+        heatmap_mad_db=model.heatmap_mad_db,
+    )
+    calibration_id = (
+        "radar-clutter-"
+        + hashlib.sha256(_payload_without_id(without_id)).hexdigest()[:16]
+    )
+    return RadarClutterModel(
+        **{
+            **without_id.__dict__,
+            "calibration_id": calibration_id,
+        }
+    )
+
+
 _MODEL_KEYS = {
     "schema_version",
     "calibration_id",
@@ -500,7 +620,11 @@ def _load_vector(
     return result
 
 
-def load_clutter_model(path: Path) -> RadarClutterModel:
+def load_clutter_model(
+    path: Path,
+    *,
+    axes: Optional[RadarAxes] = None,
+) -> RadarClutterModel:
     try:
         text = Path(path).read_bytes().decode("utf-8")
         parsed = json.loads(
@@ -567,4 +691,6 @@ def load_clutter_model(path: Path) -> RadarClutterModel:
     )
     if model.calibration_id != expected_id:
         raise ValueError("calibration_id is inconsistent with model payload")
+    if axes is not None and axes.signature() != model.axes.signature():
+        return reorient_clutter_model(model, axes)
     return model

@@ -100,6 +100,9 @@ class RadarSupervisorConfig:
     heatmap_azimuth_bins: int = 16
     heatmap_range_bins: int = 128
     heatmap_range_step_m: float = 0.09765625
+    adc_samples_per_chirp: int = 256
+    adc_rx_channels: int = 3
+    adc_chirps: int = 2
     first_frame_timeout_s: float = 3.0
     frame_timeout_s: float = 2.5
     verification_timeout_s: float = 8.0
@@ -142,6 +145,9 @@ class RadarSupervisorConfig:
             "data_baud",
             "heatmap_azimuth_bins",
             "heatmap_range_bins",
+            "adc_samples_per_chirp",
+            "adc_rx_channels",
+            "adc_chirps",
             "verification_frames",
         ):
             _require_positive_int(getattr(self, name), name)

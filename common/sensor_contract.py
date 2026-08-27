@@ -45,6 +45,7 @@ _RADAR_FRAME_TRANSITIONS = {
 }
 _RADAR_HEATMAP_MODES = {"major", "minor"}
 _RADAR_HEATMAP_TLV_TYPES = {304: "major", 305: "minor"}
+RADAR_ADC_SAMPLES_TLV_TYPE = 316
 
 
 def _require_mapping(value: object, name: str) -> Mapping[str, Any]:
@@ -282,6 +283,40 @@ class RadarHeatmap:
 
 
 @dataclass(frozen=True)
+class RadarAdcSnapshot:
+    """Signed real ADC samples from the demo's final chirp pair.
+
+    The firmware serializes chirp-major, receive-channel-major REAL16 samples.
+    This is not a complete frame capture and it carries no calibrated angle by
+    itself.  Keeping the bytes lossless lets the operator PC perform range FFT
+    processing without inventing an angular measurement.
+    """
+
+    data: bytes
+    samples_per_chirp: int
+    rx_channels: int
+    chirps: int
+    sample_bits: int
+    tlv_type: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.data, bytes):
+            raise ValueError("data must be bytes")
+        _require_int(self.samples_per_chirp, "samples_per_chirp", 1, 4096)
+        _require_int(self.rx_channels, "rx_channels", 1, 8)
+        _require_int(self.chirps, "chirps", 1, 8)
+        _require_int(self.sample_bits, "sample_bits", 1, 16)
+        _require_int(self.tlv_type, "tlv_type", 0, 2**32 - 1)
+        if self.tlv_type != RADAR_ADC_SAMPLES_TLV_TYPE:
+            raise ValueError("tlv_type is not the UART ADC sample TLV")
+        expected_bytes = (
+            self.samples_per_chirp * self.rx_channels * self.chirps * 2
+        )
+        if len(self.data) != expected_bytes:
+            raise ValueError("data length does not match ADC dimensions")
+
+
+@dataclass(frozen=True)
 class RadarFrame:
     header: SensorHeader
     frame_number: int
@@ -296,6 +331,7 @@ class RadarFrame:
     profile_id: Optional[str] = None
     capture_baudrate: Optional[int] = None
     heatmap: Optional[RadarHeatmap] = None
+    adc_snapshot: Optional[RadarAdcSnapshot] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.header, SensorHeader):
@@ -336,6 +372,11 @@ class RadarFrame:
             RadarHeatmap,
         ):
             raise ValueError("heatmap must be a RadarHeatmap or null")
+        if self.adc_snapshot is not None and not isinstance(
+            self.adc_snapshot,
+            RadarAdcSnapshot,
+        ):
+            raise ValueError("adc_snapshot must be a RadarAdcSnapshot or null")
 
 
 @dataclass(frozen=True)
@@ -717,6 +758,58 @@ def _heatmap_from_dict(value: object) -> RadarHeatmap:
     )
 
 
+def _adc_snapshot_to_dict(snapshot: RadarAdcSnapshot) -> Dict[str, Any]:
+    return {
+        "data_base64": base64.b64encode(snapshot.data).decode("ascii"),
+        "samples_per_chirp": snapshot.samples_per_chirp,
+        "rx_channels": snapshot.rx_channels,
+        "chirps": snapshot.chirps,
+        "sample_bits": snapshot.sample_bits,
+        "tlv_type": snapshot.tlv_type,
+        "layout": "chirp-major_rx-major_real16-le",
+    }
+
+
+def _adc_snapshot_from_dict(value: object) -> RadarAdcSnapshot:
+    data = _require_mapping(value, "payload.adc_snapshot")
+    encoded = _payload_value(data, "data_base64")
+    if not isinstance(encoded, str):
+        raise ValueError("payload.adc_snapshot.data_base64 must be a string")
+    try:
+        raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as exc:
+        raise ValueError(
+            "payload.adc_snapshot.data_base64 is not valid base64"
+        ) from exc
+    if data.get("layout", "chirp-major_rx-major_real16-le") != (
+        "chirp-major_rx-major_real16-le"
+    ):
+        raise ValueError("payload.adc_snapshot.layout is invalid")
+    return RadarAdcSnapshot(
+        data=raw,
+        samples_per_chirp=_require_int(
+            _payload_value(data, "samples_per_chirp"),
+            "payload.adc_snapshot.samples_per_chirp", 1, 4096,
+        ),
+        rx_channels=_require_int(
+            _payload_value(data, "rx_channels"),
+            "payload.adc_snapshot.rx_channels", 1, 8,
+        ),
+        chirps=_require_int(
+            _payload_value(data, "chirps"),
+            "payload.adc_snapshot.chirps", 1, 8,
+        ),
+        sample_bits=_require_int(
+            _payload_value(data, "sample_bits"),
+            "payload.adc_snapshot.sample_bits", 1, 16,
+        ),
+        tlv_type=_require_int(
+            _payload_value(data, "tlv_type"),
+            "payload.adc_snapshot.tlv_type", 0, 2**32 - 1,
+        ),
+    )
+
+
 def record_to_dict(record: SensorRecord) -> Dict[str, Any]:
     """Convert a validated record into the versioned wire representation."""
 
@@ -738,6 +831,11 @@ def record_to_dict(record: SensorRecord) -> Dict[str, Any]:
                 None
                 if record.heatmap is None
                 else _heatmap_to_dict(record.heatmap)
+            ),
+            "adc_snapshot": (
+                None
+                if record.adc_snapshot is None
+                else _adc_snapshot_to_dict(record.adc_snapshot)
             ),
         }
     elif isinstance(record, ImuSample):
@@ -916,6 +1014,11 @@ def record_from_dict(
                 None
                 if payload.get("heatmap") is None
                 else _heatmap_from_dict(payload.get("heatmap"))
+            ),
+            adc_snapshot=(
+                None
+                if payload.get("adc_snapshot") is None
+                else _adc_snapshot_from_dict(payload.get("adc_snapshot"))
             ),
         )
 

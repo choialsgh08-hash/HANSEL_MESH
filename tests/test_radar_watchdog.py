@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from common.sensor_contract import (
+    RadarAdcSnapshot,
     RadarFrame,
     RadarHeatmap,
     SensorHeader,
@@ -60,6 +61,7 @@ def radar_frame(
     azimuth_bins: int = 16,
     range_bins: int = 128,
     range_step_m: float = 0.09765625,
+    adc: bool = False,
 ) -> RadarFrame:
     radar_heatmap = None
     if heatmap:
@@ -82,6 +84,13 @@ def radar_frame(
         points=(),
         profile_id=profile_id,
         heatmap=radar_heatmap,
+        adc_snapshot=(
+            RadarAdcSnapshot(
+                data=b"\x00\x00" * (256 * 3 * 2),
+                samples_per_chirp=256, rx_channels=3, chirps=2,
+                sample_bits=12, tlv_type=316,
+            ) if adc else None
+        ),
     )
 
 
@@ -141,6 +150,28 @@ def make_watchdog(mission: Path, raw: Path) -> RadarEpochWatchdog:
 
 
 class RadarEpochWatchdogTests(unittest.TestCase):
+    def test_adc_enabled_epoch_requires_matching_uart_adc_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mission = root / "mission.jsonl"
+            expected = ExpectedRadarEvidence(
+                profile_id=PROFILE_ID, heatmap_azimuth_bins=16,
+                heatmap_range_bins=128, heatmap_range_step_m=0.09765625,
+                adc_samples_per_chirp=256, adc_rx_channels=3, adc_chirps=2,
+            )
+            watchdog = RadarEpochWatchdog(
+                mission_path=mission, raw_path=root / "capture.bin",
+                expected=expected, started_at_s=0.0,
+                first_frame_timeout_s=3.0, frame_timeout_s=2.5,
+                required_consecutive_frames=1, verification_timeout_s=5.0,
+            )
+            append_radar_frame(mission, log_seq=1, frame_number=1)
+            self.assertEqual(watchdog.poll(0.1).consecutive_good_frames, 0)
+            append_radar_frame(
+                mission, log_seq=2, frame_number=2, adc=True,
+            )
+            self.assertTrue(watchdog.poll(0.2).verified)
+
     def test_sensor_health_does_not_refresh_radar_frame_freshness(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

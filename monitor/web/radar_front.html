@@ -177,16 +177,18 @@
 
       .workspace {
         min-width: 0;
-        min-height: 650px;
+        min-height: 500px;
         display: grid;
         grid-template-columns: minmax(0, 1fr) 284px;
+        align-items: start;
         gap: 10px;
       }
 
       .radar-stage {
         position: relative;
         min-width: 0;
-        min-height: 650px;
+        min-height: 500px;
+        height: clamp(500px, calc(100vh - 200px), 650px);
         overflow: hidden;
         border: 1px solid var(--line);
         background: #020609;
@@ -211,7 +213,7 @@
         display: flex;
         flex-wrap: wrap;
         gap: 6px;
-        max-width: calc(100% - 390px);
+        max-width: calc(100% - 24px);
         pointer-events: none;
       }
 
@@ -336,6 +338,11 @@
 
       #pointcloud-3d-canvas:active {
         cursor: grabbing;
+      }
+
+      #collision-inset[hidden],
+      #pointcloud-3d-panel[hidden] {
+        display: none !important;
       }
 
       .sector-strip {
@@ -633,6 +640,7 @@
 
         .radar-stage {
           min-height: 0;
+          height: auto;
           display: grid;
           grid-template-rows: 470px 236px 286px auto;
           gap: 8px;
@@ -730,9 +738,9 @@
       <header class="page-header">
         <div class="brand">
           <p class="eyebrow">HANSEL MESH / RADAR OPERATOR VIEW</p>
-          <h1>반지름 30cm 근접 주행 지도</h1>
+          <h1>0~30cm 전방 조종 화면</h1>
           <p class="subtitle">
-            측정된 반사 증거만 표시 · UNKNOWN ≠ FREE · 카메라 영상 및 SLAM 아님
+            전체 반사 경향 기반 저반사 경로 후보 · 10cm 포인트 충돌 경고
           </p>
         </div>
         <div class="header-status">
@@ -749,30 +757,26 @@
         <div class="radar-stage" id="radar-panel">
           <canvas
             id="radar-main-canvas"
-            aria-label="레이더 중심 반지름 30센티미터 근접 주행 지도"
+            aria-label="레이더 전방 0~30센티미터 반사 증거와 통로 후보 지도"
           ></canvas>
 
           <div class="stage-tags">
-            <span class="tag">PROBABILITY MAP · DEFAULT</span>
-            <span class="tag">WHITE = STABLE REFLECTIVITY</span>
-            <span class="tag">CYAN = MEASURED WALLS</span>
-            <span class="tag">RADAR AT CENTER</span>
-            <span class="tag">5cm PROBABILITY</span>
+            <span class="tag">GRAY = FULL RANGE-AZIMUTH EVIDENCE</span>
+            <span class="tag">CYAN = REPEATED REFLECTION</span>
+            <span class="tag">YELLOW = LOW-REFLECTION ROUTE</span>
+            <span class="tag">FORWARD VIEW · 0~30cm</span>
             <span class="tag">UNKNOWN ≠ FREE</span>
-            <span class="tag">1cm PATH</span>
-            <span class="tag">BLUE = TRAVEL TRAIL</span>
             <span class="tag">ROBOT 15cm · MARGIN 3cm</span>
-            <span class="tag">1s DECAY · 2.5s TTL</span>
+            <span class="tag">RED = STOP WITHIN 10cm</span>
             <span class="tag">±60° TRUSTED FOV</span>
-            <span class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>
             <span class="tag" id="ground-filter-tag">SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN</span>
-            <span class="tag" id="build-tag">UI R54</span>
+            <span class="tag" id="build-tag">UI R75</span>
             <span class="tag" id="axis-warning">장착축/보정 확인</span>
           </div>
 
-          <section id="collision-inset" data-hazard="UNKNOWN">
+          <section id="collision-inset" data-hazard="UNKNOWN" hidden>
             <header>
-              <strong>0~30cm 충돌 확대</strong>
+              <strong>0~30cm 충돌·반사·경로</strong>
               <span id="collision-distance">-- cm</span>
             </header>
             <canvas
@@ -781,7 +785,7 @@
             ></canvas>
           </section>
 
-          <section id="pointcloud-3d-panel">
+          <section id="pointcloud-3d-panel" hidden>
             <header>
               <strong>2.5D FILTERED TRACKS · 0~30cm</strong>
               <span id="pointcloud-3d-status">FILTERED · SENSOR-RELATIVE Z</span>
@@ -873,6 +877,7 @@
               <dt>좌표축</dt><dd id="axis-value">+Y 전방 · +X 우측</dd>
               <dt>프로필</dt><dd id="profile-value">--</dd>
               <dt>보정 상태</dt><dd id="calibration-value">--</dd>
+              <dt>UART ADC</dt><dd id="adc-status-value">--</dd>
               <dt>Pose 모드</dt><dd id="pose-mode-value">ROBOT RELATIVE · SHORT MEMORY</dd>
               <dt>이동 보정</dt><dd id="motion-status-value">--</dd>
               <dt>계획 경로</dt><dd id="path-status-value">--</dd>
@@ -891,7 +896,7 @@
               <dt>Reflectivity surface</dt><dd id="reflectivity-cell-value">--</dd>
               <dt>확인 track</dt><dd id="confirmed-track-value">--</dd>
               <dt>Clutter 제거</dt><dd id="clutter-rejected-value">--</dd>
-              <dt>Quality gate 제거</dt><dd id="quality-rejected-value">--</dd>
+              <dt>Geometry unavailable</dt><dd id="quality-rejected-value">--</dd>
               <dt>Heatmap 후보 셀</dt><dd id="heatmap-candidate-value">--</dd>
               <dt>Heatmap cluster</dt><dd id="heatmap-cluster-value">--</dd>
               <dt>Reflection evidence</dt><dd id="reflection-value">--</dd>
@@ -932,8 +937,8 @@
       </footer>
     </main>
 
-    <script src="/radar_scene.js?v=20260811-calibrated-contours-r54"></script>
-    <script src="/radar_panel.js?v=20260811-calibrated-contours-r54"></script>
+    <script src="/radar_scene.js?v=20260826-turn-confidence-r75"></script>
+    <script src="/radar_panel.js?v=20260826-turn-confidence-r75"></script>
     <script>
       const panel = new window.HanselRadarPanel(
         document.querySelector("#radar-panel"),

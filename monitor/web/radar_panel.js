@@ -1,10 +1,11 @@
 (function () {
   "use strict";
 
-  const UI_BUILD_ID = "20260811-calibrated-contours-r54";
+  const UI_BUILD_ID = "20260826-turn-confidence-r75";
   const MAIN_MAX_RANGE_M = 0.3;
   const MAIN_HALF_WIDTH_M = 0.3;
   const CLOSE_MAX_RANGE_M = 0.3;
+  const OPERATOR_EVIDENCE_RADIUS_M = 0.3;
   const DANGER_RANGE_M = 0.1;
   const TRACK_MAX_AGE_MS = 300;
   const NORMAL_COPY =
@@ -233,27 +234,40 @@
         }
       } catch (error) {
         this.invalidSceneCount += 1;
-        const nowMs = this.options.now();
-        const ageMs = this.lastValidAcceptedAtMs == null
-          ? Infinity : Math.max(0, nowMs - this.lastValidAcceptedAtMs);
-        if (this.lastValidPresentation &&
-            this.invalidSceneCount < 3 && ageMs <= 500) {
-          this.snapshot = this.lastValidSnapshot;
-          this.presentation = {
-            ...this.lastValidPresentation,
-            sceneVerification: {
-              attempt: this.invalidSceneCount,
-              limit: 3,
-              ageMs,
-            },
-          };
-        } else {
+        try {
+          const fallback = window.HanselRadarScene.parseRadarEvidenceFallback(
+            snapshot,
+            error,
+          );
           this.snapshot = snapshot;
           this.presentation = {
-            blocked: true,
-            reason: "invalid_scene",
-            error,
+            ...fallback,
+            sceneVerification: null,
           };
+        } catch (_fallbackError) {
+          const nowMs = this.options.now();
+          const ageMs = this.lastValidAcceptedAtMs == null
+            ? Infinity : Math.max(0, nowMs - this.lastValidAcceptedAtMs);
+          if (this.lastValidPresentation && ageMs <= 2000) {
+            this.snapshot = this.lastValidSnapshot;
+            this.presentation = {
+              ...this.lastValidPresentation,
+              evidenceOnly: true,
+              sceneContractFallback: true,
+              hazard: { level: "UNKNOWN", threshold_m: DANGER_RANGE_M },
+              plannedPath: {
+                status: "unavailable", points: [], length_m: 0,
+              },
+              sceneVerification: null,
+            };
+          } else {
+            this.snapshot = snapshot;
+            this.presentation = {
+              blocked: true,
+              reason: "invalid_scene",
+              error,
+            };
+          }
         }
       }
       this.updateText(this.presentation);
@@ -287,19 +301,7 @@
 
     draw() {
       const main = this.resizeCanvas(this.mainCanvas);
-      const collision = this.resizeCanvas(this.collisionCanvas);
-      const pointCloud3d = this.pointCloud3dCanvas
-        ? this.resizeCanvas(this.pointCloud3dCanvas)
-        : null;
       this.clearCanvas(main.ctx, main.width, main.height);
-      this.clearCanvas(collision.ctx, collision.width, collision.height);
-      if (pointCloud3d) {
-        this.clearCanvas(
-          pointCloud3d.ctx,
-          pointCloud3d.width,
-          pointCloud3d.height,
-        );
-      }
 
       const presentation = this.presentation;
       if (!presentation || presentation.blocked) {
@@ -308,10 +310,6 @@
           reason: "waiting",
         };
         this.updateDiagnostics(blockedPresentation);
-        const pointCloudStatus = document.querySelector("#pointcloud-3d-status");
-        if (pointCloudStatus) {
-          pointCloudStatus.textContent = "SENSOR FAULT";
-        }
         const poseLabel = document.querySelector("#pose-mode-value");
         if (poseLabel) {
           poseLabel.textContent = "--";
@@ -322,65 +320,28 @@
           main.height,
           blockedPresentation,
         );
-        this.drawBlockingOverlay(
-          collision.ctx,
-          collision.width,
-          collision.height,
-          blockedPresentation,
-        );
-        if (pointCloud3d) {
-          this.drawBlockingOverlay(
-            pointCloud3d.ctx,
-            pointCloud3d.width,
-            pointCloud3d.height,
-            blockedPresentation,
-          );
-        }
         return;
       }
 
-      const mainTransform = this.makeCircularViewportTransform(
+      const mainTransform = this.makeViewportTransform(
         main.width,
         main.height,
         MAIN_MAX_RANGE_M,
-        { top: 50, right: 26, bottom: 64, left: 26 },
-      );
-      const closeTransform = this.makeViewportTransform(
-        collision.width,
-        collision.height,
-        CLOSE_MAX_RANGE_M,
-        CLOSE_MAX_RANGE_M,
-        { top: 16, right: 15, bottom: 28, left: 15 },
+        MAIN_HALF_WIDTH_M,
+        { top: 48, right: 30, bottom: 58, left: 30 },
       );
       const showRaw = Boolean(this.rawToggle && this.rawToggle.checked);
-      let rawPoints = [];
-      if (showRaw) {
-        const frame = this.snapshot && this.snapshot.frame;
-        const candidateRawPoints = frame ? frame.points : null;
-        rawPoints = Array.isArray(candidateRawPoints) ? candidateRawPoints : [];
-      }
-      this.drawLidarTopView(
+      const frame = this.snapshot && this.snapshot.frame;
+      const candidateRawPoints = showRaw && frame ? frame.points : null;
+      const rawPoints = Array.isArray(candidateRawPoints)
+        ? candidateRawPoints : [];
+      this.drawCollisionInset(
         main.ctx,
         mainTransform,
         presentation,
         rawPoints,
         showRaw,
       );
-      this.drawCollisionInset(
-        collision.ctx,
-        closeTransform,
-        presentation,
-      );
-      if (pointCloud3d) {
-        this.drawPointCloud25d(
-          pointCloud3d.ctx,
-          pointCloud3d.width,
-          pointCloud3d.height,
-          presentation.filteredTracks,
-          rawPoints,
-          showRaw,
-        );
-      }
     }
 
     clearCanvas(ctx, width, height) {
@@ -446,24 +407,11 @@
         scene.reflectivitySurface,
         { clipShape: "circle" },
       );
-      this.drawReflectivityContours(
+      this.drawAdcAngleEvidence(
         ctx,
         transform,
-        scene.reflectivityContours,
+        scene.adcRangeAngleSurface,
       );
-      if (scene.reflectivityContours?.status !== "confirmed") {
-        this.drawReflectivityBoundaries(
-          ctx,
-          transform,
-          scene.reflectivityBoundaries,
-          scene.reflectivityCorridor,
-        );
-        this.drawReflectivityCorridor(
-          ctx,
-          transform,
-          scene.reflectivityCorridor,
-        );
-      }
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
           clipShape: "circle",
@@ -478,7 +426,6 @@
         );
       }
       this.drawTravelTrail(ctx, transform, scene.travelTrail);
-      this.drawPlannedPath(ctx, transform, scene.plannedPath);
       for (const track of Array.isArray(scene.filteredTracks)
         ? scene.filteredTracks : []) {
         if (this.operatorVisibleTrack(track)) {
@@ -502,6 +449,9 @@
         this.drawRawDebugPoints(ctx, transform, rawPoints);
       }
       ctx.restore();
+      // Keep the steering advisory above every reflection/track layer.  It is
+      // the operator's final overlay and must never disappear under evidence.
+      this.drawPlannedPath(ctx, transform, scene.plannedPath);
       this.drawRobotFootprint(ctx, transform);
       this.drawRobot(ctx, transform);
       ctx.fillStyle = "rgba(225, 246, 243, 0.72)";
@@ -514,43 +464,38 @@
       );
     }
 
-    drawCollisionInset(ctx, transform, scene) {
+    drawCollisionInset(ctx, transform, scene, rawPoints = [], showRaw = false) {
       this.drawMetricGrid(ctx, transform, {
         forwardMaxM: CLOSE_MAX_RANGE_M,
         halfWidthM: CLOSE_MAX_RANGE_M,
         rangeStepM: 0.1,
         labelUnit: "cm",
-        clipShape: "radial",
+        clipShape: "fov",
       });
       ctx.save();
-      this.clipToMapBoundary(ctx, transform, "radial");
+      this.clipToMapBoundary(ctx, transform, "fov");
       this.drawReflectivitySurface(
         ctx,
         transform,
         scene.reflectivitySurface,
-        { clipShape: "radial" },
+        { clipShape: "fov" },
       );
-      this.drawReflectivityContours(
-        ctx,
-        transform,
-        scene.reflectivityContours,
-      );
-      if (scene.reflectivityContours?.status !== "confirmed") {
-        this.drawReflectivityBoundaries(
+      if (scene.adcRangeAngleSurface) {
+        this.drawAdcAngleEvidence(
           ctx,
           transform,
-          scene.reflectivityBoundaries,
-          scene.reflectivityCorridor,
+          scene.adcRangeAngleSurface,
         );
-        this.drawReflectivityCorridor(
+      } else {
+        this.drawAdcRangeEvidence(
           ctx,
           transform,
-          scene.reflectivityCorridor,
+          this.snapshot?.frame?.adc_range_profile,
         );
       }
       if (scene.probabilisticLocalMap === null) {
         this.drawEvidenceGrid(ctx, transform, scene, {
-          clipShape: "radial",
+          clipShape: "fov",
         });
         this.drawAccumulatedObstacles(ctx, transform, scene);
       } else {
@@ -558,29 +503,756 @@
           ctx,
           transform,
           scene.probabilisticLocalMap,
-          { clipShape: "radial" },
+          { clipShape: "fov", showUncertainty: false },
         );
-      }
-      this.drawPlannedPath(ctx, transform, scene.plannedPath);
-      for (const track of Array.isArray(scene.filteredTracks)
-        ? scene.filteredTracks : []) {
-        if (this.operatorVisibleTrack(track)) {
-          this.drawUncertaintyOutline(ctx, transform, track);
-        }
       }
       this.drawTracks(ctx, transform, scene.tracks, {
         scene,
         labelLimit: 3,
         maxRangeM: CLOSE_MAX_RANGE_M,
         close: true,
-        clipShape: "radial",
+        clipShape: "fov",
       });
+      this.drawOperatorReturns(
+        ctx,
+        transform,
+        scene.probabilisticLocalMap,
+      );
+      this.drawPlannedPath(ctx, transform, scene.plannedPath);
+      this.drawOperatorGuide(
+        ctx,
+        transform,
+        this.deriveOperatorGuide(
+          scene.probabilisticLocalMap,
+          scene.plannedPath,
+        ),
+        scene.hazard,
+        scene.plannedPath,
+      );
+      if (showRaw) {
+        this.drawRawDebugPoints(ctx, transform, rawPoints);
+      }
       ctx.restore();
       this.drawRobotFootprint(ctx, transform);
       this.drawRobot(ctx, transform);
     }
 
+    drawAdcRangeEvidence(ctx, transform, profile) {
+      if (!profile || profile.source !== "uart_last_chirp_pair_adc" ||
+          profile.direction_semantics !== "range_only" ||
+          profile.complete_frame_adc !== false ||
+          !Array.isArray(profile.values)) {
+        return;
+      }
+      const rangeStepM = Number(profile.range_step_m);
+      if (!Number.isFinite(rangeStepM) || rangeStepM <= 0) return;
+      ctx.save();
+      ctx.setLineDash([3, 5]);
+      ctx.lineWidth = 1.25;
+      for (let index = 1; index < profile.values.length; index += 1) {
+        const rangeM = index * rangeStepM;
+        const value = Number(profile.values[index]);
+        if (rangeM > transform.forwardMaxM + 1e-9 ||
+            !Number.isFinite(value) || value <= 0) {
+          continue;
+        }
+        const strength = Math.max(0, Math.min(1, value / 255));
+        ctx.globalAlpha = 0.05 + 0.22 * strength;
+        ctx.strokeStyle = "rgba(118, 184, 255, 0.88)";
+        ctx.beginPath();
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          rangeM * transform.scale,
+          Math.PI,
+          Math.PI * 2,
+        );
+        ctx.stroke();
+      }
+      const peakRangeM = Number(profile.peak_range_m);
+      if (Number.isFinite(peakRangeM) && peakRangeM > 0 &&
+          peakRangeM <= transform.forwardMaxM + 1e-9) {
+        ctx.globalAlpha = 0.86;
+        ctx.fillStyle = "rgba(166, 210, 255, 0.94)";
+        ctx.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textAlign = "left";
+        ctx.fillText(
+          `ADC RANGE ONLY · ${Math.round(peakRangeM * 100)}cm PEAK`,
+          14,
+          26,
+        );
+      }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    drawAdcAngleEvidence(ctx, transform, surface) {
+      if (!surface || surface.source !== "uart_last_chirp_pair_adc" ||
+          surface.directionSemantics !== "range_azimuth" ||
+          surface.completeFrameAdc !== false ||
+          !Array.isArray(surface.cells) || !Array.isArray(surface.peaks)) {
+        return;
+      }
+      ctx.save();
+      for (const cell of surface.cells) {
+        const rangeM = Number(cell.range_m);
+        const forwardM = Number(cell.forward_m);
+        const lateralM = Number(cell.lateral_m);
+        const intensity = Number(cell.intensity);
+        const coherence = Number(cell.coherence);
+        if (!Number.isFinite(rangeM) || rangeM <= 0 ||
+            rangeM > transform.forwardMaxM + 1e-9 ||
+            !Number.isFinite(forwardM) || !Number.isFinite(lateralM) ||
+            !Number.isFinite(intensity) || !Number.isFinite(coherence) ||
+            intensity <= 0) {
+          continue;
+        }
+        const point = window.HanselRadarScene.projectMapPoint(
+          transform, forwardM, lateralM,
+        );
+        const strength = Math.max(0, Math.min(1, intensity * coherence));
+        const radius = Math.max(0.7, Math.min(
+          2.3, 0.45 + 1.85 * strength,
+        ));
+        ctx.globalAlpha = 0.025 + 0.28 * strength;
+        ctx.fillStyle = "rgba(99, 231, 255, 0.92)";
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      const verified = surface.peaks.filter((peak) =>
+        peak && peak.verified === true &&
+        Number.isFinite(Number(peak.range_m)) &&
+        Number(peak.range_m) <= transform.forwardMaxM + 1e-9 &&
+        Number.isFinite(Number(peak.azimuth_deg)) &&
+        Number.isFinite(Number(peak.forward_m)) &&
+        Number.isFinite(Number(peak.lateral_m)));
+      for (const peak of verified) {
+        const rangeM = Number(peak.range_m);
+        const azimuthRad = Number(peak.azimuth_deg) * Math.PI / 180;
+        const uncertaintyRad = Number(peak.angular_uncertainty_deg) *
+          Math.PI / 180;
+        const point = window.HanselRadarScene.projectMapPoint(
+          transform, Number(peak.forward_m), Number(peak.lateral_m),
+        );
+        ctx.globalAlpha = 0.45 + 0.5 * Math.max(
+          0, Math.min(1, Number(peak.confidence) || 0),
+        );
+        ctx.strokeStyle = "rgba(176, 250, 255, 0.96)";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          rangeM * transform.scale,
+          -Math.PI / 2 + azimuthRad - uncertaintyRad,
+          -Math.PI / 2 + azimuthRad + uncertaintyRad,
+        );
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = "rgba(225, 254, 255, 0.98)";
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 3.4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (verified.length > 0) {
+        const strongest = verified.reduce((best, peak) =>
+          Number(peak.confidence) > Number(best.confidence) ? peak : best);
+        const sign = Number(strongest.azimuth_deg) > 0 ? "+" : "";
+        const calibration = surface.phaseCalibration === "measured"
+          ? "CAL" : "DESIGN CAL";
+        ctx.globalAlpha = 0.94;
+        ctx.fillStyle = "rgba(195, 251, 255, 0.98)";
+        ctx.font = "700 10px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textAlign = "left";
+        ctx.fillText(
+          `ADC PHASE ${calibration} · ${sign}${Math.round(
+            Number(strongest.azimuth_deg),
+          )}° · ${Math.round(Number(strongest.range_m) * 100)}cm`,
+          14,
+          26,
+        );
+      }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
+    deriveOperatorWalls(surface, localMap = null) {
+      const probabilityCells = localMap && Array.isArray(localMap.cells)
+        ? localMap.cells : [];
+      const hasProbabilityBoundary = probabilityCells.some(
+        (cell) => Number(cell && cell.probability) > 0.5,
+      );
+      const calibratedPolar = surface && surface.source ===
+        "full_range_azimuth_heatmap" && surface.calibrated === true &&
+        surface.normalization ===
+          "current_range_common_mode_physical_beam" &&
+        Array.isArray(surface.cells);
+      if (calibratedPolar && !hasProbabilityBoundary) {
+        const physicalResolutionDeg = Number(surface.angularResolutionDeg);
+        const beamWidthDeg = Number.isFinite(physicalResolutionDeg) &&
+          physicalResolutionDeg > 0 ? physicalResolutionDeg : 29;
+        const beamCenters = [-48, -24, 0, 24, 48];
+        const points = [];
+        for (const centreDeg of beamCenters) {
+          if (Math.abs(centreDeg) < 1e-9) continue;
+          const candidates = [];
+          for (const cell of surface.cells) {
+            const azimuthDeg = Number(cell && cell.azimuth_deg);
+            const rangeM = Number(cell && cell.range_m);
+            const forwardM = Number(cell && cell.forward_m);
+            const lateralM = Number(cell && cell.lateral_m);
+            const residualDb = Number(
+              cell && cell.calibrated_residual_db,
+            );
+            const confidence = Number(cell && cell.confidence);
+            const persistence = Number(cell && cell.persistence);
+            if (!Number.isFinite(azimuthDeg) ||
+                !Number.isFinite(rangeM) || rangeM < 0.07 ||
+                rangeM > OPERATOR_EVIDENCE_RADIUS_M + 1e-9 ||
+                !Number.isFinite(forwardM) || forwardM < 0 ||
+                forwardM > CLOSE_MAX_RANGE_M + 1e-9 ||
+                !Number.isFinite(lateralM) ||
+                Math.abs(lateralM) > MAIN_HALF_WIDTH_M + 1e-9 ||
+                !Number.isFinite(residualDb) ||
+                !Number.isFinite(confidence) ||
+                !Number.isFinite(persistence)) continue;
+            const deltaDeg = (azimuthDeg - centreDeg) /
+              (beamWidthDeg / 2.355);
+            const angularWeight = Math.exp(-0.5 * deltaDeg * deltaDeg);
+            if (angularWeight < 0.03) continue;
+            candidates.push({
+              cell,
+              rangeM,
+              residualDb,
+              confidence,
+              persistence,
+              angularWeight,
+            });
+          }
+          const ranges = [...new Set(candidates.map((value) => value.rangeM))]
+            .sort((left, right) => left - right);
+          let best = null;
+          let visibility = 1;
+          for (const rangeM of ranges) {
+            const row = candidates.filter((value) => value.rangeM === rangeM);
+            const weight = row.reduce(
+              (sum, value) => sum + value.angularWeight, 0,
+            );
+            if (weight <= 0) continue;
+            const residualDb = row.reduce(
+              (sum, value) => sum + value.residualDb * value.angularWeight,
+              0,
+            ) / weight;
+            const confidence = row.reduce(
+              (sum, value) => sum + value.confidence * value.angularWeight,
+              0,
+            ) / weight;
+            const persistence = row.reduce(
+              (sum, value) => sum + value.persistence * value.angularWeight,
+              0,
+            ) / weight;
+            // Residual is converted continuously into a posterior.  No cell
+            // is dropped for weak signal; the largest positive posterior is
+            // the beam's measured boundary and weak beams stay translucent.
+            const occupancy = 1 / (1 + Math.exp(
+              -Math.max(-12, Math.min(12, residualDb / 1.5)),
+            ));
+            const sceneChange = row.reduce(
+              (sum, value) => sum + Number(
+                value.cell.scene_change_score ?? 1,
+              ) * value.angularWeight,
+              0,
+            ) / weight;
+            const strength = Math.max(0, Math.min(0.995,
+              (occupancy - 0.5) * 2 * confidence * persistence,
+            )) * (0.55 + 0.45 * Math.max(0, Math.min(1, sceneChange)));
+            const firstSurfaceProbability = visibility * strength;
+            if (!best || firstSurfaceProbability > best.strength) {
+              best = {
+                rangeM, residualDb,
+                strength: firstSurfaceProbability, confidence,
+              };
+            }
+            visibility *= 1 - strength;
+          }
+          if (!best || best.strength <= 0) continue;
+          const azimuthRad = centreDeg * Math.PI / 180;
+          const forwardM = best.rangeM * Math.cos(azimuthRad);
+          const lateralM = best.rangeM * Math.sin(azimuthRad);
+          if (forwardM > CLOSE_MAX_RANGE_M + 1e-9 ||
+              Math.abs(lateralM) > MAIN_HALF_WIDTH_M + 1e-9) continue;
+          points.push({
+            azimuthIndex: centreDeg,
+            azimuthDeg: centreDeg,
+            rangeM: best.rangeM,
+            forwardM,
+            lateralM,
+            strength: best.strength,
+            confidence: best.confidence,
+            angularUncertaintyDeg: beamWidthDeg / 2,
+          });
+        }
+        return {
+          left: points.filter((point) => point.lateralM < 0),
+          right: points.filter((point) => point.lateralM > 0),
+          calibrated: true,
+        };
+      }
+      if (probabilityCells.length > 0) {
+        const resolutionM = Number(localMap.resolutionM);
+        const rows = new Map();
+        for (const cell of probabilityCells) {
+          const forwardM = Number(cell && cell.forward_m);
+          const lateralM = Number(cell && cell.lateral_m);
+          const probability = Number(cell && cell.probability);
+          if (!Number.isFinite(forwardM) || forwardM <= 0 ||
+              forwardM > CLOSE_MAX_RANGE_M + 1e-9 ||
+              !Number.isFinite(lateralM) || Math.abs(lateralM) < 1e-6 ||
+              Math.abs(lateralM) > MAIN_HALF_WIDTH_M + 1e-9 ||
+              !Number.isFinite(probability) || probability <= 0.5) {
+            continue;
+          }
+          const side = lateralM < 0 ? "left" : "right";
+          const rowIndex = Number.isFinite(resolutionM) && resolutionM > 0
+            ? Math.round(forwardM / resolutionM)
+            : Math.round(forwardM * 100);
+          const key = `${side}:${rowIndex}`;
+          const strength = Math.max(0, Math.min(1,
+            (probability - 0.5) * 2,
+          ));
+          const point = {
+            azimuthIndex: rowIndex,
+            azimuthDeg: Math.atan2(lateralM, forwardM) * 180 / Math.PI,
+            rangeM: Math.hypot(forwardM, lateralM),
+            forwardM,
+            lateralM,
+            strength,
+            confidence: strength,
+          };
+          const previous = rows.get(key);
+          if (!previous || point.strength > previous.strength ||
+              (point.strength === previous.strength &&
+                Math.abs(point.lateralM) < Math.abs(previous.lateralM))) {
+            rows.set(key, point);
+          }
+        }
+        const left = [];
+        const right = [];
+        for (const [key, point] of rows) {
+          (key.startsWith("left:") ? left : right).push(point);
+        }
+        left.sort((a, b) => a.forwardM - b.forwardM);
+        right.sort((a, b) => a.forwardM - b.forwardM);
+        if (left.length + right.length >= 1) {
+          return { left, right };
+        }
+      }
+      const cells = surface && surface.source ===
+        "full_range_azimuth_heatmap" && Array.isArray(surface.cells)
+        ? surface.cells : [];
+      const columns = new Map();
+      for (const cell of cells) {
+        const azimuthIndex = Number(cell && cell.azimuth_index);
+        const azimuthDeg = Number(cell && cell.azimuth_deg);
+        const rangeM = Number(cell && cell.range_m);
+        const forwardM = Number(cell && cell.forward_m);
+        const lateralM = Number(cell && cell.lateral_m);
+        const intensity = Number(cell && cell.intensity);
+        const confidence = Number(cell && cell.confidence);
+        const persistence = Number(cell && cell.persistence);
+        if (!Number.isInteger(azimuthIndex) ||
+            !Number.isFinite(azimuthDeg) ||
+            !Number.isFinite(rangeM) || rangeM <= 0 ||
+            rangeM > OPERATOR_EVIDENCE_RADIUS_M + 1e-9 ||
+            !Number.isFinite(forwardM) || forwardM < 0 ||
+            forwardM > CLOSE_MAX_RANGE_M + 1e-9 ||
+            !Number.isFinite(lateralM) ||
+            Math.abs(lateralM) > MAIN_HALF_WIDTH_M + 1e-9 ||
+            !Number.isFinite(intensity) ||
+            !Number.isFinite(confidence) ||
+            !Number.isFinite(persistence)) {
+          continue;
+        }
+        const strength = Math.max(0, Math.min(1, intensity)) *
+          (0.65 + 0.35 * Math.max(0, Math.min(1, confidence))) *
+          (0.50 + 0.50 * Math.max(0, Math.min(1, persistence)));
+        const point = {
+          azimuthIndex,
+          azimuthDeg,
+          rangeM,
+          forwardM,
+          lateralM,
+          strength,
+          confidence: Math.max(0, Math.min(1, confidence)),
+        };
+        const previous = columns.get(azimuthIndex);
+        if (!previous || point.strength > previous.strength ||
+            (point.strength === previous.strength &&
+              point.rangeM < previous.rangeM)) {
+          columns.set(azimuthIndex, point);
+        }
+      }
+      const ordered = [...columns.values()].sort(
+        (left, right) => left.azimuthDeg - right.azimuthDeg,
+      );
+      return {
+        left: ordered.filter((point) => point.lateralM < -1e-6),
+        right: ordered.filter((point) => point.lateralM > 1e-6),
+      };
+    }
+
+    operatorWallSegments(points) {
+      const segments = [];
+      let segment = [];
+      for (const point of Array.isArray(points) ? points : []) {
+        const previous = segment.at(-1);
+        const gap = previous ? Math.hypot(
+          point.forwardM - previous.forwardM,
+          point.lateralM - previous.lateralM,
+        ) : 0;
+        const angularGapDeg = previous
+          ? Math.abs(Number(point.azimuthDeg) - Number(previous.azimuthDeg))
+          : 0;
+        const radialGapM = previous
+          ? Math.abs(Number(point.rangeM) - Number(previous.rangeM))
+          : 0;
+        const physicallyAdjacent = previous &&
+          Number.isFinite(angularGapDeg) && angularGapDeg <= 29.0 + 1e-9 &&
+          Number.isFinite(radialGapM) && radialGapM <= 0.09 + 1e-9;
+        if (previous && gap > 0.12 && !physicallyAdjacent) {
+          if (segment.length > 0) segments.push(segment);
+          segment = [];
+        }
+        segment.push(point);
+      }
+      if (segment.length > 0) segments.push(segment);
+      return segments;
+    }
+
+    drawOperatorReturns(ctx, transform, localMap = null) {
+      const cells = localMap && Array.isArray(localMap.cells)
+        ? localMap.cells : [];
+      ctx.save();
+      for (const cell of cells) {
+        const forwardM = Number(cell && cell.forward_m);
+        const lateralM = Number(cell && cell.lateral_m);
+        const probability = Number(cell && cell.probability);
+        const radialUncertainty = Number(cell && cell.range_uncertainty_m);
+        const lateralUncertainty = Number(cell && cell.lateral_uncertainty_m);
+        if (!Number.isFinite(forwardM) || forwardM < 0 ||
+            forwardM > transform.forwardMaxM + 1e-9 ||
+            !Number.isFinite(lateralM) ||
+            Math.abs(lateralM) > transform.halfWidthM + 1e-9 ||
+            !Number.isFinite(probability) || probability <= 0.5 ||
+            Math.abs(Math.atan2(lateralM, Math.max(forwardM, 1e-9))) >
+              Math.PI / 3 + 1e-9) {
+          continue;
+        }
+        const projected = window.HanselRadarScene.projectMapPoint(
+          transform, forwardM, lateralM,
+        );
+        const strength = Math.max(0, Math.min(1,
+          (probability - 0.5) / 0.47,
+        ));
+        const radiusPx = Math.max(
+          4,
+          Math.min(28, Math.max(
+            Number.isFinite(radialUncertainty) ? radialUncertainty : 0,
+            Number.isFinite(lateralUncertainty) ? lateralUncertainty : 0,
+            0.025,
+          ) * transform.scale),
+        );
+        ctx.beginPath();
+        ctx.arc(projected.x, projected.y, radiusPx, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(92, 228, 208, ${
+          (0.08 + 0.34 * strength).toFixed(3)})`;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(projected.x, projected.y, 2.4 + 2.6 * strength,
+          0, Math.PI * 2);
+        ctx.fillStyle = `rgba(224, 255, 252, ${
+          (0.50 + 0.48 * strength).toFixed(3)})`;
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    deriveOperatorGuide(localMap, plannedPath = null) {
+      const evidence = [];
+      const mapCells = localMap && Array.isArray(localMap.cells)
+        ? localMap.cells : [];
+      for (const cell of mapCells) {
+        const forwardM = Number(cell && cell.forward_m);
+        const lateralM = Number(cell && cell.lateral_m);
+        const probability = Number(cell && cell.probability);
+        const rangeUncertainty = Number(cell && cell.range_uncertainty_m);
+        const lateralUncertainty = Number(cell && cell.lateral_uncertainty_m);
+        if (!Number.isFinite(forwardM) || forwardM < 0 || forwardM > 0.30 ||
+            !Number.isFinite(lateralM) ||
+            !Number.isFinite(probability) || probability <= 0.5) continue;
+        if (Math.abs(lateralM) > 0.30 ||
+            Math.abs(Math.atan2(lateralM, Math.max(1e-9, forwardM))) >
+              Math.PI / 3 + 1e-9) continue;
+        evidence.push({
+          forwardM,
+          lateralM,
+          strength: Math.max(0, Math.min(1, (probability - 0.5) * 2)),
+          uncertaintyM: Math.max(
+            0,
+            Number.isFinite(rangeUncertainty) ? rangeUncertainty : 0,
+            Number.isFinite(lateralUncertainty) ? lateralUncertainty : 0,
+          ),
+        });
+      }
+      const occupiedEvidence = evidence.filter(
+        (obstacle) => obstacle.strength > 0,
+      );
+      const negativeLateral = occupiedEvidence
+        .filter((obstacle) => obstacle.lateralM < -1e-6)
+        .map((obstacle) => obstacle.lateralM);
+      const positiveLateral = occupiedEvidence
+        .filter((obstacle) => obstacle.lateralM > 1e-6)
+        .map((obstacle) => obstacle.lateralM);
+      const leftBoundaryM = negativeLateral.length > 0
+        ? Math.max(...negativeLateral) : null;
+      const rightBoundaryM = positiveLateral.length > 0
+        ? Math.min(...positiveLateral) : null;
+      const twoSided = leftBoundaryM !== null && rightBoundaryM !== null;
+      const corridorCenterM = twoSided
+        ? (leftBoundaryM + rightBoundaryM) / 2 : null;
+      const corridorWidthM = twoSided
+        ? rightBoundaryM - leftBoundaryM : null;
+      const requiredPassageWidthM = 0.21;
+      const boundedPassage = twoSided &&
+        corridorWidthM >= requiredPassageWidthM;
+      const evidenceState = boundedPassage ? "two_sided" :
+        (twoSided ? "too_narrow" :
+          (occupiedEvidence.length > 0 ? "one_sided" : "unobserved"));
+
+      if (plannedPath && plannedPath.status === "turn_side_unresolved") {
+        return {
+          points: [],
+          direction: "unknown",
+          advisory: true,
+          clearanceM: requiredPassageWidthM,
+          evidenceState: "side_unresolved",
+          passageVerified: false,
+          corridorWidthM,
+          confidence: 0,
+        };
+      }
+
+      if (plannedPath && Array.isArray(plannedPath.points) &&
+          plannedPath.points.length >= 2 &&
+          ["clear", "limited"].includes(plannedPath.status)) {
+        const points = plannedPath.points.map((point) => [point[0], point[1]]);
+        const destination = points.at(-1)[1];
+        return {
+          points,
+          direction: destination > 0.025 ? "right" :
+            (destination < -0.025 ? "left" : "straight"),
+          advisory: true,
+          clearanceM: Number.isFinite(plannedPath.minimum_passage_width_m)
+            ? plannedPath.minimum_passage_width_m : requiredPassageWidthM,
+          evidenceState,
+          passageVerified: boundedPassage,
+          corridorWidthM,
+          confidence: boundedPassage
+            ? Math.max(0, Math.min(
+                1, (corridorWidthM - requiredPassageWidthM) / 0.09,
+              ))
+            : 0,
+        };
+      }
+
+      if (!boundedPassage) {
+        return {
+          points: [],
+          direction: "unknown",
+          advisory: true,
+          clearanceM: requiredPassageWidthM,
+          evidenceState,
+          passageVerified: false,
+          corridorWidthM,
+          confidence: 0,
+        };
+      }
+
+      const lateralValues = [];
+      for (let index = -18; index <= 18; index += 1) {
+        lateralValues.push(index / 100);
+      }
+      const rows = [];
+      let previous = [{ lateralM: 0, cost: 0, previousIndex: -1 }];
+      const robotInfluenceM = 0.075 + 0.03;
+      for (let step = 1; step <= 10; step += 1) {
+        const forwardM = step * 0.03;
+        const limitM = Math.min(0.18, 0.02 + forwardM * 0.80);
+        const candidates = lateralValues.filter(
+          (lateralM) => Math.abs(lateralM) <= limitM + 1e-9,
+        );
+        const row = candidates.map((lateralM) => {
+          let obstacleCost = 0;
+          for (const obstacle of evidence) {
+            if (obstacle.strength <= 0) continue;
+            const influenceM = robotInfluenceM +
+              Math.min(0.05, obstacle.uncertaintyM);
+            const distanceM = Math.hypot(
+              forwardM - obstacle.forwardM,
+              lateralM - obstacle.lateralM,
+            );
+            const ratio = distanceM / Math.max(0.02, influenceM);
+            obstacleCost += obstacle.strength *
+              Math.exp(-0.5 * ratio * ratio) * 9.0;
+          }
+          let bestCost = Infinity;
+          let bestIndex = -1;
+          previous.forEach((prior, priorIndex) => {
+            const deltaM = lateralM - prior.lateralM;
+            if (Math.abs(deltaM) > 0.055 + 1e-9) return;
+            const transitionCost = 1.8 * Math.pow(deltaM / 0.03, 2);
+            const preferredLateralM = corridorCenterM === null
+              ? 0 : corridorCenterM;
+            const centreCost = 0.045 * Math.pow(
+              (lateralM - preferredLateralM) / 0.01,
+              2,
+            );
+            const cost = prior.cost + obstacleCost +
+              transitionCost + centreCost;
+            if (cost < bestCost) {
+              bestCost = cost;
+              bestIndex = priorIndex;
+            }
+          });
+          return { lateralM, cost: bestCost, previousIndex: bestIndex };
+        });
+        rows.push(row);
+        previous = row;
+      }
+      let bestIndex = 0;
+      for (let index = 1; index < previous.length; index += 1) {
+        if (previous[index].cost < previous[bestIndex].cost) {
+          bestIndex = index;
+        }
+      }
+      const points = [];
+      for (let rowIndex = rows.length - 1; rowIndex >= 0; rowIndex -= 1) {
+        const node = rows[rowIndex][bestIndex];
+        points.push([(rowIndex + 1) * 0.03, node.lateralM]);
+        bestIndex = node.previousIndex;
+      }
+      points.reverse();
+      points.unshift([0, 0]);
+      const destination = points.at(-1)[1];
+      return {
+        points,
+        direction: destination > 0.025 ? "right" :
+          (destination < -0.025 ? "left" : "straight"),
+        advisory: true,
+        clearanceM: robotInfluenceM * 2,
+        evidenceState: "two_sided",
+        passageVerified: true,
+        corridorWidthM,
+        confidence: Math.max(0, Math.min(
+          1, (corridorWidthM - requiredPassageWidthM) / 0.09,
+        )),
+      };
+    }
+
+    drawOperatorGuide(ctx, transform, guide, hazard, plannedPath = null) {
+      const points = guide && Array.isArray(guide.points)
+        ? guide.points : [];
+      if (points.length < 2) {
+        const evidenceState = guide && guide.evidenceState;
+        const reason = evidenceState === "side_unresolved"
+          ? "TURN REQUIRED · SIDE UNRESOLVED"
+          : evidenceState === "too_narrow"
+          ? "PASSAGE TOO NARROW · DIRECTION WITHHELD"
+          : evidenceState === "one_sided"
+            ? "ONE-SIDED EVIDENCE · DIRECTION WITHHELD"
+            : "COVERAGE INCOMPLETE · DIRECTION WITHHELD";
+        ctx.save();
+        ctx.fillStyle = "rgba(255, 213, 107, 0.94)";
+        ctx.font = "800 11px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(reason, transform.width / 2, 30);
+        ctx.restore();
+        return;
+      }
+      const projected = points.map(([forwardM, lateralM]) =>
+        window.HanselRadarScene.projectMapPoint(
+          transform,
+          forwardM,
+          lateralM,
+        ));
+      const trace = () => {
+        ctx.beginPath();
+        ctx.moveTo(projected[0].x, projected[0].y);
+        for (const point of projected.slice(1)) {
+          ctx.lineTo(point.x, point.y);
+        }
+      };
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      trace();
+      ctx.strokeStyle = "rgba(255, 206, 74, 0.07)";
+      ctx.lineWidth = Math.max(18, guide.clearanceM * transform.scale);
+      ctx.stroke();
+      trace();
+      ctx.strokeStyle = "rgba(255, 197, 46, 0.18)";
+      ctx.lineWidth = 12;
+      ctx.stroke();
+      trace();
+      ctx.strokeStyle = "rgba(255, 225, 101, 0.98)";
+      ctx.lineWidth = 3.5;
+      ctx.stroke();
+      const endpoint = projected.at(-1);
+      ctx.beginPath();
+      ctx.arc(endpoint.x, endpoint.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255, 225, 101, 0.98)";
+      ctx.fill();
+      ctx.fillStyle = "rgba(255, 235, 156, 0.98)";
+      ctx.font = "800 12px ui-monospace, SFMono-Regular, Consolas, monospace";
+      ctx.textAlign = "center";
+      const backendBlocked = plannedPath &&
+        (plannedPath.status === "blocked_near_field" ||
+          plannedPath.status === "stopped_no_path");
+      let direction;
+      if (backendBlocked) {
+        direction = "STOP · NO VERIFIED PASSAGE";
+      } else if (guide.passageVerified === false) {
+        const heading = guide.direction === "left" ? "LEFT" :
+          (guide.direction === "right" ? "RIGHT" : "STRAIGHT");
+        direction = guide.evidenceState === "too_narrow"
+          ? `GUIDE ${heading} · WIDTH UNVERIFIED`
+          : `GUIDE ${heading} · UNKNOWN ≠ FREE`;
+      } else {
+        direction = guide.direction === "left" ? "STEER LEFT" :
+          (guide.direction === "right" ? "STEER RIGHT" : "GO STRAIGHT");
+      }
+      const labelPoint = projected[Math.min(7, projected.length - 1)];
+      ctx.fillText(
+        direction,
+        Math.max(70, Math.min(transform.width - 70, labelPoint.x)),
+        Math.max(70, labelPoint.y - 13),
+      );
+      if (hazard && hazard.level === "DANGER") {
+        ctx.fillStyle = "rgba(255, 76, 80, 0.98)";
+        ctx.fillText("STOP · OBSTACLE WITHIN 10cm", transform.originX, 28);
+      }
+      ctx.restore();
+    }
+
     drawReflectivitySurface(ctx, transform, surface, options) {
+      if (surface && surface.source === "full_range_azimuth_heatmap") {
+        this.drawFullHeatmapSurface(ctx, transform, surface, options);
+        return;
+      }
       const resolution = Number(surface && surface.resolutionM);
       const cells = surface && Array.isArray(surface.cells)
         ? surface.cells : [];
@@ -647,6 +1319,133 @@
       ctx.globalAlpha = 1;
     }
 
+    drawFullHeatmapSurface(ctx, transform, surface, options) {
+      const cells = Array.isArray(surface && surface.cells)
+        ? surface.cells : [];
+      if (cells.length === 0) return;
+      ctx.save();
+      this.clipToMapBoundary(
+        ctx,
+        transform,
+        options && options.clipShape ? options.clipShape : "circle",
+      );
+      const physicalResolutionDeg = Number(surface.angularResolutionDeg);
+      const beamWidthDeg = Number.isFinite(physicalResolutionDeg) &&
+        physicalResolutionDeg > 0 ? physicalResolutionDeg : 29;
+      const beamCenters = [-48, -24, 0, 24, 48];
+      const rangeRows = [...new Set(cells.map((cell) =>
+        Number(cell && cell.range_m),
+      ).filter(Number.isFinite))];
+      const displayCells = [];
+      for (const rangeM of rangeRows) {
+        const rowCells = cells.filter((cell) =>
+          Math.abs(Number(cell && cell.range_m) - rangeM) < 1e-9,
+        );
+        for (const centreDeg of beamCenters) {
+          let weightedResidual = 0;
+          let weightedConfidence = 0;
+          let weightedPersistence = 0;
+          let weightSum = 0;
+          let rangeUncertainty = 0;
+          for (const cell of rowCells) {
+            const azimuthDeg = Number(cell && cell.azimuth_deg);
+            const residualDb = Number(cell && cell.relative_db);
+            const confidence = Number(cell && cell.confidence);
+            const persistence = Number(cell && cell.persistence);
+            if (!Number.isFinite(azimuthDeg) ||
+                !Number.isFinite(residualDb) ||
+                !Number.isFinite(confidence) ||
+                !Number.isFinite(persistence)) continue;
+            const sigmaDeg = beamWidthDeg / 2.355;
+            const delta = (azimuthDeg - centreDeg) / sigmaDeg;
+            const weight = Math.exp(-0.5 * delta * delta);
+            weightedResidual += residualDb * weight;
+            weightedConfidence += confidence * weight;
+            weightedPersistence += persistence * weight;
+            weightSum += weight;
+            rangeUncertainty = Math.max(
+              rangeUncertainty,
+              Number(cell && cell.range_uncertainty_m) || 0,
+            );
+          }
+          if (weightSum <= 0 || rangeUncertainty <= 0) continue;
+          const relativeDb = weightedResidual / weightSum;
+          displayCells.push({
+            range_m: rangeM,
+            azimuth_deg: centreDeg,
+            intensity: 1 / (1 + Math.exp(
+              -Math.max(-12, Math.min(12, relativeDb / 1.5)),
+            )),
+            confidence: weightedConfidence / weightSum,
+            persistence: weightedPersistence / weightSum,
+            relative_db: relativeDb,
+            range_uncertainty_m: rangeUncertainty,
+            angular_uncertainty_deg: beamWidthDeg / 2,
+          });
+        }
+      }
+      for (const cell of displayCells) {
+        const rangeM = Number(cell && cell.range_m);
+        const azimuthDeg = Number(cell && cell.azimuth_deg);
+        const intensity = Number(cell && cell.intensity);
+        const confidence = Number(cell && cell.confidence);
+        const rangeUncertainty = Number(cell && cell.range_uncertainty_m);
+        const angularUncertainty = Number(
+          cell && cell.angular_uncertainty_deg,
+        );
+        if (!Number.isFinite(rangeM) || rangeM <= 0 ||
+            !Number.isFinite(azimuthDeg) || !Number.isFinite(intensity) ||
+            !Number.isFinite(confidence) ||
+            !Number.isFinite(rangeUncertainty) || rangeUncertainty <= 0 ||
+            !Number.isFinite(angularUncertainty) || angularUncertainty <= 0) {
+          continue;
+        }
+        const centre = azimuthDeg * Math.PI / 180 - Math.PI / 2;
+        const halfWidth = angularUncertainty * Math.PI / 180;
+        const innerRadius = Math.max(
+          0,
+          (rangeM - rangeUncertainty) * transform.scale,
+        );
+        const outerRadius = Math.max(
+          innerRadius + 1,
+          (rangeM + rangeUncertainty) * transform.scale,
+        );
+        const strength = Math.max(0, Math.min(1, intensity));
+        const trust = Math.max(0, Math.min(1, confidence));
+        const visibleStrength = Math.max(0, Math.min(1,
+          (strength - 0.34) / 0.66,
+        ));
+        // Full heatmap energy is diagnostic context, not a wall.  Keep it
+        // visible without letting a bright later multipath lobe obscure the
+        // first-surface probability map and steering overlay.
+        const alpha = 0.004 + Math.pow(visibleStrength, 2.2) *
+          (0.025 + 0.045 * trust);
+        const shade = Math.round(76 + visibleStrength * 150);
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = `rgb(${shade}, ${shade}, ${shade})`;
+        ctx.beginPath();
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          outerRadius,
+          centre - halfWidth,
+          centre + halfWidth,
+        );
+        ctx.arc(
+          transform.originX,
+          transform.originY,
+          innerRadius,
+          centre + halfWidth,
+          centre - halfWidth,
+          true,
+        );
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+
     drawReflectivityContours(ctx, transform, contours) {
       const segments = contours && contours.status === "confirmed" &&
         Array.isArray(contours.segments) ? contours.segments : [];
@@ -656,6 +1455,24 @@
       ctx.lineJoin = "round";
       ctx.shadowBlur = 0;
       for (const segment of segments) {
+        // Prominence is local (same bearing, neighbouring ranges), so it is a
+        // useful display weight without becoming a scene-specific detection
+        // cutoff.  Keep weak measured fragments visible, while making the
+        // temporally persistent, spatially supported wall ridges dominant.
+        const prominenceWeight = Math.max(
+          0,
+          Math.min(1, segment.meanProminenceDb / 2.0),
+        );
+        const spanWeight = Math.max(0, Math.min(1, segment.spanM / 0.10));
+        const evidenceWeight = Math.max(
+          0.18,
+          Math.min(
+            1,
+            0.45 * segment.confidence +
+              0.35 * prominenceWeight +
+              0.20 * spanWeight,
+          ),
+        );
         const start = window.HanselRadarScene.projectMapPoint(
           transform, segment.start[0], segment.start[1],
         );
@@ -670,12 +1487,16 @@
           ctx.lineWidth = width;
           ctx.stroke();
         };
-        trace("rgba(80, 235, 224, 0.20)", 10);
-        trace("rgba(190, 255, 250, 0.98)", 3.5);
+        trace(`rgba(80, 235, 224, ${0.07 + 0.25 * evidenceWeight})`,
+          6 + 8 * evidenceWeight);
+        trace(`rgba(190, 255, 250, ${0.28 + 0.70 * evidenceWeight})`,
+          1.4 + 3.1 * evidenceWeight);
         for (const point of [start, end]) {
           ctx.beginPath();
-          ctx.arc(point.x, point.y, 3.2, 0, Math.PI * 2);
-          ctx.fillStyle = "rgba(224, 255, 252, 0.98)";
+          ctx.arc(point.x, point.y, 2.0 + 1.8 * evidenceWeight,
+            0, Math.PI * 2);
+          ctx.fillStyle = `rgba(224, 255, 252, ${
+            0.35 + 0.63 * evidenceWeight})`;
           ctx.fill();
         }
         const midpoint = {
@@ -686,7 +1507,8 @@
           Math.hypot(...segment.start),
           Math.hypot(...segment.end),
         );
-        ctx.fillStyle = "rgba(220, 255, 252, 0.96)";
+        ctx.fillStyle = `rgba(220, 255, 252, ${
+          0.30 + 0.66 * evidenceWeight})`;
         ctx.font = "800 10px ui-monospace, SFMono-Regular, Consolas, monospace";
         ctx.textAlign = "center";
         ctx.fillText(
@@ -837,7 +1659,7 @@
         }
         const certainty = Math.max(0, Math.min(1,
           (probability - 0.5) / (0.97 - 0.5)));
-        ctx.globalAlpha = certainty * 0.70;
+        ctx.globalAlpha = certainty * 0.46;
         const color = cell.occupied ? [255, 126, 54] : [92, 228, 208];
         ctx.fillStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
         const center = window.HanselRadarScene.projectMapPoint(
@@ -848,8 +1670,10 @@
         ctx.fillRect(center.x - size / 2, center.y - size / 2, size, size);
       }
       ctx.globalAlpha = 1;
-      for (const cell of cells) {
-        this.drawUncertaintyOutline(ctx, transform, cell);
+      if (!options || options.showUncertainty !== false) {
+        for (const cell of cells) {
+          this.drawUncertaintyOutline(ctx, transform, cell);
+        }
       }
     }
 
@@ -1198,7 +2022,7 @@
       if (!plannedPath || !Array.isArray(plannedPath.points)) {
         return;
       }
-      const strokePath = (points, color, width) => {
+      const strokePath = (points, color, width, dash = []) => {
         if (!Array.isArray(points) || points.length < 2) return;
         ctx.beginPath();
         points.forEach((coordinates, index) => {
@@ -1217,16 +2041,72 @@
         ctx.lineWidth = width;
         ctx.lineJoin = "round";
         ctx.lineCap = "round";
+        ctx.setLineDash(dash);
         ctx.stroke();
+        ctx.setLineDash([]);
       };
       ctx.save();
+      const candidates = Array.isArray(plannedPath.turn_candidates)
+        ? plannedPath.turn_candidates : [];
+      const unresolvedTurn = plannedPath.status === "turn_side_unresolved" ||
+        (plannedPath.length_m === 0 && candidates.length === 2);
+      if (unresolvedTurn) {
+        for (const candidate of candidates) {
+          strokePath(
+            candidate.points,
+            "rgba(255, 166, 42, 0.40)",
+            18,
+            [7, 7],
+          );
+          strokePath(
+            candidate.points,
+            "rgba(255, 231, 128, 1.0)",
+            4.5,
+            [7, 7],
+          );
+          if (Array.isArray(candidate.points) && candidate.points.length > 1) {
+            const endCoordinates = candidate.points.at(-1);
+            const endPoint = window.HanselRadarScene.projectMapPoint(
+              transform,
+              endCoordinates[0],
+              endCoordinates[1],
+            );
+            ctx.beginPath();
+            ctx.arc(endPoint.x, endPoint.y, 7, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(255, 231, 128, 1.0)";
+            ctx.fill();
+            ctx.fillStyle = "rgba(255, 235, 156, 0.98)";
+            ctx.font = "900 12px ui-monospace, SFMono-Regular, Consolas, monospace";
+            ctx.textAlign = "center";
+            ctx.fillText(
+              candidate.direction === "left" ? "LEFT ?" : "RIGHT ?",
+              endPoint.x,
+              endPoint.y - 13,
+            );
+          }
+        }
+        ctx.fillStyle = "rgba(255, 213, 107, 0.98)";
+        ctx.font = "900 13px ui-monospace, SFMono-Regular, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(
+          "TURN REQUIRED · SIDE UNRESOLVED",
+          transform.originX,
+          Math.max(36, transform.originY - 0.24 * transform.scale),
+        );
+        ctx.restore();
+        return;
+      }
       const passageWidthM = Number(plannedPath.minimum_passage_width_m);
-      const underlayWidth = Number.isFinite(passageWidthM) && passageWidthM > 0
-        ? passageWidthM * transform.scale
-        : 7;
+      const trendGuided = plannedPath.planner_mode ===
+        "full_reflectivity_opening";
+      const underlayWidth = trendGuided
+        ? 12
+        : Number.isFinite(passageWidthM) && passageWidthM > 0
+          ? passageWidthM * transform.scale
+          : 7;
       strokePath(
         plannedPath.points,
-        "rgba(5, 9, 12, 0.42)",
+        trendGuided ? "rgba(28, 91, 140, 0.44)" : "rgba(5, 9, 12, 0.42)",
         underlayWidth,
       );
       strokePath(plannedPath.points, "rgba(255, 215, 64, 0.96)", 3.2);
@@ -1380,6 +2260,30 @@
           0,
           Math.PI * 2,
         );
+      } else if (clipShape === "fov") {
+        const edgeLateral = transform.halfWidthM;
+        const sideReachForward = Math.min(
+          transform.forwardMaxM,
+          edgeLateral / Math.tan(Math.PI / 3),
+        );
+        ctx.moveTo(transform.originX, transform.originY);
+        ctx.lineTo(
+          transform.originX - edgeLateral * transform.scale,
+          transform.originY - sideReachForward * transform.scale,
+        );
+        ctx.lineTo(
+          transform.originX - edgeLateral * transform.scale,
+          transform.originY - transform.forwardMaxM * transform.scale,
+        );
+        ctx.lineTo(
+          transform.originX + edgeLateral * transform.scale,
+          transform.originY - transform.forwardMaxM * transform.scale,
+        );
+        ctx.lineTo(
+          transform.originX + edgeLateral * transform.scale,
+          transform.originY - sideReachForward * transform.scale,
+        );
+        ctx.closePath();
       } else if (clipShape === "radial") {
         ctx.moveTo(transform.originX, transform.originY);
         ctx.lineTo(
@@ -1422,6 +2326,30 @@
           0,
           Math.PI * 2,
         );
+      } else if (clipShape === "fov") {
+        const edgeLateral = transform.halfWidthM;
+        const sideReachForward = Math.min(
+          transform.forwardMaxM,
+          edgeLateral / Math.tan(Math.PI / 3),
+        );
+        ctx.moveTo(transform.originX, transform.originY);
+        ctx.lineTo(
+          transform.originX - edgeLateral * transform.scale,
+          transform.originY - sideReachForward * transform.scale,
+        );
+        ctx.lineTo(
+          transform.originX - edgeLateral * transform.scale,
+          transform.originY - transform.forwardMaxM * transform.scale,
+        );
+        ctx.lineTo(
+          transform.originX + edgeLateral * transform.scale,
+          transform.originY - transform.forwardMaxM * transform.scale,
+        );
+        ctx.lineTo(
+          transform.originX + edgeLateral * transform.scale,
+          transform.originY - sideReachForward * transform.scale,
+        );
+        ctx.closePath();
       } else if (clipShape === "radial") {
         ctx.moveTo(
           transform.originX - transform.forwardMaxM * transform.scale,
@@ -1630,6 +2558,12 @@
           Math.hypot(track.forward_m, track.lateral_m) <=
           options.maxRangeM
         );
+      }
+      if (options.clipShape === "fov") {
+        return Math.abs(Math.atan2(
+          track.lateral_m,
+          Math.max(track.forward_m, 1e-9),
+        )) <= Math.PI / 3 + 1e-9;
       }
       return true;
     }
@@ -1947,13 +2881,27 @@
             : "지도 입력 확인 필요",
       );
 
-      const nearest = this.nearestConfirmedPoint(presentation);
+      const nearestPoint = this.nearestConfirmedPoint(presentation);
+      const surfaceDistances = presentation &&
+        presentation.probabilisticLocalMap &&
+        Array.isArray(presentation.probabilisticLocalMap.cells)
+        ? presentation.probabilisticLocalMap.cells
+          .filter((cell) => Number(cell && cell.probability) > 0.5)
+          .map((cell) => Math.hypot(
+            Number(cell.forward_m), Number(cell.lateral_m),
+          )).filter(Number.isFinite)
+        : [];
+      const nearestSurface = surfaceDistances.length > 0
+        ? Math.min(...surfaceDistances) : null;
+      const nearest = [nearestPoint, nearestSurface]
+        .filter(Number.isFinite)
+        .sort((left, right) => left - right)[0] ?? null;
       const collisionNearest =
         this.nearestConfirmedPoint(presentation, CLOSE_MAX_RANGE_M);
       this.setMetric(
         "metric-nearest",
         nearest === null ? "--" : `${nearest.toFixed(2)} m`,
-        "확인된 point track",
+        "filtered point / first surface",
       );
       this.setMetric(
         "metric-fps",
@@ -2007,6 +2955,21 @@
         scene && scene.calibration_status
           ? scene.calibration_status
           : "--";
+      const adcStatus = document.querySelector("#adc-status-value");
+      if (adcStatus) {
+        adcStatus.textContent = frame && frame.adc_status === "available" &&
+            scene?.adc_range_angle_surface?.direction_semantics ===
+              "range_azimuth"
+          ? `AVAILABLE · PHASE ANGLE · ${
+            scene.adc_range_angle_surface.phase_calibration === "measured"
+              ? "CALIBRATED" : "DESIGN CAL"
+          }`
+          : frame && frame.adc_status === "available"
+            ? "AVAILABLE · RANGE ONLY"
+          : frame && frame.adc_status
+            ? String(frame.adc_status).toUpperCase()
+            : "--";
+      }
       const poseMode = visible
         ? presentation.poseMode
         : null;
@@ -2143,7 +3106,7 @@
       document.querySelector("#axis-warning").hidden =
         Boolean(
           scene &&
-          ["ok", "synthetic"].includes(scene.calibration_status),
+          ["ok", "synthetic", "spi_raw"].includes(scene.calibration_status),
         );
       const pointCloudStatus = document.querySelector("#pointcloud-3d-status");
       if (pointCloudStatus && !visible) {
@@ -2154,6 +3117,7 @@
     updateSectors(presentation) {
       const sectors = Array.from({ length: 5 }, () => ({
         tracks: [],
+        reflections: [],
         danger: false,
       }));
       if (!presentation || presentation.blocked) {
@@ -2185,17 +3149,54 @@
         sectors[index].danger =
           sectors[index].danger || this.isDangerTrack(track, presentation);
       });
+      const probabilityCells = presentation.probabilisticLocalMap &&
+        Array.isArray(presentation.probabilisticLocalMap.cells)
+        ? presentation.probabilisticLocalMap.cells : [];
+      probabilityCells.forEach((cell) => {
+        const forwardM = Number(cell && cell.forward_m);
+        const lateralM = Number(cell && cell.lateral_m);
+        const probability = Number(cell && cell.probability);
+        const distance = Math.hypot(forwardM, lateralM);
+        const rangeUncertaintyM = Number(cell && cell.range_uncertainty_m);
+        const lateralUncertaintyM = Number(
+          cell && cell.lateral_uncertainty_m,
+        );
+        const displayUncertaintyM = Math.max(
+          0,
+          Number.isFinite(rangeUncertaintyM) ? rangeUncertaintyM : 0,
+          Number.isFinite(lateralUncertaintyM) ? lateralUncertaintyM : 0,
+        );
+        const angle = (Math.atan2(lateralM, forwardM) * 180) / Math.PI;
+        if (!Number.isFinite(forwardM) || forwardM < 0 ||
+            !Number.isFinite(lateralM) || !Number.isFinite(probability) ||
+            probability <= 0.5 || !Number.isFinite(distance) ||
+            distance - displayUncertaintyM > MAIN_MAX_RANGE_M + 1e-9 ||
+            !Number.isFinite(angle) || angle < -70 || angle > 70) {
+          return;
+        }
+        const index = Math.min(
+          4,
+          Math.max(0, Math.floor(((angle + 70) / 140) * 5)),
+        );
+        sectors[index].reflections.push({
+          distance: Math.min(distance, MAIN_MAX_RANGE_M), probability,
+        });
+      });
       sectors.forEach((sector, index) => {
-        if (sector.tracks.length === 0) {
+        if (sector.tracks.length === 0 && sector.reflections.length === 0) {
           this.setSector(index, "unknown", "UNKNOWN");
           return;
         }
-        const nearest = Math.min(
-          ...sector.tracks.map((track) =>
+        const nearestTrack = sector.tracks.length > 0
+          ? Math.min(...sector.tracks.map((track) =>
             Number.isFinite(track.distance_m)
               ? track.distance_m
-              : Math.hypot(track.forward_m, track.lateral_m)),
-        );
+              : Math.hypot(track.forward_m, track.lateral_m)))
+          : Infinity;
+        const nearestReflection = sector.reflections.length > 0
+          ? Math.min(...sector.reflections.map((cell) => cell.distance))
+          : Infinity;
+        const nearest = Math.min(nearestTrack, nearestReflection);
         const hasConfirmedPoint = sector.tracks.some(
           (track) =>
             track.source === "point" && track.point_confirmed === true,
@@ -2207,7 +3208,9 @@
             : hasConfirmedPoint
               ? "point"
               : "evidence",
-          `${nearest < 1 ? Math.round(nearest * 100) + "cm" : nearest.toFixed(1) + "m"} 반사`,
+          sector.tracks.length === 0
+            ? `${Math.round(nearest * 100)}cm REFLECTION`
+            : `${nearest < 1 ? Math.round(nearest * 100) + "cm" : nearest.toFixed(1) + "m"} 반사`,
         );
       });
     }

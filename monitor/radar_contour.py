@@ -119,35 +119,76 @@ class CalibratedContourEstimator:
         cls,
         observations: Sequence[Mapping[str, object]],
     ) -> List[Dict[str, object]]:
-        by_azimuth: Dict[int, Observation] = {}
+        unique: Dict[Tuple[int, int], Observation] = {}
         for value in observations:
             parsed = cls._parse_observation(value)
             if parsed is None:
                 continue
-            existing = by_azimuth.get(parsed[4])
+            key = (parsed[4], parsed[5])
+            existing = unique.get(key)
             if (
                 existing is None
-                or parsed[5] < existing[5]
-                or (
-                    parsed[5] == existing[5]
-                    and parsed[2] > existing[2]
-                )
+                or parsed[2] > existing[2]
             ):
-                by_azimuth[parsed[4]] = parsed
+                unique[key] = parsed
+
+        # Keep simultaneous near and far radial ridges separate.  Selecting
+        # only the nearest value at each angle erased legitimate wall pieces;
+        # selecting only the strongest joined unrelated multipath.  Connected
+        # components across adjacent angular samples preserve every coherent
+        # surface while isolated bins still cannot form a line.
+        points = sorted(
+            unique.values(),
+            key=lambda item: (item[4], item[5], -item[2]),
+        )
+        parents = list(range(len(points)))
+
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def union(left: int, right: int) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parents[right_root] = left_root
+
+        by_azimuth: Dict[int, List[int]] = {}
+        for point_index, point in enumerate(points):
+            by_azimuth.setdefault(point[4], []).append(point_index)
+        for azimuth_index in sorted(by_azimuth):
+            next_indices = by_azimuth.get(azimuth_index + 1, ())
+            for left_index in by_azimuth[azimuth_index]:
+                left = points[left_index]
+                for right_index in next_indices:
+                    right = points[right_index]
+                    if math.hypot(
+                        left[0] - right[0],
+                        left[1] - right[1],
+                    ) <= MAX_ADJACENT_GAP_M + 1e-12:
+                        union(left_index, right_index)
+
+        components: Dict[int, List[Observation]] = {}
+        for point_index, point in enumerate(points):
+            components.setdefault(find(point_index), []).append(point)
 
         runs: List[List[Observation]] = []
-        for point in sorted(by_azimuth.values(), key=lambda item: item[4]):
-            if (
-                not runs
-                or point[4] != runs[-1][-1][4] + 1
-                or math.hypot(
-                    point[0] - runs[-1][-1][0],
-                    point[1] - runs[-1][-1][1],
-                ) > MAX_ADJACENT_GAP_M
-            ):
-                runs.append([point])
-            else:
-                runs[-1].append(point)
+        for component in components.values():
+            component_by_azimuth: Dict[int, Observation] = {}
+            for point in component:
+                existing = component_by_azimuth.get(point[4])
+                if (
+                    existing is None
+                    or point[2] > existing[2]
+                    or (point[2] == existing[2] and point[5] < existing[5])
+                ):
+                    component_by_azimuth[point[4]] = point
+            runs.append(sorted(
+                component_by_azimuth.values(),
+                key=lambda item: item[4],
+            ))
 
         segments: List[Dict[str, object]] = []
         for run in runs:

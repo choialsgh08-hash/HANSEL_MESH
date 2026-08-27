@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Mapping, Tuple
 
 
 @dataclass
@@ -60,6 +60,153 @@ class ProbabilisticRollingGrid:
         if self._probability(cell.log_odds) >= self.occupied_threshold:
             cell._occupied_episode = True
 
+    def observe(
+        self,
+        forward_m,
+        lateral_m,
+        measurement_probability,
+        confidence,
+        source,
+        range_uncertainty_m,
+        lateral_uncertainty_m,
+        now,
+    ) -> None:
+        """Blend one soft measurement without turning it into a binary hit."""
+        self.observe_frame(
+            ({
+                "forward_m": forward_m,
+                "lateral_m": lateral_m,
+                "measurement_probability": measurement_probability,
+                "confidence": confidence,
+                "source": source,
+                "range_uncertainty_m": range_uncertainty_m,
+                "lateral_uncertainty_m": lateral_uncertainty_m,
+            },),
+            now,
+        )
+
+    def observe_frame(
+        self,
+        measurements: Iterable[Mapping[str, object]],
+        now,
+    ) -> None:
+        """Fuse correlated soft evidence once per map cell and input frame.
+
+        Adjacent angle-FFT bins are not independent observations: several of
+        them commonly quantize into one local-map cell.  Combining them before
+        updating the posterior prevents bin count and iteration order from
+        manufacturing confidence.
+        """
+        if not math.isfinite(float(now)):
+            raise ValueError("soft evidence values must be finite")
+        now_ns = self._to_ns(now)
+        self._advance(now_ns)
+        grouped: Dict[Tuple[int, int], Dict[str, object]] = {}
+        for measurement in measurements:
+            values = (
+                measurement["forward_m"],
+                measurement["lateral_m"],
+                measurement["measurement_probability"],
+                measurement["confidence"],
+                measurement["range_uncertainty_m"],
+                measurement["lateral_uncertainty_m"],
+            )
+            if any(not math.isfinite(float(value)) for value in values):
+                raise ValueError("soft evidence values must be finite")
+            probability = float(measurement["measurement_probability"])
+            if not 0.5 < probability <= self.maximum_probability:
+                raise ValueError("measurement_probability is out of range")
+            forward_m = float(measurement["forward_m"])
+            lateral_m = float(measurement["lateral_m"])
+            key = self._key(forward_m, lateral_m)
+            if not self._inside(key):
+                continue
+            candidate: Dict[str, object] = {
+                "measurement_probability": probability,
+                "confidence": max(
+                    0.0, min(1.0, float(measurement["confidence"]))
+                ),
+                "source": str(measurement["source"]),
+                "range_uncertainty_m": float(
+                    measurement["range_uncertainty_m"]
+                ),
+                "lateral_uncertainty_m": float(
+                    measurement["lateral_uncertainty_m"]
+                ),
+            }
+            previous = grouped.get(key)
+            if previous is None:
+                grouped[key] = candidate
+                continue
+            previous["measurement_probability"] = max(
+                float(previous["measurement_probability"]), probability
+            )
+            previous["confidence"] = max(
+                float(previous["confidence"]), float(candidate["confidence"])
+            )
+            previous["range_uncertainty_m"] = max(
+                float(previous["range_uncertainty_m"]),
+                float(candidate["range_uncertainty_m"]),
+            )
+            previous["lateral_uncertainty_m"] = max(
+                float(previous["lateral_uncertainty_m"]),
+                float(candidate["lateral_uncertainty_m"]),
+            )
+            previous["source"] = self._merged_source(
+                str(previous["source"]), str(candidate["source"])
+            )
+
+        for key, measurement in grouped.items():
+            self._observe_key(key, measurement, now_ns)
+
+    def _observe_key(
+        self,
+        key: Tuple[int, int],
+        measurement: Mapping[str, object],
+        now_ns: int,
+    ) -> None:
+        probability = float(measurement["measurement_probability"])
+        confidence = float(measurement["confidence"])
+        source = str(measurement["source"])
+        range_uncertainty_m = float(measurement["range_uncertainty_m"])
+        lateral_uncertainty_m = float(measurement["lateral_uncertainty_m"])
+        target_log_odds = math.log(probability / (1.0 - probability))
+        cell = self._cells.get(key)
+        if cell is None:
+            self._cells[key] = _Cell(
+                target_log_odds,
+                confidence,
+                source,
+                range_uncertainty_m,
+                lateral_uncertainty_m,
+                1,
+                now_ns,
+                now_ns,
+                probability >= self.occupied_threshold,
+            )
+            return
+        # The source surface already contains temporal evidence.  Converging
+        # toward its posterior avoids manufacturing certainty by repeatedly
+        # adding the same correlated FFT lobe every frame.
+        blend = 0.45
+        cell.log_odds = min(
+            self._max_log_odds,
+            cell.log_odds * (1.0 - blend) + target_log_odds * blend,
+        )
+        cell.confidence = confidence
+        cell.range_uncertainty_m = max(
+            cell.range_uncertainty_m, range_uncertainty_m
+        )
+        cell.lateral_uncertainty_m = max(
+            cell.lateral_uncertainty_m, lateral_uncertainty_m
+        )
+        cell.source = self._merged_source(cell.source, source)
+        cell.hits = min(255, cell.hits + 1)
+        cell._last_hit_ns = now_ns
+        cell._last_decay_ns = now_ns
+        if self._probability(cell.log_odds) >= self.occupied_threshold:
+            cell._occupied_episode = True
+
     def transform(self, delta_forward_m, delta_lateral_m, yaw_rad, now) -> None:
         now_ns = self._to_ns(now)
         self._advance(now_ns)
@@ -100,6 +247,16 @@ class ProbabilisticRollingGrid:
         now_ns = self._to_ns(now)
         self._advance(now_ns)
         return [cell for cell in self._cell_payloads(now_ns) if cell["occupied"]]
+
+    def active_cells(self, now) -> list[dict]:
+        """Return every measured cell that still differs from UNKNOWN.
+
+        The planner consumes heatmap cells as continuous steering cost, while
+        ``occupied_cells`` remains the strict binary/collision interface.
+        """
+        now_ns = self._to_ns(now)
+        self._advance(now_ns)
+        return self._cell_payloads(now_ns)
 
     def diagnostics(self) -> dict:
         occupied = sum(self._probability(cell.log_odds) >= self.occupied_threshold for cell in self._cells.values())

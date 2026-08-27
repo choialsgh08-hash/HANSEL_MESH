@@ -168,6 +168,41 @@ class PathSelectionHysteresisTests(unittest.TestCase):
             refreshed["blocked_previous_path"], first["blocked_previous_path"]
         )
 
+    def test_unresolved_turn_withholds_straight_immediately_and_clear_needs_confirmation(self):
+        selector = PathSelectionHysteresis(confirm_frames=3)
+        clear = path(0.0)
+        selector.select(clear, False, [], 1_000_000_000)
+        unresolved = dict(
+            clear,
+            status="turn_side_unresolved",
+            points=[[0.0, 0.0]],
+            length_m=0.0,
+            turn_candidates=[{"direction": "left"}, {"direction": "right"}],
+        )
+        blocked = [{
+            "start_index": 0,
+            "end_index": 2,
+            "reason": "turn_side_unresolved",
+        }]
+
+        first = selector.select(
+            unresolved, True, blocked, 1_125_000_000,
+        )
+        held = selector.select(
+            unresolved, True, blocked, 1_250_000_000,
+        )
+        clear_one = selector.select(clear, False, [], 1_375_000_000)
+        clear_two = selector.select(clear, False, [], 1_500_000_000)
+        clear_three = selector.select(clear, False, [], 1_625_000_000)
+
+        self.assertEqual(first["path"]["status"], "turn_side_unresolved")
+        self.assertTrue(first["switch_accepted"])
+        self.assertEqual(held["path"]["status"], "turn_side_unresolved")
+        self.assertFalse(held["switch_accepted"])
+        self.assertEqual(clear_one["path"]["status"], "turn_side_unresolved")
+        self.assertEqual(clear_two["pending_switch_frames"], 2)
+        self.assertEqual(clear_three["path"]["status"], "clear")
+
     def test_reset_clears_selected_pending_overlay_and_epoch_counters(self):
         selector = PathSelectionHysteresis(confirm_frames=3)
         selector.select(path(0.0), False, [], 1_000_000_000)

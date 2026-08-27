@@ -19,6 +19,7 @@ from typing import Deque, List, Optional, Sequence, Tuple, Union
 from common.sensor_contract import (
     MAX_RADAR_HEATMAP_CELLS,
     RadarFrame,
+    RadarAdcSnapshot,
     RadarHeatmap,
     RadarPoint,
     SensorHeader,
@@ -35,8 +36,9 @@ DEFAULT_SIDE_INFO_TLV = 7
 DEFAULT_COMPRESSED_POINT_TLV = 301
 RANGE_AZIMUTH_HEATMAP_MAJOR_TLV = 304
 RANGE_AZIMUTH_HEATMAP_MINOR_TLV = 305
+ADC_SAMPLES_TLV = 316
 _KNOWN_STANDARD_TLV_TYPES = frozenset(range(1, 10))
-_KNOWN_EXTENDED_TLV_TYPES = frozenset(range(301, 319))
+_KNOWN_EXTENDED_TLV_TYPES = frozenset(range(301, 321))
 _HEATMAP_MODE_BY_TLV = {
     RANGE_AZIMUTH_HEATMAP_MAJOR_TLV: "major",
     RANGE_AZIMUTH_HEATMAP_MINOR_TLV: "minor",
@@ -101,6 +103,26 @@ class TiRadarHeatmap:
 
 
 @dataclass(frozen=True)
+class TiRadarAdcSamples:
+    data: bytes
+    samples_per_chirp: int
+    rx_channels: int
+    chirps: int
+    sample_bits: int = 12
+    tlv_type: int = ADC_SAMPLES_TLV
+
+    def to_sensor_snapshot(self) -> RadarAdcSnapshot:
+        return RadarAdcSnapshot(
+            data=self.data,
+            samples_per_chirp=self.samples_per_chirp,
+            rx_channels=self.rx_channels,
+            chirps=self.chirps,
+            sample_bits=self.sample_bits,
+            tlv_type=self.tlv_type,
+        )
+
+
+@dataclass(frozen=True)
 class TiRadarFrame:
     header: TiPacketHeader
     header_size: int
@@ -110,6 +132,7 @@ class TiRadarFrame:
     unknown_tlvs: Tuple[Tuple[int, int], ...]
     warnings: Tuple[str, ...]
     heatmap: Optional[TiRadarHeatmap] = None
+    adc_samples: Optional[TiRadarAdcSamples] = None
     host_receipt_monotonic_ns: Optional[int] = None
     host_receipt_uncertainty_ns: Optional[int] = None
 
@@ -156,6 +179,11 @@ class TiRadarFrame:
                 if self.heatmap is None
                 else self.heatmap.to_sensor_heatmap()
             ),
+            adc_snapshot=(
+                None
+                if self.adc_samples is None
+                else self.adc_samples.to_sensor_snapshot()
+            ),
         )
 
 
@@ -169,6 +197,7 @@ class _ParsedTlvs:
     trailing_padding: int
     recognized_point_tlvs: int
     heatmap: Optional[TiRadarHeatmap]
+    adc_samples: Optional[TiRadarAdcSamples]
 
 
 class TiMmwavePacketParser:
@@ -188,6 +217,9 @@ class TiMmwavePacketParser:
         heatmap_azimuth_bins: Optional[int] = None,
         heatmap_range_bins: Optional[int] = None,
         heatmap_range_step_m: Optional[float] = None,
+        adc_samples_per_chirp: Optional[int] = None,
+        adc_rx_channels: Optional[int] = None,
+        adc_chirps: Optional[int] = None,
         tlv_length_includes_header: bool = False,
         allow_elided_empty_point_tlv: bool = False,
         allow_nonzero_padding: bool = False,
@@ -246,6 +278,28 @@ class TiMmwavePacketParser:
                 "heatmap dimensions exceed limit of "
                 f"{MAX_RADAR_HEATMAP_CELLS} cells"
             )
+        adc_configuration = (
+            adc_samples_per_chirp,
+            adc_rx_channels,
+            adc_chirps,
+        )
+        if any(value is not None for value in adc_configuration) and not all(
+            value is not None for value in adc_configuration
+        ):
+            raise ValueError(
+                "adc_samples_per_chirp, adc_rx_channels, and adc_chirps "
+                "must be supplied together"
+            )
+        for name, value, maximum in (
+            ("adc_samples_per_chirp", adc_samples_per_chirp, 4096),
+            ("adc_rx_channels", adc_rx_channels, 8),
+            ("adc_chirps", adc_chirps, 8),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int)
+                or value < 1 or value > maximum
+            ):
+                raise ValueError(f"{name} must be a positive integer")
         if max_packet_bytes < DOCUMENTED_HEADER_SIZE:
             raise ValueError("max_packet_bytes is too small")
         if max_points < 1:
@@ -272,6 +326,9 @@ class TiMmwavePacketParser:
             if heatmap_range_step_m is None
             else float(heatmap_range_step_m)
         )
+        self.adc_samples_per_chirp = adc_samples_per_chirp
+        self.adc_rx_channels = adc_rx_channels
+        self.adc_chirps = adc_chirps
         self.tlv_length_includes_header = tlv_length_includes_header
         self.allow_elided_empty_point_tlv = allow_elided_empty_point_tlv
         self.allow_nonzero_padding = allow_nonzero_padding
@@ -319,7 +376,8 @@ class TiMmwavePacketParser:
                 continue
             score = (
                 parsed.recognized_point_tlvs
-                + (1 if parsed.heatmap is not None else 0),
+                + (1 if parsed.heatmap is not None else 0)
+                + (1 if parsed.adc_samples is not None else 0),
                 1 if len(parsed.points) == header.num_detected_obj else 0,
                 -parsed.trailing_padding,
             )
@@ -339,6 +397,7 @@ class TiMmwavePacketParser:
             unknown_tlvs=selected.unknown_tlvs,
             warnings=selected.warnings,
             heatmap=selected.heatmap,
+            adc_samples=selected.adc_samples,
             host_receipt_monotonic_ns=None,
             host_receipt_uncertainty_ns=None,
         )
@@ -354,6 +413,7 @@ class TiMmwavePacketParser:
         raw_side_info: Optional[List[Tuple[float, float]]] = None
         compressed_points: Optional[List[TiRadarPoint]] = None
         heatmap: Optional[TiRadarHeatmap] = None
+        adc_samples: Optional[TiRadarAdcSamples] = None
         unknown: List[Tuple[int, int]] = []
         warnings: List[str] = []
         recognized = 0
@@ -404,6 +464,15 @@ class TiMmwavePacketParser:
                         "packet contains multiple range-azimuth heatmaps"
                     )
                 heatmap = self._parse_heatmap(payload, tlv_type)
+            elif (
+                self.adc_samples_per_chirp is not None
+                and tlv_type == ADC_SAMPLES_TLV
+            ):
+                if adc_samples is not None:
+                    raise TiMmwaveParseError(
+                        "packet contains multiple ADC sample TLVs"
+                    )
+                adc_samples = self._parse_adc_samples(payload)
             else:
                 unknown.append((tlv_type, payload_length))
 
@@ -499,6 +568,27 @@ class TiMmwavePacketParser:
             trailing_padding=len(trailing),
             recognized_point_tlvs=recognized,
             heatmap=heatmap,
+            adc_samples=adc_samples,
+        )
+
+    def _parse_adc_samples(self, payload: bytes) -> TiRadarAdcSamples:
+        assert self.adc_samples_per_chirp is not None
+        assert self.adc_rx_channels is not None
+        assert self.adc_chirps is not None
+        expected = (
+            self.adc_samples_per_chirp * self.adc_rx_channels
+            * self.adc_chirps * 2
+        )
+        if len(payload) != expected:
+            raise TiMmwaveParseError(
+                f"ADC sample size does not match configured shape "
+                f"({len(payload)} != {expected})"
+            )
+        return TiRadarAdcSamples(
+            data=payload,
+            samples_per_chirp=self.adc_samples_per_chirp,
+            rx_channels=self.adc_rx_channels,
+            chirps=self.adc_chirps,
         )
 
     def _starts_with_plausible_tlv(self, trailing: bytes) -> bool:

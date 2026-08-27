@@ -94,6 +94,7 @@ function makeContext() {
     arcCalls: [],
     ellipseCalls: [],
     strokeCalls: [],
+    clipCalls: [],
     fillCalls: [],
     lineDashCalls: [],
     globalAlphaValues: [],
@@ -103,7 +104,9 @@ function makeContext() {
     restore() {},
     closePath() {},
     rect() {},
-    clip() {},
+    clip() {
+      this.clipCalls.push(currentPath.map((command) => [...command]));
+    },
     translate() {},
     setLineDash(pattern) {
       this.lineDashCalls.push([...pattern]);
@@ -220,6 +223,7 @@ function makeHarness(options = {}) {
     "axis-value",
     "profile-value",
     "calibration-value",
+    "adc-status-value",
     "pose-mode-value",
     "frame-value",
     "gap-value",
@@ -484,7 +488,7 @@ function livePresentationWithProbabilityMap() {
   };
 }
 
-test("two transient invalid scenes retain the last valid map then the third blocks", () => {
+test("repeated invalid scenes use current evidence fallback instead of blocking", () => {
   let nowMs = 1000;
   const { panel, window, elements } = makeHarness({ now: () => nowMs });
   const valid = livePresentationWithProbabilityMap();
@@ -492,27 +496,36 @@ test("two transient invalid scenes retain the last valid map then the third bloc
     if (snapshot.invalid) throw new Error("transition frame");
     return valid;
   };
+  window.HanselRadarScene.parseRadarEvidenceFallback = (_snapshot, error) => ({
+    ...valid,
+    evidenceOnly: true,
+    sceneContractFallback: true,
+    hazard: { level: "UNKNOWN", threshold_m: 0.1 },
+    plannedPath: { status: "unavailable", points: [], length_m: 0 },
+    sceneWarnings: ["scene_contract_evidence_fallback", error.message],
+  });
 
   panel.acceptSnapshot({ status: "live" });
   panel.acceptSnapshot({ status: "live", invalid: true });
   assert.equal(panel.presentation.blocked, false);
-  assert.equal(panel.presentation.sceneVerification.attempt, 1);
-  assert.equal(panel.presentation.sceneVerification.limit, 3);
-  assert.equal(panel.presentation.sceneVerification.ageMs, 0);
-  assert.equal(elements.get("#radar-status").textContent, "SCENE VERIFYING 1/3");
+  assert.equal(panel.presentation.evidenceOnly, true);
+  assert.equal(panel.presentation.hazard.level, "UNKNOWN");
+  assert.notEqual(elements.get("#radar-status").textContent, "SCENE CONTRACT ERROR");
+  assert.equal(panel.presentation.sceneVerification, null);
+  assert.equal(elements.get("#radar-status").textContent.includes("VERIFYING"), false);
 
   nowMs += 125;
   panel.acceptSnapshot({ status: "live", invalid: true });
   assert.equal(panel.presentation.blocked, false);
-  assert.equal(panel.presentation.sceneVerification.attempt, 2);
+  assert.equal(panel.presentation.blocked, false);
 
   nowMs += 125;
   panel.acceptSnapshot({ status: "live", invalid: true });
-  assert.equal(panel.presentation.blocked, true);
-  assert.equal(panel.presentation.reason, "invalid_scene");
+  assert.equal(panel.presentation.blocked, false);
+  assert.equal(panel.presentation.sceneContractFallback, true);
 });
 
-test("valid scene resets transient verification and 500ms is a hard hold limit", () => {
+test("valid scene resets verification and retained evidence holds for two seconds", () => {
   let nowMs = 2000;
   const { panel, window } = makeHarness({ now: () => nowMs });
   const valid = livePresentationWithProbabilityMap();
@@ -525,10 +538,14 @@ test("valid scene resets transient verification and 500ms is a hard hold limit",
   panel.acceptSnapshot({ status: "live", invalid: true });
   panel.acceptSnapshot({ status: "live" });
   panel.acceptSnapshot({ status: "live", invalid: true });
-  assert.equal(panel.presentation.sceneVerification.attempt, 1);
+  assert.equal(panel.presentation.sceneVerification, null);
 
   panel.acceptSnapshot({ status: "live" });
   nowMs += 501;
+  panel.acceptSnapshot({ status: "live", invalid: true });
+  assert.equal(panel.presentation.blocked, false);
+  assert.equal(panel.presentation.evidenceOnly, true);
+  nowMs += 1500;
   panel.acceptSnapshot({ status: "live", invalid: true });
   assert.equal(panel.presentation.blocked, true);
   assert.equal(panel.presentation.reason, "invalid_scene");
@@ -669,7 +686,118 @@ test("null probability map preserves both legacy layers in both map views", () =
   assert.equal(legacyCircleCalls, 2);
 });
 
-test("both map views invoke contour legacy probability and robot-footprint renderers", () => {
+test("UART ADC evidence draws range-only rings without inventing direction", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[0];
+  const transform = {
+    originX: 250, originY: 500, scale: 1000,
+    width: 500, height: 500, forwardMaxM: 0.3,
+    halfWidthM: 0.3,
+  };
+  panel.snapshot.frame.adc_range_profile = {
+    source: "uart_last_chirp_pair_adc",
+    direction_semantics: "range_only",
+    range_bins: 5,
+    range_step_m: 0.1,
+    values: [0, 128, 255, 255, 255],
+    peak_bin: 2,
+    peak_range_m: 0.2,
+    complete_frame_adc: false,
+  };
+
+  panel.drawAdcRangeEvidence(
+    context,
+    transform,
+    panel.snapshot.frame.adc_range_profile,
+  );
+
+  assert.deepEqual(
+    context.arcCalls.map((args) => Math.round(args[2])),
+    [100, 200, 300],
+  );
+  assert.ok(context.strokeCalls.every(
+    (call) => call.strokeStyle.includes("118, 184, 255"),
+  ));
+  assert.ok(context.fillTextCalls.some(
+    ([label]) => label === "ADC RANGE ONLY · 20cm PEAK",
+  ));
+});
+
+test("UART ADC angle evidence draws measured cells and verified peaks", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[0];
+  const transform = {
+    originX: 250, originY: 500, scale: 1000,
+    width: 500, height: 500, forwardMaxM: 0.3,
+    halfWidthM: 0.3,
+  };
+  const surface = {
+    source: "uart_last_chirp_pair_adc",
+    directionSemantics: "range_azimuth",
+    completeFrameAdc: false,
+    angularResolutionDeg: 29,
+    cells: [{
+      range_m: 0.234375, azimuth_deg: 30,
+      forward_m: 0.202975, lateral_m: 0.117188,
+      intensity: 0.9, coherence: 0.92,
+    }],
+    peaks: [{
+      range_m: 0.234375, azimuth_deg: 30,
+      forward_m: 0.202975, lateral_m: 0.117188,
+      confidence: 0.84, verified: true,
+      angular_uncertainty_deg: 14.5,
+    }],
+  };
+
+  panel.drawAdcAngleEvidence(context, transform, surface);
+
+  assert.ok(context.fillCalls.length >= 1);
+  assert.ok(context.arcCalls.length >= 1);
+  assert.ok(context.fillTextCalls.some(([label]) =>
+    label.includes("ADC PHASE") && label.includes("30"),
+  ));
+});
+
+test("collision view layers ADC range evidence behind mapped obstacles", () => {
+  const { panel } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  panel.snapshot.frame.adc_range_profile = {
+    source: "uart_last_chirp_pair_adc",
+    direction_semantics: "range_only",
+    range_bins: 2,
+    range_step_m: 0.1,
+    values: [0, 255],
+    peak_bin: 1,
+    peak_range_m: 0.1,
+    complete_frame_adc: false,
+  };
+  const transform = {
+    originX: 250, originY: 500, scale: 1000,
+    width: 500, height: 500, forwardMaxM: 0.3,
+    halfWidthM: 0.3,
+  };
+  const order = [];
+  const clips = [];
+  panel.clipToMapBoundary = (_ctx, _transform, shape) => {
+    clips.push(shape);
+  };
+  panel.drawReflectivitySurface = () => { order.push("reflectivity"); };
+  panel.drawAdcRangeEvidence = () => { order.push("adc"); };
+  panel.drawProbabilisticLocalMap = () => { order.push("probability"); };
+  panel.drawTracks = () => { order.push("tracks"); };
+  panel.drawOperatorReturns = () => { order.push("returns"); };
+  panel.drawOperatorGuide = () => { order.push("guide"); };
+
+  panel.drawCollisionInset(makeContext(), transform, presentation);
+
+  assert.deepEqual(order, [
+    "reflectivity", "adc", "probability", "tracks", "returns", "guide",
+  ]);
+  assert.ok(clips.length >= 1);
+  assert.ok(clips.every((shape) => shape === "fov"));
+});
+
+test("both map views suppress wall renderers while preserving evidence and footprint", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -692,14 +820,14 @@ test("both map views invoke contour legacy probability and robot-footprint rende
   panel.drawLidarTopView(contexts[0], transform, presentation);
   panel.drawCollisionInset(contexts[1], transform, presentation);
   assert.equal(reflectivityCalls, 2);
-  assert.equal(boundaryCalls, 2);
-  assert.equal(corridorCalls, 2);
-  assert.equal(contourCalls, 2);
+  assert.equal(boundaryCalls, 0);
+  assert.equal(corridorCalls, 0);
+  assert.equal(contourCalls, 0);
   assert.equal(probabilityCalls, 2);
   assert.equal(footprintCalls, 2);
 });
 
-test("both map views draw surface contour legacy probability path then every track layer", () => {
+test("both map views draw evidence probability path then every track layer without walls", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   const transform = {
@@ -708,9 +836,9 @@ test("both map views draw surface contour legacy probability path then every tra
     halfWidthM: 0.5, centeredCircle: true,
   };
   for (const [context, expected, render] of [
-    [contexts[0], ["reflectivity", "contour", "boundary", "corridor", "probability", "path", "tracks", "tracks"],
+    [contexts[0], ["reflectivity", "probability", "tracks", "tracks", "path"],
       () => panel.drawLidarTopView(contexts[0], transform, presentation)],
-    [contexts[1], ["reflectivity", "contour", "boundary", "corridor", "probability", "path", "tracks"],
+    [contexts[1], ["reflectivity", "probability", "tracks", "returns", "path", "guide"],
       () => panel.drawCollisionInset(contexts[1], transform, presentation)],
   ]) {
     const order = [];
@@ -720,6 +848,8 @@ test("both map views draw surface contour legacy probability path then every tra
     panel.drawReflectivityContours = () => { order.push("contour"); };
     panel.drawProbabilisticLocalMap = () => { order.push("probability"); };
     panel.drawPlannedPath = () => { order.push("path"); };
+    panel.drawOperatorReturns = () => { order.push("returns"); };
+    panel.drawOperatorGuide = () => { order.push("guide"); };
     panel.drawTracks = () => { order.push("tracks"); };
     render();
     assert.deepEqual(order, expected);
@@ -727,7 +857,7 @@ test("both map views draw surface contour legacy probability path then every tra
   }
 });
 
-test("confirmed arbitrary contours replace the forced corridor wall layers", () => {
+test("confirmed contour metadata cannot restore wall layers", () => {
   const { panel, contexts } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
   presentation.reflectivityContours = {
@@ -753,7 +883,7 @@ test("confirmed arbitrary contours replace the forced corridor wall layers", () 
   panel.drawLidarTopView(contexts[0], transform, presentation);
   panel.drawCollisionInset(contexts[1], transform, presentation);
 
-  assert.equal(contourCalls, 2);
+  assert.equal(contourCalls, 0);
   assert.equal(legacyCalls, 0);
 });
 
@@ -929,6 +1059,784 @@ test("reflectivity surface fills cells and outlines only exposed edges", () => {
   ));
   assert.equal(context.shadowBlur, 0);
   assert.equal(context.globalAlphaValues.at(-1), 1);
+});
+
+test("full heatmap surface renders an unverified polar cell instead of blanking it", () => {
+  const { panel, contexts } = makeHarness();
+  const context = contexts[0];
+  const transform = {
+    originX: 250, originY: 250, scale: 600,
+    width: 500, height: 500, forwardMaxM: 0.3,
+    halfWidthM: 0.3, centeredCircle: true,
+  };
+  panel.drawReflectivitySurface(context, transform, {
+    source: "full_range_azimuth_heatmap",
+    rangeStepM: 0.058594,
+    angularResolutionDeg: 29,
+    cells: [{
+      range_m: 0.175781,
+      azimuth_deg: 7.180756,
+      forward_m: 0.174402,
+      lateral_m: 0.021973,
+      intensity: 0.78,
+      relative_db: 1.9,
+      confidence: 0.55,
+      persistence: 0.2,
+      verified: false,
+      range_uncertainty_m: 0.029297,
+      angular_uncertainty_deg: 14.5,
+    }],
+  }, { clipShape: "circle" });
+
+  assert.ok(context.arcCalls.length >= 2);
+  assert.ok(context.fillCalls.length >= 1);
+  assert.ok(context.globalAlphaValues.some((value) => value > 0 && value < 1));
+});
+
+test("full heatmap display collapses correlated FFT bins into five beams per range", () => {
+  const { panel, contexts } = makeHarness();
+  const cells = [];
+  for (let index = 0; index < 25; index += 1) {
+    const azimuthDeg = -58 + index * (116 / 24);
+    cells.push({
+      range_m: 0.175781,
+      azimuth_deg: azimuthDeg,
+      intensity: 0.75,
+      relative_db: 1.65,
+      confidence: 1,
+      persistence: 1,
+      range_uncertainty_m: 0.029297,
+      angular_uncertainty_deg: 14.5,
+    });
+  }
+  panel.drawFullHeatmapSurface(contexts[0], {
+    originX: 250, originY: 480, scale: 1000,
+    width: 500, height: 500, forwardMaxM: 0.3, halfWidthM: 0.3,
+  }, {
+    source: "full_range_azimuth_heatmap",
+    angularResolutionDeg: 29,
+    cells,
+  }, { clipShape: "radial" });
+
+  assert.equal(contexts[0].fillCalls.length, 5);
+  assert.ok(contexts[0].globalAlphaValues.every(
+    (value) => value === 1 || value <= 0.075,
+  ));
+});
+
+test("full heatmap view suppresses host contours and fallback walls", () => {
+  const { panel, contexts } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.reflectivitySurface = {
+    source: "full_range_azimuth_heatmap",
+    cells: [],
+  };
+  presentation.reflectivityContours = {
+    ...presentation.reflectivityContours,
+    status: "confirmed",
+    segments: [{
+      segmentId: "contour_1", confidence: 0.8, headingDeg: 40,
+      supportCells: 5, spanM: 0.10, meanProminenceDb: 2,
+      start: [0.12, -0.16], end: [0.20, -0.10],
+    }],
+  };
+  const transform = {
+    originX: 250, originY: 250, scale: 600,
+    width: 500, height: 500, forwardMaxM: 0.3,
+    halfWidthM: 0.3, centeredCircle: true,
+  };
+  let contourCalls = 0;
+  let fallbackCalls = 0;
+  panel.drawReflectivityContours = () => { contourCalls += 1; };
+  panel.drawReflectivityBoundaries = () => { fallbackCalls += 1; };
+  panel.drawReflectivityCorridor = () => { fallbackCalls += 1; };
+
+  panel.drawLidarTopView(contexts[0], transform, presentation);
+  panel.drawCollisionInset(contexts[1], transform, presentation);
+
+  assert.equal(contourCalls, 0);
+  assert.equal(fallbackCalls, 0);
+});
+
+test("operator wall ridges follow the measured asymmetric polar envelope", () => {
+  const { panel } = makeHarness();
+  const polarCell = (azimuthIndex, azimuthDeg, rangeM, intensity = 0.9) => ({
+    azimuth_index: azimuthIndex,
+    azimuth_deg: azimuthDeg,
+    range_m: rangeM,
+    forward_m: rangeM * Math.cos(azimuthDeg * Math.PI / 180),
+    lateral_m: rangeM * Math.sin(azimuthDeg * Math.PI / 180),
+    intensity,
+    confidence: 0.9,
+    persistence: 1.0,
+  });
+  const surface = {
+    source: "full_range_azimuth_heatmap",
+    cells: [
+      polarCell(1, -45, 0.12), polarCell(2, -30, 0.16),
+      polarCell(3, -15, 0.20), polarCell(4, 15, 0.24),
+      polarCell(5, 30, 0.21), polarCell(6, 45, 0.18),
+      polarCell(1, -45, 0.29, 0.2), polarCell(6, 45, 0.08, 0.2),
+    ],
+  };
+
+  const walls = panel.deriveOperatorWalls(surface);
+
+  assert.equal(walls.left.length, 3);
+  assert.equal(walls.right.length, 3);
+  assert.ok(walls.left[0].rangeM < walls.left[2].rangeM);
+  assert.ok(walls.right[0].rangeM > walls.right[2].rangeM);
+  assert.ok(walls.left.every((point) => point.lateralM < 0));
+  assert.ok(walls.right.every((point) => point.lateralM > 0));
+});
+
+test("operator walls collapse correlated FFT bins into physical 29 degree beams", () => {
+  const { panel } = makeHarness();
+  const cells = [];
+  let azimuthIndex = 0;
+  for (const azimuthDeg of [-55, -50, -45, -38, -32, -26,
+    26, 32, 38, 45, 50, 55]) {
+    for (const rangeM of [0.12, 0.18, 0.24, 0.30]) {
+      cells.push({
+        range_index: Math.round(rangeM * 100),
+        azimuth_index: azimuthIndex,
+        azimuth_deg: azimuthDeg,
+        range_m: rangeM,
+        forward_m: rangeM * Math.cos(azimuthDeg * Math.PI / 180),
+        lateral_m: rangeM * Math.sin(azimuthDeg * Math.PI / 180),
+        intensity: rangeM === 0.24 ? 0.90 : 0.40,
+        confidence: 1.0,
+        persistence: 1.0,
+        relative_db: rangeM === 0.24 ? 5.0 : -1.0,
+        calibrated_residual_db: rangeM === 0.24 ? 5.0 : -1.0,
+      });
+    }
+    azimuthIndex += 1;
+  }
+  const walls = panel.deriveOperatorWalls({
+    source: "full_range_azimuth_heatmap",
+    angularResolutionDeg: 29,
+    independentBeamCount: 5,
+    normalization: "current_range_common_mode_physical_beam",
+    calibrated: true,
+    cells,
+  });
+
+  assert.equal(walls.left.length, 2);
+  assert.equal(walls.right.length, 2);
+  assert.ok(walls.left.every((point) => point.rangeM > 0.20));
+  assert.ok(walls.right.every((point) => point.rangeM > 0.20));
+});
+
+test("operator walls choose the first persistent surface before brighter multipath", () => {
+  const { panel } = makeHarness();
+  const cells = [0.12, 0.24].flatMap((rangeM) => [18, 24, 30].map(
+    (azimuthDeg, index) => ({
+      range_index: Math.round(rangeM * 100),
+      azimuth_index: index,
+      azimuth_deg: azimuthDeg,
+      range_m: rangeM,
+      forward_m: rangeM * Math.cos(azimuthDeg * Math.PI / 180),
+      lateral_m: rangeM * Math.sin(azimuthDeg * Math.PI / 180),
+      intensity: 0.9,
+      confidence: 1,
+      persistence: 1,
+      relative_db: rangeM === 0.12 ? 2 : 8,
+      calibrated_residual_db: rangeM === 0.12 ? 2 : 8,
+    }),
+  )).concat([0.12, 0.24].map((rangeM, index) => ({
+    range_index: Math.round(rangeM * 100), azimuth_index: 100 + index,
+    azimuth_deg: 0, range_m: rangeM, forward_m: rangeM, lateral_m: 0,
+    intensity: 0.34, confidence: 1, persistence: 1,
+    relative_db: -1, calibrated_residual_db: -1,
+  })));
+
+  const walls = panel.deriveOperatorWalls({
+    source: "full_range_azimuth_heatmap",
+    angularResolutionDeg: 29,
+    independentBeamCount: 5,
+    normalization: "current_range_common_mode_physical_beam",
+    calibrated: true,
+    cells,
+  });
+
+  assert.ok(walls.right.length > 0);
+  assert.ok(walls.right.every((point) => point.rangeM === 0.12));
+});
+
+test("returns outside the thirty centimeter operator radius never become walls", () => {
+  const { panel } = makeHarness();
+  const cells = [0.24, 0.40].flatMap((rangeM) => [-50, -46].map(
+    (azimuthDeg, index) => ({
+      range_index: Math.round(rangeM * 100),
+      azimuth_index: index,
+      azimuth_deg: azimuthDeg,
+      range_m: rangeM,
+      forward_m: rangeM * Math.cos(azimuthDeg * Math.PI / 180),
+      lateral_m: rangeM * Math.sin(azimuthDeg * Math.PI / 180),
+      intensity: rangeM === 0.40 ? 0.96 : 0.55,
+      confidence: 1,
+      persistence: 1,
+      relative_db: rangeM === 0.40 ? 5 : 0.3,
+      calibrated_residual_db: rangeM === 0.40 ? 5 : 0.3,
+    }),
+  )).concat([0.24, 0.40].map((rangeM, index) => ({
+    range_index: Math.round(rangeM * 100), azimuth_index: 100 + index,
+    azimuth_deg: 0, range_m: rangeM, forward_m: rangeM, lateral_m: 0,
+    intensity: 0.34, confidence: 1, persistence: 1,
+    relative_db: -1, calibrated_residual_db: -1,
+  })));
+
+  const walls = panel.deriveOperatorWalls({
+    source: "full_range_azimuth_heatmap",
+    angularResolutionDeg: 29,
+    independentBeamCount: 5,
+    normalization: "current_range_common_mode_physical_beam",
+    calibrated: true,
+    cells,
+  });
+
+  assert.ok(walls.left.some((point) => point.rangeM === 0.24));
+  assert.ok(walls.left.every((point) => point.rangeM <= 0.30));
+});
+
+test("adjacent physical beams form one wall despite a twelve centimeter chord", () => {
+  const { panel } = makeHarness();
+  const points = [24, 48].map((azimuthDeg) => {
+    const rangeM = 0.293;
+    return {
+      azimuthDeg,
+      rangeM,
+      forwardM: rangeM * Math.cos(azimuthDeg * Math.PI / 180),
+      lateralM: rangeM * Math.sin(azimuthDeg * Math.PI / 180),
+      strength: 0.8,
+      confidence: 1,
+    };
+  });
+
+  const segments = panel.operatorWallSegments(points);
+
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].length, 2);
+});
+
+test("calibrated probability ridges override a misleading near raw echo", () => {
+  const { panel } = makeHarness();
+  const surface = {
+    source: "full_range_azimuth_heatmap",
+    cells: [{
+      azimuth_index: 5, azimuth_deg: 30, range_m: 0.06,
+      forward_m: 0.052, lateral_m: 0.03,
+      intensity: 1, confidence: 1, persistence: 1,
+    }],
+  };
+  const localMap = {
+    resolutionM: 0.05,
+    cells: [0.10, 0.15, 0.20, 0.25].flatMap((forwardM) => [
+      { forward_m: forwardM, lateral_m: -0.15,
+        probability: 0.88, occupied: true, range_uncertainty_m: 0.025,
+        lateral_uncertainty_m: 0.03 },
+      { forward_m: forwardM, lateral_m: 0.16,
+        probability: 0.82, occupied: true, range_uncertainty_m: 0.025,
+        lateral_uncertainty_m: 0.03 },
+    ]),
+  };
+
+  const walls = panel.deriveOperatorWalls(surface, localMap);
+
+  assert.equal(walls.left.length, 4);
+  assert.equal(walls.right.length, 4);
+  assert.ok(Math.min(...walls.right.map((point) => point.rangeM)) > 0.15);
+});
+
+test("probability boundaries take priority over calibrated polar ridges", () => {
+  const { panel } = makeHarness();
+  const surface = {
+    source: "full_range_azimuth_heatmap",
+    angularResolutionDeg: 29,
+    independentBeamCount: 5,
+    normalization: "current_range_common_mode_physical_beam",
+    calibrated: true,
+    cells: [-48, -42, 42, 48].map((azimuthDeg, index) => ({
+      range_index: 2,
+      azimuth_index: index,
+      azimuth_deg: azimuthDeg,
+      range_m: 0.12,
+      forward_m: 0.12 * Math.cos(azimuthDeg * Math.PI / 180),
+      lateral_m: 0.12 * Math.sin(azimuthDeg * Math.PI / 180),
+      intensity: 1,
+      confidence: 1,
+      persistence: 1,
+      relative_db: 8,
+      calibrated_residual_db: 8,
+    })),
+  };
+  const localMap = {
+    resolutionM: 0.05,
+    cells: [0.10, 0.15, 0.20, 0.25].flatMap((forwardM) => [
+      { forward_m: forwardM, lateral_m: -0.16,
+        probability: 0.88, occupied: true },
+      { forward_m: forwardM, lateral_m: 0.17,
+        probability: 0.86, occupied: true },
+    ]),
+  };
+
+  const walls = panel.deriveOperatorWalls(surface, localMap);
+
+  assert.equal(walls.calibrated, undefined);
+  assert.equal(walls.left.length, 4);
+  assert.equal(walls.right.length, 4);
+  assert.ok(walls.left.every((point) => point.rangeM > 0.18));
+  assert.ok(walls.right.every((point) => point.rangeM > 0.19));
+});
+
+test("one probability return stays a blob instead of restoring a raw wall", () => {
+  const { panel } = makeHarness();
+  const surface = {
+    source: "full_range_azimuth_heatmap",
+    angularResolutionDeg: 29,
+    independentBeamCount: 5,
+    normalization: "current_range_common_mode_physical_beam",
+    calibrated: true,
+    cells: [-48, -42, 42, 48].map((azimuthDeg, index) => ({
+      range_index: 2, azimuth_index: index, azimuth_deg: azimuthDeg,
+      range_m: 0.12,
+      forward_m: 0.12 * Math.cos(azimuthDeg * Math.PI / 180),
+      lateral_m: 0.12 * Math.sin(azimuthDeg * Math.PI / 180),
+      intensity: 1, confidence: 1, persistence: 1,
+      relative_db: 8, calibrated_residual_db: 8,
+    })),
+  };
+  const localMap = {
+    resolutionM: 0.05,
+    cells: [{ forward_m: 0.20, lateral_m: 0.15,
+      probability: 0.88, occupied: true }],
+  };
+
+  const walls = panel.deriveOperatorWalls(surface, localMap);
+
+  assert.equal(walls.left.length, 0);
+  assert.equal(walls.right.length, 1);
+  assert.equal(walls.right[0].forwardM, 0.20);
+  assert.equal(walls.right[0].lateralM, 0.15);
+});
+
+test("sub-threshold probability evidence stays visible as a faint wall candidate", () => {
+  const { panel } = makeHarness();
+  const walls = panel.deriveOperatorWalls(null, {
+    resolutionM: 0.05,
+    cells: [
+      { forward_m: 0.10, lateral_m: -0.10, probability: 0.79,
+        occupied: false },
+      { forward_m: 0.15, lateral_m: -0.10, probability: 0.79,
+        occupied: false },
+    ],
+  });
+
+  assert.equal(walls.left.length, 2);
+  assert.equal(walls.right.length, 0);
+  assert.ok(walls.left.every((point) => point.strength > 0));
+});
+
+test("operator guide steers away from either mirrored obstacle field", () => {
+  const { panel } = makeHarness();
+  const makeMap = (sign) => ({
+    resolutionM: 0.05,
+    cells: [0.09, 0.14, 0.19, 0.24, 0.29].map((forwardM) => ({
+      forward_m: forwardM,
+      lateral_m: sign * 0.06,
+      probability: 0.92,
+      range_uncertainty_m: 0.025,
+      lateral_uncertainty_m: 0.03,
+      occupied: true,
+    })),
+  });
+
+  const avoidLeft = panel.deriveOperatorGuide(makeMap(-1));
+  const avoidRight = panel.deriveOperatorGuide(makeMap(1));
+
+  assert.equal(avoidLeft.evidenceState, "one_sided");
+  assert.equal(avoidRight.evidenceState, "one_sided");
+  assert.equal(avoidLeft.points.length, 0);
+  assert.equal(avoidRight.points.length, 0);
+  assert.equal(avoidLeft.direction, "unknown");
+  assert.equal(avoidRight.direction, "unknown");
+});
+
+test("sub-threshold probability cells influence the guide proportionally", () => {
+  const { panel } = makeHarness();
+  const guide = panel.deriveOperatorGuide({
+    resolutionM: 0.05,
+    cells: [0.09, 0.14, 0.19, 0.24, 0.29].map((forwardM) => ({
+      forward_m: forwardM,
+      lateral_m: 0.06,
+      probability: 0.79,
+      range_uncertainty_m: 0.025,
+      lateral_uncertainty_m: 0.03,
+      occupied: false,
+    })),
+  });
+
+  assert.equal(guide.direction, "unknown");
+  assert.equal(guide.points.length, 0);
+  assert.equal(guide.evidenceState, "one_sided");
+});
+
+test("backend route remains visible as partial guidance with one-sided evidence", () => {
+  const { panel } = makeHarness();
+  const guide = panel.deriveOperatorGuide({
+    resolutionM: 0.05,
+    cells: [0.10, 0.15, 0.20].map((forwardM) => ({
+      forward_m: forwardM,
+      lateral_m: 0.10,
+      probability: 0.90,
+      occupied: true,
+      range_uncertainty_m: 0.025,
+      lateral_uncertainty_m: 0.03,
+    })),
+  }, {
+    status: "clear",
+    minimum_passage_width_m: 0.21,
+    points: [[0, 0], [0.10, -0.02], [0.20, -0.05]],
+  });
+
+  assert.equal(guide.evidenceState, "one_sided");
+  assert.equal(guide.direction, "left");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(guide.points)),
+    [[0, 0], [0.10, -0.02], [0.20, -0.05]],
+  );
+  assert.equal(guide.passageVerified, false);
+});
+
+test("backend route remains visible when all directional sectors are unknown", () => {
+  const { panel } = makeHarness();
+  const guide = panel.deriveOperatorGuide({
+    resolutionM: 0.05,
+    cells: [],
+  }, {
+    status: "clear",
+    confidence: 0.92,
+    minimum_passage_width_m: 0.21,
+    points: [[0, 0], [0.10, 0], [0.20, 0]],
+  });
+
+  assert.equal(guide.evidenceState, "unobserved");
+  assert.equal(guide.direction, "straight");
+  assert.equal(guide.points.length, 3);
+  assert.equal(guide.passageVerified, false);
+});
+
+test("withheld guidance remains visible without drawing a fake route", () => {
+  const { panel, contexts } = makeHarness();
+  panel.drawOperatorGuide(contexts[0], {
+    originX: 250, originY: 480, scale: 1000, width: 500, height: 500,
+  }, {
+    points: [], direction: "unknown", evidenceState: "one_sided",
+  }, { level: "NORMAL" });
+
+  assert.ok(contexts[0].fillTextCalls.some(([text]) =>
+    String(text).includes("DIRECTION WITHHELD"),
+  ));
+  assert.equal(contexts[0].strokeCalls.length, 0);
+});
+
+test("partial backend guidance is labeled as unknown rather than safe passage", () => {
+  const { panel, contexts } = makeHarness();
+  panel.drawOperatorGuide(contexts[0], {
+    originX: 250, originY: 480, scale: 1000, width: 500, height: 500,
+  }, {
+    points: [[0, 0], [0.10, 0], [0.20, 0]],
+    direction: "straight",
+    clearanceM: 0.21,
+    evidenceState: "unobserved",
+    passageVerified: false,
+  }, { level: "NORMAL" }, { status: "clear" });
+
+  const labels = contexts[0].fillTextCalls.map(([text]) => String(text));
+  assert.ok(labels.includes("GUIDE STRAIGHT · UNKNOWN ≠ FREE"));
+  assert.equal(labels.includes("GO STRAIGHT"), false);
+  assert.ok(contexts[0].strokeCalls.length > 0);
+});
+
+test("unresolved turn suppresses a locally invented straight guide", () => {
+  const { panel } = makeHarness();
+  const guide = panel.deriveOperatorGuide({
+    resolutionM: 0.05,
+    cells: [],
+  }, {
+    status: "turn_side_unresolved",
+    points: [[0, 0]],
+    turn_candidates: [],
+  });
+
+  assert.equal(guide.evidenceState, "side_unresolved");
+  assert.equal(guide.direction, "unknown");
+  assert.equal(guide.points.length, 0);
+});
+
+test("operator reflection rendering shows cells without inventing boundary fragments", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 480, scale: 1000, width: 500, height: 500,
+    forwardMaxM: 0.3, halfWidthM: 0.3,
+  };
+  const localMap = {
+    resolutionM: 0.05,
+    cells: [
+      { forward_m: 0.10, lateral_m: -0.10, probability: 0.88 },
+      { forward_m: 0.15, lateral_m: -0.10, probability: 0.86 },
+      { forward_m: 0.20, lateral_m: 0.12, probability: 0.89 },
+    ],
+  };
+
+  panel.drawOperatorReturns(contexts[0], transform, localMap);
+
+  const lineSegments = contexts[0].strokeCalls.flatMap((call) => call.path)
+    .filter((command) => command[0] === "lineTo");
+  const labels = contexts[0].fillTextCalls.map(([label]) => String(label));
+  assert.equal(lineSegments.length, 0);
+  assert.equal(labels.some((label) => /MEASURED/.test(label)), false);
+  assert.ok(contexts[0].arcCalls.length >= 3);
+});
+
+test("operator reflection rendering never bridges a missing forward row", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 480, scale: 1000, width: 500, height: 500,
+    forwardMaxM: 0.3, halfWidthM: 0.3,
+  };
+
+  panel.drawOperatorReturns(contexts[0], transform, {
+    resolutionM: 0.05,
+    cells: [
+      { forward_m: 0.10, lateral_m: -0.10, probability: 0.88 },
+      { forward_m: 0.20, lateral_m: -0.10, probability: 0.86 },
+    ],
+  });
+
+  const lineSegments = contexts[0].strokeCalls.flatMap((call) => call.path)
+    .filter((command) => command[0] === "lineTo");
+  assert.equal(lineSegments.length, 0);
+});
+
+test("operator reflection rendering does not turn one range row into a wall", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 480, scale: 1000, width: 500, height: 500,
+    forwardMaxM: 0.3, halfWidthM: 0.3,
+  };
+
+  panel.drawOperatorReturns(contexts[0], transform, {
+    resolutionM: 0.05,
+    cells: [
+      { forward_m: 0.15, lateral_m: 0.05, probability: 0.88 },
+      { forward_m: 0.15, lateral_m: 0.10, probability: 0.86 },
+    ],
+  });
+
+  const lineSegments = contexts[0].strokeCalls.flatMap((call) => call.path)
+    .filter((command) => command[0] === "lineTo");
+  assert.equal(lineSegments.length, 0);
+});
+
+test("operator guide follows repeated evidence even before hard occupancy", () => {
+  const { panel } = makeHarness();
+  const guide = panel.deriveOperatorGuide({
+    resolutionM: 0.05,
+    cells: [
+      { forward_m: 0.10, lateral_m: -0.12, probability: 0.69,
+        range_uncertainty_m: 0.029, lateral_uncertainty_m: 0.04 },
+      { forward_m: 0.15, lateral_m: -0.12, probability: 0.70,
+        range_uncertainty_m: 0.029, lateral_uncertainty_m: 0.04 },
+      { forward_m: 0.10, lateral_m: 0.13, probability: 0.72,
+        range_uncertainty_m: 0.029, lateral_uncertainty_m: 0.04 },
+      { forward_m: 0.15, lateral_m: 0.13, probability: 0.73,
+        range_uncertainty_m: 0.029, lateral_uncertainty_m: 0.04 },
+    ],
+  }, {
+    status: "clear",
+    minimum_passage_width_m: 0.21,
+    points: [[0, 0], [0.10, 0], [0.20, 0]],
+  });
+
+  assert.equal(guide.evidenceState, "two_sided");
+  assert.ok(guide.points.length >= 2);
+});
+
+test("operator view keeps side evidence within 30cm forward depth", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 480, scale: 1000, width: 500, height: 500,
+    forwardMaxM: 0.3, halfWidthM: 0.3,
+  };
+
+  panel.drawOperatorReturns(contexts[0], transform, {
+    resolutionM: 0.05,
+    cells: [{
+      forward_m: 0.25,
+      lateral_m: 0.25,
+      probability: 0.90,
+      range_uncertainty_m: 0.029,
+      lateral_uncertainty_m: 0.08,
+    }],
+  });
+
+  assert.ok(contexts[0].arcCalls.length >= 2);
+});
+
+test("operator FOV clip preserves the full sixty-degree side view", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 300, originY: 300, scale: 1000, width: 600, height: 600,
+    forwardMaxM: 0.3, halfWidthM: 0.3,
+  };
+
+  panel.clipToMapBoundary(contexts[0], transform, "fov");
+
+  assert.deepEqual(contexts[0].clipCalls[0], [
+    ["moveTo", 300, 300],
+    ["lineTo", 0, 300 - (0.3 / Math.tan(Math.PI / 3)) * 1000],
+    ["lineTo", 0, 0],
+    ["lineTo", 600, 0],
+    ["lineTo", 600, 300 - (0.3 / Math.tan(Math.PI / 3)) * 1000],
+  ]);
+});
+
+test("operator guide ignores evidence beyond the thirty-centimeter forward view", () => {
+  const { panel } = makeHarness();
+  const guide = panel.deriveOperatorGuide({
+    resolutionM: 0.05,
+    cells: [
+      { forward_m: 0.40, lateral_m: -0.20, probability: 0.95,
+        range_uncertainty_m: 0.025, lateral_uncertainty_m: 0.03 },
+      { forward_m: 0.40, lateral_m: 0.20, probability: 0.95,
+        range_uncertainty_m: 0.025, lateral_uncertainty_m: 0.03 },
+      { forward_m: 0.20, lateral_m: 0.10, probability: 0.95,
+        range_uncertainty_m: 0.025, lateral_uncertainty_m: 0.03 },
+    ],
+  });
+
+  assert.equal(guide.evidenceState, "one_sided");
+  assert.equal(guide.points.length, 0);
+});
+
+test("nearest operator metric prefers a first surface over a distant point", () => {
+  const { panel, elements } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.tracks = [{
+    source: "point", point_confirmed: true, distance_m: 0.40,
+  }];
+  presentation.probabilisticLocalMap.cells = [{
+    forward_m: 0.10, lateral_m: -0.15, probability: 0.81,
+    occupied: true,
+  }];
+
+  panel.updateText(presentation);
+
+  assert.equal(
+    elements.get("#metric-nearest").querySelector("strong").textContent,
+    "0.18 m",
+  );
+  assert.equal(
+    elements.get("#metric-nearest").querySelector("span").textContent,
+    "filtered point / first surface",
+  );
+});
+
+test("two confirmed side boundaries center the guide by geometry", () => {
+  const { panel } = makeHarness();
+  const localMap = {
+    resolutionM: 0.05,
+    cells: [0.06, 0.12, 0.18, 0.24].flatMap((forwardM) => [
+      { forward_m: forwardM, lateral_m: -0.10, probability: 0.91,
+        occupied: true, range_uncertainty_m: 0.025,
+        lateral_uncertainty_m: 0.03 },
+      { forward_m: forwardM, lateral_m: 0.16, probability: 0.91,
+        occupied: true, range_uncertainty_m: 0.025,
+        lateral_uncertainty_m: 0.03 },
+    ]),
+  };
+
+  const guide = panel.deriveOperatorGuide(localMap);
+
+  assert.equal(guide.evidenceState, "two_sided");
+  assert.ok(guide.corridorWidthM > 0.24 && guide.corridorWidthM < 0.28);
+  assert.ok(guide.points.at(-1)[1] > 0.015);
+  assert.equal(guide.direction, "right");
+});
+
+test("operator guide uses the collision-checked backend path geometry", () => {
+  const { panel } = makeHarness();
+  const guide = panel.deriveOperatorGuide({
+    resolutionM: 0.05,
+    cells: [0.06, 0.12, 0.18, 0.24].flatMap((forwardM) => [
+      { forward_m: forwardM, lateral_m: -0.12, probability: 0.91,
+        occupied: true, range_uncertainty_m: 0.025,
+        lateral_uncertainty_m: 0.03 },
+      { forward_m: forwardM, lateral_m: 0.13, probability: 0.91,
+        occupied: true, range_uncertainty_m: 0.025,
+        lateral_uncertainty_m: 0.03 },
+    ]),
+  }, {
+    status: "clear",
+    minimum_passage_width_m: 0.21,
+    points: [[0, 0], [0.10, 0.02], [0.20, 0.05]],
+  });
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(guide.points)),
+    [[0, 0], [0.10, 0.02], [0.20, 0.05]],
+  );
+  assert.equal(guide.direction, "right");
+  assert.equal(guide.clearanceM, 0.21);
+});
+
+test("blocked backend path suppresses advisory steering and labels stop", () => {
+  const { panel, contexts } = makeHarness();
+  const guide = {
+    points: [[0, 0], [0.10, -0.02], [0.20, -0.04]],
+    direction: "left",
+    clearanceM: 0.21,
+    evidenceState: "one_sided",
+  };
+  panel.drawOperatorGuide(contexts[0], {
+    originX: 250, originY: 480, scale: 1000, width: 500, height: 500,
+  }, guide, { level: "NORMAL" }, {
+    status: "blocked_near_field",
+  });
+
+  const labels = contexts[0].fillTextCalls.map(([text]) => String(text));
+  assert.ok(labels.includes("STOP · NO VERIFIED PASSAGE"));
+  assert.equal(labels.some((text) => text.startsWith("STEER")), false);
+});
+
+test("main canvas uses the forward collision renderer and operator overlays", () => {
+  const { panel } = makeHarness();
+  panel.presentation = livePresentationWithProbabilityMap();
+  panel.presentation.reflectivitySurface = {
+    source: "full_range_azimuth_heatmap",
+    cells: [],
+  };
+  let oldMainCalls = 0;
+  let collisionCalls = 0;
+  let wallCalls = 0;
+  let guideCalls = 0;
+  const originalDrawCollisionInset = panel.drawCollisionInset;
+  panel.drawLidarTopView = () => { oldMainCalls += 1; };
+  panel.drawCollisionInset = (...args) => {
+    collisionCalls += 1;
+    return originalDrawCollisionInset.apply(panel, args);
+  };
+  panel.drawOperatorReturns = () => { wallCalls += 1; };
+  panel.drawOperatorGuide = () => { guideCalls += 1; };
+
+  panel.draw();
+
+  assert.equal(oldMainCalls, 0);
+  assert.equal(collisionCalls, 1);
+  assert.equal(wallCalls, 1);
+  assert.equal(guideCalls, 1);
 });
 
 test("display-only reflectivity cells never enter track drawing", () => {
@@ -1118,6 +2026,32 @@ test("planned path underlay uses the physical minimum passage width", () => {
   ));
 });
 
+test("unresolved turn draws both measured candidates and never a straight route", () => {
+  const { panel, contexts } = makeHarness();
+  const transform = {
+    originX: 250, originY: 250, scale: 400, width: 500, height: 500,
+    forwardMaxM: 0.5, halfWidthM: 0.5,
+  };
+  panel.drawPlannedPath(contexts[0], transform, {
+    status: "turn_side_unresolved",
+    points: [[0, 0]],
+    turn_candidates: [
+      { points: [[0, 0], [0.10, -0.04], [0.20, -0.09]] },
+      { points: [[0, 0], [0.10, 0.04], [0.20, 0.09]] },
+    ],
+  });
+
+  assert.equal(contexts[0].strokeCalls.length, 4);
+  assert.equal(
+    contexts[0].fillTextCalls.some(([text]) =>
+      String(text).includes("TURN REQUIRED · SIDE UNRESOLVED")),
+    true,
+  );
+  assert.ok(contexts[0].lineDashCalls.some(
+    (dash) => JSON.stringify(dash) === JSON.stringify([7, 7]),
+  ));
+});
+
 test("blocked path segments use original inclusive point indices", () => {
   const { panel, contexts } = makeHarness();
   const transform = {
@@ -1231,7 +2165,7 @@ test("collision inset includes thirty centimeters and excludes thirty-one", () =
   ];
   panel.presentation = presentation;
   panel.draw();
-  const labels = contexts[1].fillTextCalls.map(([text]) => String(text));
+  const labels = contexts[0].fillTextCalls.map(([text]) => String(text));
   assert.ok(labels.includes("P 30cm"));
   assert.equal(labels.includes("P 31cm"), false);
 });
@@ -1269,6 +2203,42 @@ test("main-view sectors exclude evidence beyond thirty centimeters", () => {
   presentation.tracks[0].forward_m = 0.30;
   panel.updateSectors(presentation);
   assert.match(elements.get("#sector-2").querySelector("span").textContent, /30cm/);
+});
+
+test("direction sectors show persistent probability reflections without a point track", () => {
+  const { panel, elements } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.probabilisticLocalMap.cells = [
+    { forward_m: 0.10, lateral_m: -0.15, probability: 0.70,
+      occupied: false },
+    { forward_m: 0.10, lateral_m: 0.15, probability: 0.84,
+      occupied: true },
+  ];
+
+  panel.updateSectors(presentation);
+
+  const labels = [0, 1, 2, 3, 4].map((index) =>
+    elements.get(`#sector-${index}`).querySelector("span").textContent,
+  );
+  assert.equal(labels.filter((label) => label.includes("REFLECTION")).length, 2);
+  assert.equal(labels.filter((label) => label === "UNKNOWN").length, 3);
+});
+
+test("direction sectors keep a quantized reflection intersecting 30cm", () => {
+  const { panel, elements } = makeHarness();
+  const presentation = livePresentationWithProbabilityMap();
+  presentation.probabilisticLocalMap.cells = [{
+    forward_m: 0.30, lateral_m: -0.10, probability: 0.65,
+    range_uncertainty_m: 0.029, lateral_uncertainty_m: 0.073,
+    occupied: false,
+  }];
+
+  panel.updateSectors(presentation);
+
+  const labels = [0, 1, 2, 3, 4].map((index) =>
+    elements.get(`#sector-${index}`).querySelector("span").textContent,
+  );
+  assert.equal(labels.filter((label) => label.includes("REFLECTION")).length, 1);
 });
 
 test("2.5d view excludes tracks beyond thirty centimeters or sixty degrees", () => {
@@ -1375,6 +2345,11 @@ test("2.5d raw marker is absent when raw debug is off", () => {
 test("validated diagnostics and blocked-near-field status drive existing rows", () => {
   const { panel, elements } = makeHarness();
   const presentation = livePresentationWithProbabilityMap();
+  panel.snapshot.frame.adc_status = "available";
+  panel.snapshot.scene.adc_range_angle_surface = {
+    direction_semantics: "range_azimuth",
+    phase_calibration: "evm_design_default",
+  };
   presentation.diagnostics = {
     raw_point_count: 7,
     ground_rejected_count: 13,
@@ -1419,6 +2394,10 @@ test("validated diagnostics and blocked-near-field status drive existing rows", 
   assert.equal(elements.get("#probability-expired-value").textContent, "10");
   assert.equal(elements.get("#path-pending-value").textContent, "1");
   assert.equal(elements.get("#path-accepted-value").textContent, "12");
+  assert.equal(
+    elements.get("#adc-status-value").textContent,
+    "AVAILABLE · PHASE ANGLE · DESIGN CAL",
+  );
   assert.match(
     elements.get("#path-status-value").textContent,
     /BLOCKED_NEAR_FIELD.*ROUTE_CHANGED_BLOCKED/,
@@ -1464,13 +2443,13 @@ test("every blocked reason clears stale maps and renders only its stop overlay",
 
       assert.equal(lidarDraws, 0, `${reason}: stale LiDAR scene rendered`);
       assert.equal(collisionDraws, 0, `${reason}: stale collision scene rendered`);
-      assert.equal(overlayCalls.length, 3, `${reason}: overlay count`);
+      assert.equal(overlayCalls.length, 1, `${reason}: overlay count`);
       assert.deepEqual(
         contexts.map((context) => context.clearRectCalls.length),
-        [1, 1, 1],
+        [1, 0, 0],
         `${reason}: canvas clear count`,
       );
-      for (const context of contexts) {
+      for (const context of contexts.slice(0, 1)) {
         assert.deepEqual(
           context.fillTextCalls.map(([text]) => text),
           [heading, explanation],
@@ -1550,6 +2529,7 @@ test("every blocked reason replaces stale live metrics and sectors with sensor f
       for (const selector of [
         "#profile-value",
         "#calibration-value",
+        "#adc-status-value",
         "#pose-mode-value",
         "#frame-value",
         "#gap-value",
@@ -1684,7 +2664,11 @@ test("operator views hide unconfirmed heatmap geometry but retain confirmed evid
   );
   panel.drawLidarTopView(contexts[0], mainTransform, scene);
   panel.drawCollisionInset(contexts[1], collisionTransform, scene);
-  assert.deepEqual(outlines, [2, 3, 2, 3]);
+  assert.deepEqual(
+    outlines,
+    [2, 3],
+    "the driving view omits uncertainty ellipses that obscure walls",
+  );
   assert.deepEqual(heatmaps, [2, 2]);
   assert.deepEqual(points, [3, 3]);
   assert.equal(outlines.includes(1), false);

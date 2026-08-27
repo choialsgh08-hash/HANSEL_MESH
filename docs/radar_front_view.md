@@ -1,4 +1,4 @@
-# IWRL6432BOOST R10 레이더 LiDAR형 조종 화면
+# IWRL6432BOOST 레이더 전방 조종 화면
 
 > **중요:** 정상 Windows 보드 운용은
 > [자동 복구 운용 절차](radar_auto_recovery.md)의 one-command supervisor를
@@ -8,8 +8,9 @@
 R10 화면은 카메라 영상을 합성하지 않는다. IWRL6432BOOST가 실제로 측정한 포인트와
 range-azimuth heatmap의 반사 증거를 로봇 기준 LiDAR형 탑뷰로 표시한다.
 
-- 주 화면: 레이더 중심 반지름 `0~30cm`
-- 충돌 확대창: 전방 `0~30cm`
+- 주 화면: 로봇 시점 전방 `0~30cm` 반원 지도 하나
+- 청록 선: 기하 보정된 확률 지도에서 매 프레임 다시 만든 좌우 벽 능선
+- 노란 띠/선: 로봇 폭 15cm와 여유 3cm를 반영한 조향 보조 경로
 - 격자 해상도: 5cm
 - 포인트와 점유 증거 유지 시간: 최대 300ms
 - 거리 기반 빨강 경고: 고정 클러터가 아닌 확인된 포인트가 `10cm` 이하일 때만 표시
@@ -28,8 +29,9 @@ python monitor\radar_front.py --demo --bind 127.0.0.1 `
   --http-port 8081 --max-range-m 3 --history-window 0.3
 ```
 
-브라우저에서 `http://127.0.0.1:8081/`을 연다. r10 build의
-`반지름 30cm 근접 주행 지도`, `ROBOT RELATIVE`와 우측의 `0~30cm 충돌 확대`가 보여야 한다.
+브라우저에서 `http://127.0.0.1:8081/`을 연다. 현재 build의
+`0~30cm 전방 조종 화면`, `CYAN = LIVE WALL RIDGE`,
+`YELLOW = STEERING GUIDE`가 보여야 한다.
 데모 데이터는 합성 데이터이므로 실제 보드 감지 성능을 증명하지 않는다.
 
 ## 2. 보드 프로필 적용
@@ -89,7 +91,7 @@ New-Item -ItemType Directory -Force -Path configs\radar\calibrations
 
 python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
   --output configs\radar\calibrations\head-near-8hz.json `
-  --lateral-sign -1 `
+  --lateral-sign 1 `
   --min-frames 50
 ```
 
@@ -144,7 +146,7 @@ python -m sensors radar-live `
 python monitor\radar_front.py `
   --follow missions\radar-board-live.jsonl `
   --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
-  --lateral-sign -1 `
+  --lateral-sign 1 `
   --max-range-m 3 `
   --history-window 0.3
 ```
@@ -158,7 +160,7 @@ python monitor\radar_front.py `
 python monitor\radar_front.py `
   --replay missions\radar-board-live.jsonl `
   --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
-  --lateral-sign -1 `
+  --lateral-sign 1 `
   --max-range-m 3 `
   --history-window 0.3 `
   --speed 1
@@ -432,3 +434,93 @@ temperature, and operator are manual attestations and are not automatically veri
 
 **Physical bench status: PENDING HARDWARE.** Automated replay completion is not an
 empirical claim of real-world noise reduction.
+
+## Full heatmap evidence view (R56)
+
+The primary 0--30 cm operator layer consumes every trusted range--azimuth heatmap
+cell inside the configured ±60 degree FOV. Signal magnitude is normalized within
+each live frame and changes only cell intensity and confidence; it is not an
+admission threshold. The five-frame surface is visible from the first frame, so an
+unverified scene cannot blank the display. Verification is metadata for trust and
+safety decisions, not a rendering gate.
+
+The old calibrated straight/converging wall fits remain only as unavailable legacy
+API fields for one-release compatibility. They do not steer the path and are not
+drawn over a full-heatmap surface. Low-SNR Cartesian points are also retained after
+finite-coordinate, mount-ground, scene-range, and calibrated self-clutter checks.
+The probability grid blends soft heatmap posteriors instead of repeatedly adding a
+binary hit from the same FFT lobe.
+
+The heatmap has range and azimuth but no elevation coordinate. Therefore the host
+can geometrically remove floor returns only from Cartesian points with a measured
+z value. It does not claim that an azimuth heatmap cell is floor or free space.
+
+## Single operator drive view (R63)
+
+R57 removes the old circular main map and the separate collision/2.5D insets from
+the operator layout. The one main canvas is a forward-facing 0--30 cm semicircle.
+The complete heatmap remains as a dim continuous background; it is never used as
+a binary signal-strength admission gate. White uncertainty ellipses are omitted
+from the driving canvas because they obscure geometry.
+
+The cyan wall ridges are not a hard-coded straight, V, or converging-wall model.
+R63 reduces correlated angle-FFT bins to five physical beams and evaluates each
+beam from near to far. A persistent near return consumes visibility before a later,
+brighter multipath lobe, so the displayed boundary is a probabilistic first surface
+rather than the maximum-amplitude bin. Temporal stability, angular support, and
+absolute change from the empty-scene calibration continuously scale the likelihood;
+there is no signal-strength admission threshold. The stored room image is never
+subtracted to create wall geometry.
+
+The probability map, cyan ridge, nearest-distance metric, and yellow guide consume
+that same first-surface result. Positive-but-not-yet-occupied cells stay visible as
+faint candidates and influence the path proportionally. The yellow line is the
+backend collision-checked route instead of a second browser-only path calculation.
+The raw full heatmap remains as a much dimmer gray diagnostic context and cannot
+override the selected first surface. This does not replace the independent 10 cm
+point-based stop warning.
+
+## Scene-independent physical-beam view (R59)
+
+R59 never subtracts the stored heatmap image of the calibration room. The clutter
+file binds the correct board/profile and rejects the small, repeatable board/USB/mount
+point clusters; current wall geometry is normalized against the current range row.
+This prevents a wall present during calibration from being erased later or imprinted
+after the robot moves to a different scene.
+
+The 32 azimuth FFT bins are correlated samples. The operator view aggregates them into
+five approximately independent 29-degree beams over the trusted +/-60-degree FOV and
+shows their full range uncertainty. A single beam is labelled `RETURN`, not `WALL`;
+only multiple occupied measurements on the same side form a wall ridge. A two-sided
+route is centered from the measured left and right occupied boundaries, while one-sided
+or unobserved geometry stays explicitly uncertain. This display is an honest radar
+driving aid, not a claim of camera- or LiDAR-resolution reconstruction.
+
+## Cable-free UART ADC evidence (R61)
+
+The default 5 Hz near-wall profile streams a 16 x 128 range-azimuth heatmap
+and TLV 316 over the existing XDS110 Application/User UART. TLV 316 contains
+the last two chirps of each frame (256 REAL16 samples x 3 RX x 2 chirps), not a
+complete-frame raw ADC capture. The host BPM-decodes the chirp pair, removes
+its mean, applies a Hann window and range FFT, then noncoherently sums the six
+virtual-channel powers. Every range bin is retained; signal strength changes
+display intensity and does not act as an obstacle-admission threshold.
+
+Because two UART chirps do not provide a calibrated full-frame angle cube,
+this independent evidence is drawn only as blue range arcs behind the mapped
+heatmap/track layers. It never invents a left/right direction and does not
+directly change path or hazard state. `UART ADC: AVAILABLE - RANGE ONLY` in
+the input panel confirms that both the ADC TLV and PC processing are live.
+
+The 32-bin empty-room clutter calibration is deterministically converted to
+16 bins by selecting source FFT bins at identical normalized spatial
+frequencies. The current wall scene is not learned as clutter. The measured
+32-bin heatmap plus ADC combination overran the 1.25 Mbaud stream; the 16-bin
+combination sustained 5 Hz with no frame gaps or missing heatmap/ADC frames.
+
+If strict scene-contract parsing fails while current transport and heatmap
+evidence are still live, the browser renders that current evidence with
+UNKNOWN hazard and no verified path. A two-second last-valid evidence hold is
+used only when the current heatmap itself cannot be parsed. The blocking
+`SCENE CONTRACT ERROR` view remains only when no safely displayable current or
+recent evidence exists; transport faults still fail closed immediately.

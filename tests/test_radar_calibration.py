@@ -16,6 +16,8 @@ from sensors.radar_calibration import (
     RadarClutterModel,
     build_clutter_model,
     load_clutter_model,
+    reorient_clutter_model,
+    resample_clutter_model_azimuth,
 )
 from sensors.mission_log import iter_replay
 
@@ -205,6 +207,89 @@ def with_recomputed_calibration_id(
 
 
 class RadarClutterModelTests(unittest.TestCase):
+    def test_reorient_model_preserves_native_clutter_and_recomputes_id(self):
+        source = RadarClutterModel(
+            schema_version=1,
+            calibration_id="legacy",
+            profile_id=PROFILE_ID,
+            axes=RadarAxes(lateral_sign=-1),
+            range_bins=2,
+            azimuth_bins=2,
+            range_step_m=0.05,
+            motion_mode="major",
+            point_clusters=(
+                ClutterPointCluster(0.08, -0.03, 0.01, 0.025, 1.0),
+            ),
+            heatmap_median_db=(20.0, 30.0, 40.0, 50.0),
+            heatmap_mad_db=(1.0, 1.0, 1.0, 1.0),
+        )
+
+        corrected = reorient_clutter_model(
+            source,
+            RadarAxes(lateral_sign=1),
+        )
+
+        self.assertEqual(corrected.axes.lateral_sign, 1)
+        self.assertEqual(corrected.point_clusters[0].forward_m, 0.08)
+        self.assertEqual(corrected.point_clusters[0].lateral_m, 0.03)
+        self.assertEqual(corrected.heatmap_median_db, source.heatmap_median_db)
+        self.assertEqual(corrected.heatmap_mad_db, source.heatmap_mad_db)
+        self.assertRegex(corrected.calibration_id, r"^radar-clutter-[0-9a-f]{16}$")
+        self.assertNotEqual(corrected.calibration_id, source.calibration_id)
+
+    def test_resample_azimuth_preserves_matching_physical_fft_bins(self):
+        source = RadarClutterModel(
+            schema_version=1,
+            calibration_id="source",
+            profile_id="profile-32",
+            axes=RadarAxes(),
+            range_bins=2,
+            azimuth_bins=4,
+            range_step_m=0.05,
+            motion_mode="major",
+            point_clusters=(
+                ClutterPointCluster(0.08, 0.0, 0.0, 0.025, 1.0),
+            ),
+            heatmap_median_db=(10, 11, 12, 13, 20, 21, 22, 23),
+            heatmap_mad_db=(1, 2, 3, 4, 5, 6, 7, 8),
+        )
+
+        converted = resample_clutter_model_azimuth(
+            source,
+            target_azimuth_bins=2,
+            target_profile_id="profile-16-adc",
+        )
+
+        self.assertEqual(converted.azimuth_bins, 2)
+        self.assertEqual(converted.profile_id, "profile-16-adc")
+        self.assertEqual(converted.heatmap_median_db, (10, 12, 20, 22))
+        self.assertEqual(converted.heatmap_mad_db, (1, 3, 5, 7))
+        self.assertEqual(converted.point_clusters, source.point_clusters)
+        self.assertRegex(
+            converted.calibration_id,
+            r"^radar-clutter-[0-9a-f]{16}$",
+        )
+        self.assertEqual(
+            converted,
+            resample_clutter_model_azimuth(
+                source,
+                target_azimuth_bins=2,
+                target_profile_id="profile-16-adc",
+            ),
+        )
+
+    def test_resample_azimuth_rejects_non_integer_fft_ratio(self):
+        source = build_clutter_model(
+            synthetic_calibration_frames(),
+            RadarAxes(),
+        )
+        with self.assertRaisesRegex(ValueError, "integer divisor"):
+            resample_clutter_model_azimuth(
+                source,
+                target_azimuth_bins=3,
+                target_profile_id="profile-3",
+            )
+
     def assert_cluster_override_is_rejected(
         self,
         **override: float,

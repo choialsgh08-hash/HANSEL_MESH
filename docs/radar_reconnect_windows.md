@@ -66,7 +66,7 @@ New-Item -ItemType Directory -Force -Path configs\radar\calibrations
 
 python -m sensors radar-calibrate missions\radar-empty-scene.jsonl `
   --output configs\radar\calibrations\head-near-8hz.json `
-  --lateral-sign -1 `
+  --lateral-sign 1 `
   --min-frames 50
 ```
 
@@ -103,16 +103,16 @@ python -m sensors radar-live `
 python monitor\radar_front.py `
   --follow missions\radar-board-live.jsonl `
   --clutter-calibration configs\radar\calibrations\head-near-8hz.json `
-  --lateral-sign -1 `
+  --lateral-sign 1 `
   --max-range-m 3 `
   --history-window 0.3
 ```
 
 브라우저에서 `http://127.0.0.1:8081/`을 연다. 기존 탭은 `Ctrl+F5`로 새로 고친다.
-정상 화면에는 `UI R54`, `반지름 30cm 근접 주행 지도`, `ROBOT RELATIVE`,
-`0~30cm 충돌 확대`가 보인다.
+정상 화면에는 `UI R59`, `0~30cm 전방 조종 화면`, `ROBOT RELATIVE`,
+`CYAN = LIVE WALL RIDGE`, `YELLOW = STEERING GUIDE`가 보인다.
 
-주 지도와 충돌 확대창은 모두 붕괴 틈새 주행에 맞춰 30cm 이내를 표시한다.
+단일 주 지도는 붕괴 틈새 주행에 맞춰 전방 30cm 이내만 표시한다.
 빨강은 고정 클러터가 아닌 확인 포인트가 10cm 이하일 때만 허용된다. heatmap의
 가까운 bin과 missing return은 안전을 뜻하지 않으며, 어두운 영역은 `UNKNOWN`이다.
 

@@ -47,10 +47,10 @@ DEFAULT_PROFILE = (
 )
 DEFAULT_PROFILE_ID = (
     "lsdk-05.05.04.02-presence-nearwall-"
-    "heatmap32-elev4-cfar12-5hz-v4"
+    "heatmap16-adc2chirp-elev4-cfar12-5hz-v5"
 )
 DEFAULT_HEATMAP_RANGE_STEP_M = 0.05859375
-DEFAULT_HEATMAP_AZIMUTH_BINS = 32
+DEFAULT_HEATMAP_AZIMUTH_BINS = 16
 LEGACY_NEARWALL_PROFILE = (
     REPOSITORY_ROOT
     / "configs"
@@ -275,6 +275,9 @@ def _watchdog(
             heatmap_azimuth_bins=config.heatmap_azimuth_bins,
             heatmap_range_bins=config.heatmap_range_bins,
             heatmap_range_step_m=config.heatmap_range_step_m,
+            adc_samples_per_chirp=config.adc_samples_per_chirp,
+            adc_rx_channels=config.adc_rx_channels,
+            adc_chirps=config.adc_chirps,
         ),
         started_at_s=started_at_s,
         first_frame_timeout_s=config.first_frame_timeout_s,

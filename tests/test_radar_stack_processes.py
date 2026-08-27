@@ -107,7 +107,7 @@ class RadarStackProcessesTests(unittest.TestCase):
             create=True,
             return_value=SimpleNamespace(
                 calibration_id="radar-clutter-live-test",
-                axes=RadarAxes(lateral_sign=-1),
+                axes=RadarAxes(lateral_sign=1),
             ),
         )
         self.load_clutter_model = load_model_patcher.start()
@@ -124,7 +124,9 @@ class RadarStackProcessesTests(unittest.TestCase):
                 "--baud", "1250000", "--allow-elided-empty-point-tlv",
                 "--allow-nonzero-padding", "--heatmap-azimuth-bins", "16",
                 "--heatmap-range-bins", "128", "--heatmap-range-step-m",
-                "0.09765625", "--output", str(self.paths.mission),
+                "0.09765625", "--adc-samples-per-chirp", "256",
+                "--adc-rx-channels", "3", "--adc-chirps", "2",
+                "--output", str(self.paths.mission),
                 "--raw-output", str(self.paths.raw), "--raw-index",
                 str(self.paths.raw_index), "--mission-id",
                 "radar-board-live", "--profile-id",
@@ -133,7 +135,8 @@ class RadarStackProcessesTests(unittest.TestCase):
             ],
         )
         self.load_clutter_model.assert_called_once_with(
-            self.config.calibration_path
+            self.config.calibration_path,
+            axes=RadarAxes(),
         )
 
     def test_capture_calibration_loader_errors_fail_before_child_start(self):
@@ -161,7 +164,10 @@ class RadarStackProcessesTests(unittest.TestCase):
                             self.config,
                         )
 
-                loader.assert_called_once_with(self.config.calibration_path)
+                loader.assert_called_once_with(
+                    self.config.calibration_path,
+                    axes=RadarAxes(),
+                )
                 self.assertEqual(started, [])
 
     def test_viewer_command_follows_epoch_with_supervisor_settings(self):
@@ -179,11 +185,12 @@ class RadarStackProcessesTests(unittest.TestCase):
                 "--bind", "127.0.0.1", "--http-port", "8081",
                 "--max-range-m", "3", "--history-window", "0.3",
                 "--forward-axis", "y", "--forward-sign", "1",
-                "--lateral-axis", "x", "--lateral-sign", "-1", "--quiet",
+                "--lateral-axis", "x", "--lateral-sign", "1", "--quiet",
             ],
         )
         self.load_clutter_model.assert_called_once_with(
-            self.config.calibration_path
+            self.config.calibration_path,
+            axes=RadarAxes(),
         )
 
     def test_owned_commands_receive_parent_death_and_uart_handoff(self):
@@ -978,7 +985,7 @@ class RadarStackLauncherTests(unittest.TestCase):
         launcher = load_launcher()
         default_id = (
             "lsdk-05.05.04.02-presence-nearwall-"
-            "heatmap32-elev4-cfar12-5hz-v4"
+            "heatmap16-adc2chirp-elev4-cfar12-5hz-v5"
         )
         experimental_id = (
             "lsdk-05.05.04.02-presence-near-"
@@ -1155,10 +1162,10 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(
             config.profile_id,
             "lsdk-05.05.04.02-presence-nearwall-"
-            "heatmap32-elev4-cfar12-5hz-v4",
+            "heatmap16-adc2chirp-elev4-cfar12-5hz-v5",
         )
         self.assertEqual(config.heatmap_range_step_m, 0.05859375)
-        self.assertEqual(config.heatmap_azimuth_bins, 32)
+        self.assertEqual(config.heatmap_azimuth_bins, 16)
         self.assertEqual(config.data_baud, 1_250_000)
         self.assertEqual(config.http_bind, "127.0.0.1")
         self.assertIs(dependencies.port_provider, comports)
@@ -1214,9 +1221,12 @@ class RadarStackLauncherTests(unittest.TestCase):
             watchdog._expected,
             ExpectedRadarEvidence(
                 profile_id=config.profile_id,
-                heatmap_azimuth_bins=32,
+                heatmap_azimuth_bins=16,
                 heatmap_range_bins=128,
                 heatmap_range_step_m=0.05859375,
+                adc_samples_per_chirp=256,
+                adc_rx_channels=3,
+                adc_chirps=2,
             ),
         )
 
@@ -1400,8 +1410,8 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(
             loader.call_args_list,
             [
-                mock.call(config.calibration_path),
-                mock.call(config.calibration_path),
+                mock.call(config.calibration_path, axes=RadarAxes()),
+                mock.call(config.calibration_path, axes=RadarAxes()),
             ],
         )
         self.assertEqual(

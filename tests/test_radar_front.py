@@ -10,6 +10,7 @@ import unittest
 from urllib.request import urlopen
 
 from common.sensor_contract import (
+    RadarAdcSnapshot,
     RadarFrame,
     RadarHeatmap,
     RadarPoint,
@@ -44,6 +45,7 @@ def radar_frame(
     heatmap=None,
     producer_id="test-radar",
     calibration_id="radar-clutter-front-test",
+    adc_snapshot=None,
 ):
     return RadarFrame(
         header=SensorHeader(
@@ -68,6 +70,7 @@ def radar_frame(
         profile_id="test-profile",
         capture_baudrate=115200,
         heatmap=heatmap,
+        adc_snapshot=adc_snapshot,
     )
 
 
@@ -101,6 +104,33 @@ class FakeClock:
 
 
 class RadarFrontStateTests(unittest.TestCase):
+    def test_snapshot_exposes_phase_preserving_uart_adc_surface(self):
+        state = RadarFrontState(
+            "test", scene_estimator=calibrated_scene_estimator(),
+            clock=FakeClock(),
+        )
+        adc = RadarAdcSnapshot(
+            data=b"\x00\x00" * (256 * 3 * 2),
+            samples_per_chirp=256, rx_channels=3, chirps=2,
+            sample_bits=12, tlv_type=316,
+        )
+        heatmap = RadarHeatmap(
+            data=b"\x00" * 4, range_bins=2, azimuth_bins=2,
+            range_step_m=0.05, tlv_type=304, motion_mode="major",
+            floor_db=0.0, ceiling_db=1.0,
+        )
+        state.ingest(radar_frame([], heatmap=heatmap, adc_snapshot=adc))
+
+        payload = state.snapshot()["frame"]["adc_range_profile"]
+        self.assertEqual(payload["source"], "uart_last_chirp_pair_adc")
+        self.assertEqual(payload["direction_semantics"], "range_only")
+        self.assertEqual(payload["range_bins"], 128)
+        self.assertEqual(payload["values"], [0] * 128)
+        surface = state.snapshot()["scene"]["adc_range_angle_surface"]
+        self.assertEqual(surface["direction_semantics"], "range_azimuth")
+        self.assertEqual(surface["phase_calibration"], "evm_design_default")
+        self.assertFalse(surface["complete_frame_adc"])
+
     def test_radar_axes_is_reexported_from_common_geometry(self):
         self.assertIs(RadarAxes, CommonRadarAxes)
 
@@ -1197,7 +1227,7 @@ class RadarFrontDocumentationTests(unittest.TestCase):
         "python -m sensors radar-calibrate "
         "missions\\radar-empty-scene.jsonl `\n"
         "  --output configs\\radar\\calibrations\\head-near-8hz.json `\n"
-        "  --lateral-sign -1 `\n"
+        "  --lateral-sign 1 `\n"
         "  --min-frames 50"
     )
     VIEWER_COMMAND = (
@@ -1205,7 +1235,7 @@ class RadarFrontDocumentationTests(unittest.TestCase):
         "  --follow missions\\radar-board-live.jsonl `\n"
         "  --clutter-calibration "
         "configs\\radar\\calibrations\\head-near-8hz.json `\n"
-        "  --lateral-sign -1 `\n"
+        "  --lateral-sign 1 `\n"
         "  --max-range-m 3 `\n"
         "  --history-window 0.3"
     )
@@ -1225,7 +1255,7 @@ class RadarFrontDocumentationTests(unittest.TestCase):
             )
         }
 
-    def test_both_guides_document_the_calibrated_r54_contract(self):
+    def test_both_guides_document_the_full_heatmap_r56_contract(self):
         for name, docs in self.read_guides().items():
             with self.subTest(name=name):
                 self.assertIn(self.CALIBRATE_COMMAND, docs)
@@ -1350,7 +1380,7 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertEqual(payload["version"], 1)
             self.assertEqual(
                 payload["ui_build_id"],
-                "20260811-calibrated-contours-r54",
+                "20260826-turn-confidence-r75",
             )
             self.assertEqual(payload["frame"]["number"], 7)
             self.assertEqual(payload["scene"]["schema_version"], 1)
@@ -1365,11 +1395,11 @@ class RadarFrontHttpTests(unittest.TestCase):
             with urlopen(base + "/radar_scene.js", timeout=2) as response:
                 scene_javascript = response.read().decode("utf-8")
             self.assertIn(
-                "/radar_scene.js?v=20260811-calibrated-contours-r54",
+                "/radar_scene.js?v=20260826-turn-confidence-r75",
                 html,
             )
             self.assertIn(
-                "/radar_panel.js?v=20260811-calibrated-contours-r54",
+                "/radar_panel.js?v=20260826-turn-confidence-r75",
                 html,
             )
             self.assertIn(
@@ -1380,21 +1410,25 @@ class RadarFrontHttpTests(unittest.TestCase):
                 '#radar-status[data-status="http_lost"]',
                 html,
             )
-            self.assertIn('id="build-tag">UI R54</span>', html)
-            self.assertIn('class="tag">WHITE = STABLE REFLECTIVITY</span>', html)
-            self.assertIn('class="tag">CYAN = MEASURED WALLS</span>', html)
+            self.assertIn('id="build-tag">UI R75</span>', html)
+            self.assertIn('id="adc-status-value">--</dd>', html)
+            self.assertIn(
+                'class="tag">GRAY = FULL RANGE-AZIMUTH EVIDENCE</span>',
+                html,
+            )
+            self.assertIn(
+                'class="tag">CYAN = REPEATED REFLECTION</span>', html,
+            )
+            self.assertIn(
+                'class="tag">YELLOW = LOW-REFLECTION ROUTE</span>',
+                html,
+            )
             self.assertIn(
                 'id="ground-filter-tag">SENSOR 6.5cm / PITCH 0.0deg / GROUND HIDDEN</span>',
                 html,
             )
-            self.assertIn(
-                'class="tag">SMOOTH PATH · 1cm · CONFIDENCE</span>',
-                html,
-            )
-            self.assertIn("1cm PATH", html)
             self.assertIn("ROBOT 15cm · MARGIN 3cm", html)
-            self.assertIn("5cm PROBABILITY", html)
-            self.assertIn("1s DECAY · 2.5s TTL", html)
+            self.assertIn("RED = STOP WITHIN 10cm", html)
             self.assertIn("±60° TRUSTED FOV", html)
             self.assertNotIn("AZIMUTH ONLY", html)
             self.assertIn(
@@ -1406,7 +1440,7 @@ class RadarFrontHttpTests(unittest.TestCase):
                 html,
             )
             self.assertIn(
-                'const UI_BUILD_ID = "20260811-calibrated-contours-r54";',
+                'const UI_BUILD_ID = "20260826-turn-confidence-r75";',
                 javascript,
             )
             self.assertIn(
@@ -1448,8 +1482,8 @@ class RadarFrontHttpTests(unittest.TestCase):
                 "path-accepted-value",
             ):
                 self.assertIn(f'id="{diagnostic_id}"', html)
-            self.assertIn("반지름 30cm 근접 주행 지도", html)
-            self.assertIn("0~30cm 충돌 확대", html)
+            self.assertIn("0~30cm 전방 조종 화면", html)
+            self.assertIn("0~30cm 충돌·반사·경로", html)
             self.assertIn("UNKNOWN ≠ FREE", html)
             self.assertIn("ROBOT RELATIVE · SHORT MEMORY", html)
             self.assertIn("RAW DEBUG · 표시 전용", html)
@@ -1463,21 +1497,26 @@ class RadarFrontHttpTests(unittest.TestCase):
             collision_tag = html[
                 collision_start : html.index(">", collision_start) + 1
             ]
-            self.assertNotIn("hidden", collision_tag)
+            self.assertIn("hidden", collision_tag)
+            pointcloud_start = html.index('<section id="pointcloud-3d-panel"')
+            pointcloud_tag = html[
+                pointcloud_start : html.index(">", pointcloud_start) + 1
+            ]
+            self.assertIn("hidden", pointcloud_tag)
             self.assertIn("/radar_scene.js", html)
             self.assertIn("fullscreen-button", html)
             self.assertIn("HanselRadarPanel", javascript)
             self.assertIn("HanselRadarScene.parseRadarScene", javascript)
             self.assertIn("drawLidarTopView", javascript)
             self.assertIn("drawCollisionInset", javascript)
-            self.assertIn("drawPointCloud25d", javascript)
+            self.assertIn("drawOperatorReturns", javascript)
+            self.assertIn("drawOperatorGuide", javascript)
             self.assertIn("scene.referenceTracks", javascript)
             self.assertIn("referenceTracks", scene_javascript)
             self.assertIn("drawRangeGuideArc", javascript)
             self.assertIn("clipToMapBoundary", javascript)
             self.assertIn("cellIntersectsRadialLimit", javascript)
-            self.assertIn('clipShape: "radial"', javascript)
-            self.assertIn('clipShape: "radial"', javascript)
+            self.assertIn('clipShape: "fov"', javascript)
             self.assertIn(
                 "nearestConfirmedPoint("
                 "presentation, CLOSE_MAX_RANGE_M",

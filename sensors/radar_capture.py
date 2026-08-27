@@ -62,6 +62,9 @@ class RadarCaptureStats:
     heatmap_azimuth_bins: Optional[int] = None
     heatmap_range_bins: Optional[int] = None
     heatmap_range_step_m: Optional[float] = None
+    adc_frames: int = 0
+    missing_adc_frames: int = 0
+    adc_bytes_decoded: int = 0
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,7 @@ class _HealthFaultSnapshot:
     incomplete_frames: int = 0
     missing_point_tlv_frames: int = 0
     missing_heatmap_frames: int = 0
+    missing_adc_frames: int = 0
     writer_drops: int = 0
     radar_frame_gaps: int = 0
     device_discontinuities: int = 0
@@ -247,6 +251,9 @@ def capture_radar_uart(
     heatmap_azimuth_bins: Optional[int] = None,
     heatmap_range_bins: Optional[int] = None,
     heatmap_range_step_m: Optional[float] = None,
+    adc_samples_per_chirp: Optional[int] = None,
+    adc_rx_channels: Optional[int] = None,
+    adc_chirps: Optional[int] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> RadarCaptureStats:
     """Capture an already-running TI demo stream.
@@ -418,6 +425,9 @@ def capture_radar_uart(
             heatmap_azimuth_bins=heatmap_azimuth_bins,
             heatmap_range_bins=heatmap_range_bins,
             heatmap_range_step_m=heatmap_range_step_m,
+            adc_samples_per_chirp=adc_samples_per_chirp,
+            adc_rx_channels=adc_rx_channels,
+            adc_chirps=adc_chirps,
         )
     )
 
@@ -436,6 +446,9 @@ def capture_radar_uart(
     minor_heatmap_frames = 0
     missing_heatmap_frames = 0
     heatmap_cells_decoded = 0
+    adc_frames = 0
+    missing_adc_frames = 0
+    adc_bytes_decoded = 0
     radar_frame_gaps = 0
     device_discontinuities = 0
     writer_drops = 0
@@ -495,6 +508,7 @@ def capture_radar_uart(
                             missing_point_tlv_frames
                         ),
                         missing_heatmap_frames=missing_heatmap_frames,
+                        missing_adc_frames=missing_adc_frames,
                         writer_drops=writer_drops,
                         radar_frame_gaps=radar_frame_gaps,
                         device_discontinuities=device_discontinuities,
@@ -578,6 +592,11 @@ def capture_radar_uart(
                             f"{missing_heatmap_frames},"
                             "heatmap_cells_decoded="
                             f"{heatmap_cells_decoded},"
+                            f"adc_frames={adc_frames},"
+                            "adc_expected="
+                            f"{str(adc_samples_per_chirp is not None).lower()},"
+                            f"missing_adc_frames={missing_adc_frames},"
+                            f"adc_bytes_decoded={adc_bytes_decoded},"
                             "nonzero_padding_frames="
                             f"{nonzero_padding_frames},"
                             "missing_point_tlv_frames="
@@ -740,6 +759,12 @@ def capture_radar_uart(
                                     major_heatmap_frames += 1
                                 else:
                                     minor_heatmap_frames += 1
+                            if frame.adc_samples is None:
+                                if adc_samples_per_chirp is not None:
+                                    missing_adc_frames += 1
+                            else:
+                                adc_frames += 1
+                                adc_bytes_decoded += len(frame.adc_samples.data)
                             if frame.complete:
                                 complete_frames += 1
                             else:
@@ -867,6 +892,9 @@ def capture_radar_uart(
             if heatmap_range_step_m is None
             else float(heatmap_range_step_m)
         ),
+        adc_frames=adc_frames,
+        missing_adc_frames=missing_adc_frames,
+        adc_bytes_decoded=adc_bytes_decoded,
     )
 
 

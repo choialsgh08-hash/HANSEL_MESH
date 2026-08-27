@@ -1,10 +1,13 @@
+import base64
 import json
+import struct
 import unittest
 
 from common.sensor_contract import (
     DropEvent,
     ImuSample,
     RadarFrame,
+    RadarAdcSnapshot,
     RadarHeatmap,
     RadarPoint,
     SensorHeader,
@@ -56,6 +59,14 @@ class SensorContractTests(unittest.TestCase):
                     motion_mode="major",
                     floor_db=10.0,
                     ceiling_db=50.0,
+                ),
+                adc_snapshot=RadarAdcSnapshot(
+                    data=struct.pack("<12h", *range(-6, 6)),
+                    samples_per_chirp=2,
+                    rx_channels=3,
+                    chirps=2,
+                    sample_bits=12,
+                    tlv_type=316,
                 ),
             ),
             ImuSample(
@@ -158,6 +169,30 @@ class SensorContractTests(unittest.TestCase):
         wire["payload"]["heatmap"]["data_base64"] = "***"
         with self.assertRaisesRegex(ValueError, "valid base64"):
             decode_sensor_record(json.dumps(wire).encode("utf-8"))
+
+    def test_adc_snapshot_bytes_use_base64_and_round_trip_strictly(self):
+        record = self.records()[0]
+        encoded = encode_sensor_record(record)
+        wire = json.loads(encoded)
+
+        self.assertEqual(
+            wire["payload"]["adc_snapshot"]["data_base64"],
+            base64.b64encode(record.adc_snapshot.data).decode("ascii"),
+        )
+        self.assertEqual(decode_sensor_record(encoded), record)
+
+        wire["payload"]["adc_snapshot"]["data_base64"] = "***"
+        with self.assertRaisesRegex(ValueError, "valid base64"):
+            decode_sensor_record(json.dumps(wire).encode("utf-8"))
+        with self.assertRaisesRegex(ValueError, "data length"):
+            RadarAdcSnapshot(
+                data=b"\x00\x00",
+                samples_per_chirp=2,
+                rx_channels=3,
+                chirps=2,
+                sample_bits=12,
+                tlv_type=316,
+            )
 
     def test_anchor_updated_requires_keyframe_pose_and_covariance(self):
         with self.assertRaisesRegex(ValueError, "anchor_updated requires"):

@@ -152,6 +152,49 @@ class TiMmwaveTests(unittest.TestCase):
         self.assertEqual(parsed.heatmap.floor_db, 0.0)
         self.assertEqual(parsed.heatmap.ceiling_db, 1.0)
 
+    def test_uart_adc_tlv_is_explicit_opt_in_and_preserves_signed_samples(self):
+        units = struct.pack("<4f2H", 0.01, 0.1, 0.5, 1.0, 0, 0)
+        samples = tuple(range(-6, 6))
+        payload = struct.pack("<12h", *samples)
+        raw = packet([(301, units), (316, payload)], 0)
+
+        legacy = TiMmwavePacketParser().parse_packet(raw)
+        parsed = TiMmwavePacketParser(
+            adc_samples_per_chirp=2,
+            adc_rx_channels=3,
+            adc_chirps=2,
+        ).parse_packet(raw)
+
+        self.assertIsNone(legacy.adc_samples)
+        self.assertIn((316, len(payload)), legacy.unknown_tlvs)
+        self.assertEqual(parsed.adc_samples.data, payload)
+        self.assertEqual(parsed.adc_samples.samples_per_chirp, 2)
+        self.assertEqual(parsed.adc_samples.rx_channels, 3)
+        self.assertEqual(parsed.adc_samples.chirps, 2)
+        sensor_record = parsed.to_sensor_record(
+            SensorHeader(
+                mission_id="mission-1", unit_id="head", boot_id="boot-1",
+                producer_id="producer-1", stream_id="radar/front", seq=1,
+                monotonic_ns=1,
+            )
+        )
+        self.assertEqual(sensor_record.adc_snapshot.data, payload)
+
+    def test_uart_adc_shape_and_duplicate_tlvs_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            TiMmwavePacketParser(adc_samples_per_chirp=256)
+        parser = TiMmwavePacketParser(
+            adc_samples_per_chirp=2,
+            adc_rx_channels=3,
+            adc_chirps=2,
+        )
+        with self.assertRaisesRegex(TiMmwaveParseError, "ADC sample size"):
+            parser.parse_packet(packet([(316, b"\x00" * 22)], 0))
+        with self.assertRaisesRegex(TiMmwaveParseError, "multiple ADC"):
+            parser.parse_packet(packet([
+                (316, b"\x00" * 24), (316, b"\x00" * 24),
+            ], 0))
+
     def test_heatmap_configuration_and_shape_are_strict(self):
         with self.assertRaisesRegex(ValueError, "supplied together"):
             TiMmwavePacketParser(heatmap_azimuth_bins=4)

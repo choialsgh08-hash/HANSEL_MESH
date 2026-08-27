@@ -66,6 +66,35 @@ class CalibratedContourEstimatorTests(unittest.TestCase):
 
         self.assertEqual(len(estimator.payload()["segments"]), 2)
 
+    def test_parallel_radial_ridges_on_the_same_angles_are_both_retained(self):
+        observations = [
+            *(
+                sample(index, 2, prominence_db=3.0)
+                for index in range(12, 18)
+            ),
+            *(
+                sample(index, 4, prominence_db=4.0)
+                for index in range(12, 18)
+            ),
+        ]
+        estimator = CalibratedContourEstimator()
+
+        for _ in range(3):
+            estimator.ingest(observations)
+
+        payload = estimator.payload()
+        self.assertEqual(payload["status"], "confirmed")
+        self.assertEqual(len(payload["segments"]), 2)
+        ranges = sorted(
+            math.hypot(
+                (segment["start"][0] + segment["end"][0]) / 2.0,
+                (segment["start"][1] + segment["end"][1]) / 2.0,
+            )
+            for segment in payload["segments"]
+        )
+        self.assertAlmostEqual(ranges[0], 2 * RANGE_STEP_M, delta=0.01)
+        self.assertAlmostEqual(ranges[1], 4 * RANGE_STEP_M, delta=0.01)
+
     def test_one_bin_corner_is_two_surfaces_not_a_bridging_diagonal(self):
         observations = [
             *(sample(index, 3) for index in range(18, 22)),
