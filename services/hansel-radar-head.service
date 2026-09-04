@@ -1,0 +1,20 @@
+[Unit]
+Description=HANSEL Head IWRL6432 radar and BATMAN viewer API
+Requires=hansel-mesh@head.service
+After=hansel-mesh@head.service
+PartOf=hansel-mesh@head.service
+
+[Service]
+Type=simple
+User=hansel
+SupplementaryGroups=dialout
+WorkingDirectory=/home/hansel/HANSEL_MESH
+EnvironmentFile=-/etc/hansel-mesh/radar-head.env
+ExecStart=/home/hansel/HANSEL_MESH/scripts/start_head_radar_mesh.sh
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

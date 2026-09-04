@@ -1,13 +1,14 @@
 import json
 import base64
 import contextlib
+import gzip
 import io
 from pathlib import Path
 import tempfile
 import threading
 import time
 import unittest
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from common.sensor_contract import (
     RadarAdcSnapshot,
@@ -1552,6 +1553,30 @@ class RadarFrontHttpTests(unittest.TestCase):
             self.assertNotIn("https://", html)
             self.assertNotIn("https://", javascript)
             self.assertNotIn("https://", scene_javascript)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(1.0)
+
+    def test_api_uses_gzip_when_the_mesh_client_accepts_it(self):
+        state = RadarFrontState("test")
+        state.ingest(radar_frame([]))
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            build_handler(state, quiet=True),
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = Request(
+                f"http://127.0.0.1:{server.server_port}/api/radar",
+                headers={"Accept-Encoding": "gzip"},
+            )
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(response.headers["Content-Encoding"], "gzip")
+                payload = json.loads(gzip.decompress(response.read()))
+            self.assertEqual(payload["version"], 1)
+            self.assertEqual(payload["frame"]["number"], 7)
         finally:
             server.shutdown()
             server.server_close()

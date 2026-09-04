@@ -72,10 +72,10 @@ sudo batctl o
 
 ## IWRL6432BOOST 근거리 레이더 지도 (R31)
 
-Windows PC에 TI IWRL6432BOOST를 USB로 직접 연결해 사용하는 로봇 상대 근거리
-레이더 화면이다. ROS는 사용하지 않는다. Application/User UART에서 Point Cloud와
-Range-Azimuth Heatmap을 약 8Hz로 받고, 브라우저에서 2D 롤링 지도와 3D Point
-Cloud를 함께 표시한다.
+TI IWRL6432BOOST의 Application/User UART에서 Point Cloud와 Range-Azimuth Heatmap을
+받아 브라우저에서 2D 롤링 지도와 3D Point Cloud를 함께 표시한다. Windows PC 직결
+시험과 Head Raspberry Pi 수집을 모두 지원한다. Head 운용에서는 경로와 장애물 상태를
+`192.168.50.10:8081`에 제공하고 구조자 PC가 BATMAN-adv 경로로 조회해 렌더링한다.
 
 현재 구현의 목표는 SLAM이나 세계 좌표 지도를 만드는 것이 아니라, 움직이는
 레이더를 기준으로 반지름 50cm 안의 강한 장애물 증거를 유지하면서 로봇이 당장
@@ -117,7 +117,26 @@ Cloud를 함께 표시한다.
 아래쪽은 파란색, 레이더 높이와 가까운 포인트는 흰색/청록색으로 그린다. 3D 창의
 포인트는 완성된 물체 표면이 아니라 레이더가 실제로 받은 희소 반사점이다.
 
-### Windows에서 실행
+### Head에서 수집하고 PC에서 보기
+
+레이더를 Head Pi에 USB로 연결한 뒤 다음을 실행한다.
+
+```bash
+cd ~/HANSEL_MESH
+bash scripts/start_head_radar_mesh.sh configs/radar/head_mesh.env.example
+```
+
+구조자 PC는 Base와 유선 연결하고 메시 경로를 설정한 뒤 실행한다.
+
+```bash
+sudo ./scripts/setup_laptop_mesh_routes.sh <PC의-유선-인터페이스>
+./scripts/open_radar_mesh_view.sh
+```
+
+전체 설치, 서비스 등록, 검증 및 장애 해결 절차는
+[Head Radar over BATMAN Runbook](docs/radar_mesh_head_runbook.md)을 따른다.
+
+### Windows에서 직접 실행
 
 보드가 연결되면 장치 관리자에서 다음 두 포트가 보여야 한다.
 

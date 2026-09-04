@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
@@ -1108,7 +1109,12 @@ def build_handler(
                     separators=(",", ":"),
                     allow_nan=False,
                 ).encode("utf-8")
-                self._send(200, "application/json; charset=utf-8", payload)
+                self._send(
+                    200,
+                    "application/json; charset=utf-8",
+                    payload,
+                    compress=True,
+                )
                 return
             static = static_files.get(path)
             if static is None:
@@ -1135,13 +1141,25 @@ def build_handler(
             status: int,
             content_type: str,
             payload: bytes,
+            compress: bool = False,
         ) -> None:
+            content_encoding = None
+            if (
+                compress
+                and len(payload) >= 1024
+                and "gzip" in self.headers.get("Accept-Encoding", "").lower()
+            ):
+                payload = gzip.compress(payload, compresslevel=1, mtime=0)
+                content_encoding = "gzip"
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            if content_encoding is not None:
+                self.send_header("Content-Encoding", content_encoding)
+                self.send_header("Vary", "Accept-Encoding")
             self.end_headers()
             self.wfile.write(payload)
 

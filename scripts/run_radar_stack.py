@@ -129,6 +129,13 @@ def _http_port(value: str) -> int:
     return parsed
 
 
+def _http_bind(value: str) -> str:
+    parsed = value.strip()
+    if not parsed:
+        raise argparse.ArgumentTypeError("must not be empty")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -188,6 +195,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
     )
     parser.add_argument("--retry-max", type=_positive_float, default=5.0)
+    parser.add_argument(
+        "--http-bind",
+        type=_http_bind,
+        default="127.0.0.1",
+        help=(
+            "viewer bind address; use the Head bat0 address (normally "
+            "192.168.50.10) for mesh access"
+        ),
+    )
     parser.add_argument("--http-port", type=_http_port, default=8081)
     return parser
 
@@ -396,6 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         verification_frames=args.verify_frames,
         retry_initial_s=args.retry_initial,
         retry_max_s=args.retry_max,
+        http_bind=args.http_bind,
         http_port=args.http_port,
     )
     dependencies = RadarSupervisorDependencies(

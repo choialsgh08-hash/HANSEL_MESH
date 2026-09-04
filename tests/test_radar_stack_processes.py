@@ -960,6 +960,7 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(args.first_frame_timeout, 3.0)
         self.assertEqual(args.verification_timeout, 8.0)
         self.assertEqual(args.verify_frames, 30)
+        self.assertEqual(args.http_bind, "127.0.0.1")
         self.assertEqual(args.http_port, 8081)
         self.assertIsNone(args.profile_id)
         self.assertEqual(
@@ -1045,6 +1046,7 @@ class RadarStackLauncherTests(unittest.TestCase):
             ("--verify-frames", "0"),
             ("--retry-initial", "-0.5"),
             ("--retry-max", "0"),
+            ("--http-bind", "   "),
             ("--http-port", "0"),
             ("--http-port", "65536"),
         )
@@ -1147,6 +1149,8 @@ class RadarStackLauncherTests(unittest.TestCase):
                         str(calibration),
                         "--output-root",
                         str(output),
+                        "--http-bind",
+                        "192.168.50.10",
                     ]
                 )
 
@@ -1167,7 +1171,7 @@ class RadarStackLauncherTests(unittest.TestCase):
         self.assertEqual(config.heatmap_range_step_m, 0.05859375)
         self.assertEqual(config.heatmap_azimuth_bins, 16)
         self.assertEqual(config.data_baud, 1_250_000)
-        self.assertEqual(config.http_bind, "127.0.0.1")
+        self.assertEqual(config.http_bind, "192.168.50.10")
         self.assertIs(dependencies.port_provider, comports)
         self.assertIsInstance(dependencies.processes, RadarStackProcesses)
         self.assertIs(dependencies.monotonic, launcher.time.monotonic)

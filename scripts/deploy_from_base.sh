@@ -132,6 +132,9 @@ test -f scripts/start_camera_service.sh
 test -f scripts/start_control_server.sh
 test -f scripts/start_metrics_agent.sh
 test -f scripts/start_role_network.sh
+test -f scripts/start_head_radar_mesh.sh
+test -f scripts/open_radar_mesh_view.sh
+test -f scripts/enable_head_radar_service.sh
 test -f scripts/enable_mesh_autostart.sh
 test -f requirements-rpi.txt
 test -f requirements-sensors.txt
@@ -139,6 +142,10 @@ test -f services/hansel-camera.service
 test -f services/hansel-control@.service
 test -f services/hansel-mesh@.service
 test -f services/hansel-metrics@.service
+test -f services/hansel-radar-head.service
+test -f configs/radar/head_mesh.env.example
+test -f monitor/radar_front.py
+test -f sensors/ti_radar_control.py
 test -d monitor
 
 echo "[4/8] Building a tracked-only archive of the exact commit..."
@@ -264,12 +271,16 @@ for target in $TARGETS; do
 
     ssh "${SSH_OPTIONS[@]}" "$REMOTE_USER@$target" \
         "cd '$REPO_DIR' &&
-         chmod 0755 scripts/start_camera_service.sh scripts/start_control_server.sh scripts/start_metrics_agent.sh scripts/start_role_network.sh &&
+         chmod 0755 scripts/start_camera_service.sh scripts/start_control_server.sh scripts/start_metrics_agent.sh scripts/start_role_network.sh scripts/start_head_radar_mesh.sh scripts/open_radar_mesh_view.sh scripts/enable_head_radar_service.sh &&
          test -x scripts/start_camera_service.sh &&
          test -x scripts/start_control_server.sh &&
          test -x scripts/start_metrics_agent.sh &&
          test -x scripts/start_role_network.sh &&
-         python3 -m py_compile common/control_protocol.py common/sensor_contract.py robot/motor_driver.py robot/mesh_control_server.py controller/mesh_control_client.py &&
+         test -x scripts/start_head_radar_mesh.sh &&
+         test -x scripts/open_radar_mesh_view.sh &&
+         test -x scripts/enable_head_radar_service.sh &&
+         bash -n scripts/start_head_radar_mesh.sh scripts/open_radar_mesh_view.sh scripts/enable_head_radar_service.sh &&
+         python3 -m py_compile common/control_protocol.py common/sensor_contract.py robot/motor_driver.py robot/mesh_control_server.py controller/mesh_control_client.py monitor/radar_front.py scripts/run_radar_stack.py &&
          python3 -c 'import common.control_protocol, common.sensor_contract, robot.mesh_control_server, controller.mesh_control_client' &&
          printf '%s\n' '$DEPLOY_REVISION' > .hansel-deployed-revision"
     echo "[OK] $target deployed and import-verified"
