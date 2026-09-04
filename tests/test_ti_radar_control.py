@@ -93,6 +93,43 @@ class TiRadarControlTest(unittest.TestCase):
         )
         self.assertEqual(selected.location, "1-3:x.0")
 
+    def test_select_application_port_accepts_linux_xds110_interface_zero(self):
+        linux_application = SimpleNamespace(
+            device="/dev/ttyACM0",
+            vid=0x0451,
+            pid=0xBEF3,
+            serial_number="RI32RI32",
+            description="XDS110 (03.00.00.43) Embed with CMSIS-DAP",
+            location="1-1.4:1.0",
+        )
+        linux_auxiliary = SimpleNamespace(
+            **{
+                **linux_application.__dict__,
+                "device": "/dev/ttyACM1",
+                "location": "1-1.4:1.3",
+            }
+        )
+
+        selected = select_application_port(
+            [linux_auxiliary, linux_application],
+            xds_serial="RI32RI32",
+        )
+
+        self.assertEqual(selected.device, "/dev/ttyACM0")
+
+    def test_select_application_port_rejects_linux_xds110_interface_three(self):
+        linux_auxiliary = SimpleNamespace(
+            device="/dev/ttyACM1",
+            vid=0x0451,
+            pid=0xBEF3,
+            serial_number="RI32RI32",
+            description="XDS110 (03.00.00.43) Embed with CMSIS-DAP",
+            location="1-1.4:1.3",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Application/User"):
+            select_application_port([linux_auxiliary], xds_serial="RI32RI32")
+
     def test_find_xds110_reset_prefers_existing_explicit_path(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -67,9 +67,11 @@ python3 -c "import serial; print(serial.__version__)"
 ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 ```
 
-자동 탐색은 TI VID/PID와 `Application/User UART`를 우선한다. 여러 XDS110이 연결돼
+자동 탐색은 TI VID/PID와 `Application/User UART`를 우선한다. Linux에서 두 포트가
+모두 일반 `XDS110`으로 표시되면 USB 인터페이스 위치가 `.0`인 `/dev/ttyACM*`를
+Application UART로 선택하고 `.3`인 Auxiliary 포트는 거부한다. 여러 XDS110이 연결돼
 있으면 `/etc/hansel-mesh/radar-head.env`의 `RADAR_XDS_SERIAL` 또는
-`RADAR_SERIAL_PORT`를 지정한다. Auxiliary Data Port를 데이터 포트로 선택하면 안 된다.
+`RADAR_SERIAL_PORT`를 지정한다.
 
 ## 4. 프로필과 캘리브레이션
 
@@ -114,7 +116,7 @@ bash scripts/start_head_radar_mesh.sh configs/radar/head_mesh.env.example
 자동 탐색이 틀리면 포트를 명시한다.
 
 ```bash
-RADAR_SERIAL_PORT=/dev/ttyACM1 bash scripts/start_head_radar_mesh.sh
+RADAR_SERIAL_PORT=/dev/ttyACM0 bash scripts/start_head_radar_mesh.sh
 ```
 
 ### Base

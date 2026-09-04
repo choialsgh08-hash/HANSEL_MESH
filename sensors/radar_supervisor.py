@@ -23,6 +23,7 @@ from sensors.radar_owner_lock import (
 from sensors.radar_watchdog import RadarWatchdogSnapshot
 from sensors.ti_radar_control import (
     RadarPortIdentity,
+    is_xds110_application_port,
     load_commands,
     select_application_port,
     validate_profile_result,
@@ -869,11 +870,9 @@ class RadarSupervisor:
                 0xBEF3,
             ):
                 continue
-            if "Application/User UART" not in description:
+            if not is_xds110_application_port(device, description, location):
                 continue
-            if "Auxiliary" in description:
-                continue
-            if location.casefold().endswith(".3") or not serial_number:
+            if not serial_number:
                 continue
             if target_serial is not None and serial_number != target_serial:
                 continue

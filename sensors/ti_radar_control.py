@@ -35,6 +35,25 @@ def _port_metadata_text(value: object) -> str:
     return "" if value is None else str(value).strip()
 
 
+def is_xds110_application_port(
+    device: str,
+    description: str,
+    location: str,
+) -> bool:
+    """Recognize the XDS110 Application UART on Windows and Linux."""
+    description_folded = description.casefold()
+    location_folded = location.casefold()
+    if "auxiliary" in description_folded or location_folded.endswith(".3"):
+        return False
+    if "application/user uart" in description_folded:
+        return True
+    return (
+        device.startswith("/dev/ttyACM")
+        and "xds110" in description_folded
+        and location_folded.endswith(".0")
+    )
+
+
 def select_application_port(
     ports: Iterable[object],
     explicit_port: str | None = None,
@@ -53,11 +72,7 @@ def select_application_port(
         location = _port_metadata_text(getattr(port, "location", ""))
         if (vid, pid) != (0x0451, 0xBEF3):
             continue
-        if "Application/User UART" not in description:
-            continue
-        if "Auxiliary" in description:
-            continue
-        if location.casefold().endswith(".3"):
+        if not is_xds110_application_port(device, description, location):
             continue
         if not serial_number:
             continue
