@@ -1,0 +1,25 @@
+/* Compact only the embedded operator view; keep its renderer and warnings. */
+html, body { height: 100%; min-height: 0; overflow: hidden; letter-spacing: 0; }
+body { background: #02070a; }
+.shell { width: 100%; height: 100dvh; min-height: 0; padding: 10px; gap: 8px; grid-template-rows: auto auto minmax(0, 1fr) auto; }
+.page-header { min-height: 24px; justify-content: flex-end; gap: 8px; }
+.page-header .brand { display: none; }
+.header-status { flex-wrap: wrap; gap: 5px; }
+.radar-source-label { color: #f9df84; border: 1px solid #a59768; padding: 5px 7px; font: 600 10px system-ui; }
+#radar-mode, #radar-status { padding: 6px 8px; font-size: 9px; letter-spacing: 0; }
+.warning { padding: 7px 8px; min-height: 32px; font-size: 11px; line-height: 1.4; }
+.workspace { display: block; min-height: 0; height: 100%; }
+.workspace > aside { display: none; }
+.radar-stage { display: block; height: 100%; min-height: 0; width: 100%; padding: 0; overflow: hidden; box-shadow: none; border-radius: 0; }
+#radar-main-canvas { position: absolute; inset: 0; height: 100%; width: 100%; }
+.stage-tags { top: 8px; left: 8px; gap: 4px; max-width: calc(100% - 16px); }
+.stage-tags .tag { display: none; letter-spacing: 0; }
+.stage-tags #axis-warning { display: block; font-size: 9px; }
+.sector-strip { position: absolute; padding: 0; gap: 3px; inset: auto 5px 5px; }
+.sector { padding: 5px 2px; min-width: 0; }
+.sector b, .sector span { font-size: 8px; letter-spacing: 0; overflow-wrap: anywhere; }
+.shell > footer { display: block; padding: 0; font-size: 10px; line-height: 1.4; }
+.shell > footer > span + span { display: none; }
+.radar-offline { color-scheme: light; color: #506461; background: #f5f7f7; margin: 0; padding: 24px; display: grid; place-content: center; font: 14px system-ui, sans-serif; text-align: center; }
+.radar-offline h1 { font-size: 17px; font-weight: 600; }
+.radar-offline p { max-width: 300px; line-height: 1.7; font-size: 12px; }

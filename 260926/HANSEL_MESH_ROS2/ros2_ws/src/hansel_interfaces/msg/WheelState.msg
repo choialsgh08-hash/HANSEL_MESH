@@ -1,0 +1,13 @@
+builtin_interfaces/Time stamp
+string command
+float32 target_left_cps
+float32 target_right_cps
+float32 actual_left_cps
+float32 actual_right_cps
+float32 target_left_rpm
+float32 target_right_rpm
+float32 actual_left_rpm
+float32 actual_right_rpm
+float32 pwm_left
+float32 pwm_right
+bool drive_enabled

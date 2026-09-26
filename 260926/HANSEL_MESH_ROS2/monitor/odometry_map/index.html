@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HANSEL | Radar &amp; Trajectory</title>
+  <link rel="stylesheet" href="/map.css">
+  <script src="/map.js" defer></script>
+</head>
+<body>
+<svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/></symbol>
+  <symbol id="upload" viewBox="0 0 24 24"><path d="M12 16V4m-5 5 5-5 5 5M5 16v5h14v-5"/></symbol>
+  <symbol id="fit" viewBox="0 0 24 24"><path d="M4 9V4h5m6 0h5v5M4 15v5h5m6 0h5v-5"/></symbol>
+  <symbol id="target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3"/></symbol>
+  <symbol id="reload" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></symbol>
+</svg>
+<div class="app">
+  <header class="topbar">
+    <div class="brand"><strong>HANSEL</strong><span>Radar &amp; Trajectory</span></div>
+    <div class="top-actions">
+      <span id="status" class="status waiting" role="status">Connecting</span>
+      <button id="live" hidden>Back to live</button>
+      <button id="import" class="icon" title="Open map snapshot" aria-label="Open map snapshot"><svg><use href="#upload"/></svg></button>
+      <button id="export" class="icon" title="Download map snapshot (JSON)" aria-label="Download map snapshot (JSON)" disabled><svg><use href="#download"/></svg></button>
+      <input id="file" type="file" accept=".json,application/json" hidden>
+    </div>
+  </header>
+  <section class="metrics" aria-label="Head pose">
+    <div><span>X <small>m</small></span><strong id="x">--</strong></div>
+    <div><span>Y <small>m</small></span><strong id="y">--</strong></div>
+    <div><span>Heading <small>deg</small></span><strong id="yaw">--</strong></div>
+    <div><span>Retained path <small>m</small></span><strong id="distance">--</strong></div>
+    <span class="estimate-tag">PROVISIONAL</span>
+  </section>
+  <main class="split-maps">
+    <section class="radar-pane" aria-label="Radar route">
+      <header class="pane-heading"><h1>Radar Route</h1><span>Robot-relative</span><button id="radar-reload" class="icon" title="Reload radar view" aria-label="Reload radar view"><svg><use href="#reload"/></svg></button></header>
+      <iframe id="radar-frame" title="Existing HANSEL radar route" allow="fullscreen" src="/radar/"></iframe>
+    </section>
+    <section class="trajectory-pane" aria-label="Accumulated trajectory">
+      <header class="pane-heading"><h2>Accumulated Trajectory</h2><span>Odometry</span></header>
+    <section class="map-area" aria-label="Relative odometry map">
+      <canvas id="map" tabindex="0" aria-label="Head trajectory and relay estimates. Positive X points up, positive Y points left."></canvas>
+      <div class="map-label"><span id="frame">odom</span><span>+X up / +Y left</span></div>
+      <div class="map-controls">
+        <button id="zoom-in" class="icon" title="Zoom in" aria-label="Zoom in">+</button>
+        <button id="zoom-out" class="icon" title="Zoom out" aria-label="Zoom out">-</button>
+        <button id="fit-view" class="icon" title="Fit path and origin" aria-label="Fit path and origin"><svg><use href="#fit"/></svg></button>
+        <button id="follow" class="icon" title="Follow Head" aria-label="Follow Head" aria-pressed="false"><svg><use href="#target"/></svg></button>
+      </div>
+      <div id="empty" class="empty" role="status"><strong>Waiting for odometry</strong><span>/hansel/head/odometry</span></div>
+      <span id="mode-banner" class="mode-banner" hidden>SYNTHETIC DEMO</span>
+      <span id="scale" class="scale">1 m</span>
+    </section>
+    <details class="map-details"><summary>Relay Positions &amp; Data Health</summary>
+    <aside>
+      <section class="side-section">
+        <h2 class="relay-heading">Relay Positions <span id="relay-count">0</span></h2>
+        <div id="relays"><p class="muted">No relay positions received.</p></div>
+        <p class="note">Path-based estimates, not confirmed drop locations.</p>
+      </section>
+      <section class="side-section">
+        <h2>Data Health</h2>
+        <dl class="health">
+          <dt>ROS pose age</dt><dd id="pose-age">--</dd>
+          <dt>IMU age</dt><dd id="imu-age">--</dd>
+          <dt>Wheel input age</dt><dd id="wheel-age">--</dd>
+          <dt>Nano telemetry age</dt><dd id="nano-age">--</dd>
+          <dt>Path samples</dt><dd id="samples">0 / 1000</dd>
+          <dt>Rejected messages</dt><dd id="rejected">0</dd>
+        </dl>
+        <p id="diagnostic" class="diagnostic">Waiting for diagnostics.</p>
+      </section>
+      <section class="side-section legend">
+        <span><i class="key head"></i>Head</span>
+        <span><i class="key path"></i>Trajectory</span>
+        <span><i class="key relay"></i>Relay</span>
+        <span><i class="key origin"></i>Origin</span>
+      </section>
+    </aside>
+    </details>
+    </section>
+  </main>
+  <footer><span>Radar route candidates are not guaranteed free space. Views use separate reference frames.</span><span id="save-note">JSON saves odometry only, not radar or the full mission.</span></footer>
+</div>
+<div id="toast" class="toast" role="alert" hidden></div>
+</body>
+</html>

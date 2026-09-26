@@ -1,0 +1,25 @@
+# Documentation-only pin contract derived from 캡스톤_배선초안_0729.xlsx.
+arduino_nano:
+  serial_reserved: [D0, D1]
+  pwm_shared:
+    left_front_and_rear: D5
+    right_front_and_rear: D6
+  front_motor_direction:
+    left: {in1: D7, in2: D8}
+    right: {in1: D11, in2: D12}
+  rear_motor_direction:
+    left: {in1: D13, in2: A0}
+    right: {in1: A1, in2: A2}
+  rear_encoder:
+    left: {a_interrupt: D2, b_direction: D4}
+    right: {a_interrupt: D3, b_direction: A3}
+  servo:
+    head_150kg: D9
+    detach_sg90: D10
+  standby: 5V_hardwired
+raspberry_pi_bno085:
+  power_3v3: physical_pin_1
+  ground: physical_pin_6
+  sda_gpio2: physical_pin_3
+  scl_gpio3: physical_pin_5
+  int_gpio4: physical_pin_7

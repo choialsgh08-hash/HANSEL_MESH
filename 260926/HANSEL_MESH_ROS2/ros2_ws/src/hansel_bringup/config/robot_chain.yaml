@@ -1,0 +1,20 @@
+robot_chain:
+  ordered_units:
+    - head
+    - node1
+    - node2
+    - node3
+  roles:
+    head: head
+    node1: rear
+    node2: rear
+    node3: rear
+  initial_active_drive_units:
+    - head
+    - node1
+    - node2
+    - node3
+
+# Calculated at runtime from ordered_units; do not duplicate a hard-coded
+# detach_mapping here. nodeN is actuated by the immediately preceding unit.
+

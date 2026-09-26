@@ -1,0 +1,17 @@
+[Unit]
+Description=HANSEL BATMAN Mesh Network (%i)
+After=systemd-udev-settle.service network-pre.target systemd-modules-load.service NetworkManager.service dhcpcd.service
+Wants=systemd-udev-settle.service network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@HANSEL_REPO_DIR@
+ExecStart=@HANSEL_REPO_DIR@/scripts/start_role_network.sh %i
+ExecStop=@HANSEL_REPO_DIR@/scripts/stop_mesh.sh @HANSEL_REPO_DIR@/configs/%i.env
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

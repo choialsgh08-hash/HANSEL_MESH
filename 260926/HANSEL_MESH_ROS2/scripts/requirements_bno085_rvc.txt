@@ -1,0 +1,3 @@
+# Used with existing Head vendor/python dependencies. Pure Python wheels.
+adafruit-circuitpython-bno08x-rvc==1.0.24
+pyserial==3.5
