@@ -1,0 +1,7 @@
+# RAW ADC processing on the Raspberry Pi 4 or Windows bench PC.
+numpy>=2.0,<3
+
+# TI's reference FCCSP transport uses the D2XX/MPSSE API.  The Windows bench
+# path is verified with this package; Linux/Pi deployment also needs FTDI's
+# matching native D2XX library installed for the target architecture.
+ftd2xx>=1.3.8,<2

@@ -1,0 +1,18 @@
+[Unit]
+Description=HANSEL head camera RTP/H.264 stream (explicit opt-in)
+Requires=hansel-mesh@head.service
+After=hansel-mesh@head.service
+PartOf=hansel-mesh@head.service
+
+[Service]
+Type=simple
+User=hansel
+WorkingDirectory=/home/hansel/HANSEL_MESH
+ExecStart=/home/hansel/HANSEL_MESH/scripts/start_camera_service.sh
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

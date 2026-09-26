@@ -1,0 +1,42 @@
+/**:
+  ros__parameters:
+    odom_frame: odom
+    base_frame: base_link
+    imu_frame: base_link
+    publish_tf: true
+
+    # BNO085 is mounted with sensor +Y forward and +Z upward. The node zeroes
+    # heading at startup and publishes ROS base_link with +X forward.
+    # One fused-orientation report at 20 Hz keeps Raspberry Pi 4 I2C traffic
+    # modest. Angular velocity is derived from successive accepted yaw samples.
+    imu_rate_hz: 20.0
+    imu_zero_samples: 30
+    imu_yaw_sign: 1.0
+    imu_timeout_s: 0.35
+    imu_max_yaw_rate_rad_s: 6.0
+    bno_reconnect_s: 2.0
+    # Pause odometry on stale IMU data, but give short SHTP/I2C error bursts
+    # time to recover before rebuilding the BNO085 connection.
+    bno_max_consecutive_errors: 10
+    bno_error_log_period_s: 2.0
+
+    # Initial uncalibrated values. Keep provisional_calibration=true until a
+    # measured-distance run supplies left/right distance scale corrections.
+    wheel_diameter_m: 0.08
+    encoder_cpr: 400.0
+    left_encoder_sign: 1.0
+    right_encoder_sign: -1.0
+    left_distance_scale: 1.0
+    right_distance_scale: 1.0
+    provisional_calibration: true
+
+    max_wheel_dt_s: 0.25
+    history_min_step_m: 0.005
+    max_history_points: 3000
+    max_path_poses: 1000
+
+    # Arc-length offsets along the path previously driven by Head.
+    relay_offsets:
+      - node1=0.20
+      - node2=0.40
+      - node3=0.60

@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hansel_localization</name>
+  <version>0.1.0</version>
+  <description>BNO085 yaw and rear-encoder planar odometry for HANSEL Head.</description>
+  <maintainer email="hansel@example.com">HANSEL Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
+  <depend>hansel_interfaces</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

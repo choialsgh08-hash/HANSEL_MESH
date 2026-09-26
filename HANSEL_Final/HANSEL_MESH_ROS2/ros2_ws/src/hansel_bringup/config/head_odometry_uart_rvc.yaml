@@ -1,0 +1,5 @@
+/**:
+  ros__parameters:
+    # Applied AFTER head_odometry.yaml, not instead of it.
+    imu_transport: uart_rvc
+    imu_serial_port: /dev/serial0

@@ -1,0 +1,20 @@
+# hostapd config for the rescue victim AP — RENDERED by scripts/configure-ap.sh.
+# Do not edit the installed copy by hand; edit ap.env + this template and re-run.
+# Placeholders __LIKE_THIS__ are substituted from ap.env.
+
+interface=__AP_INTERFACE__
+driver=nl80211
+
+ssid=__AP_SSID__
+country_code=__AP_COUNTRY__
+ieee80211d=1
+
+hw_mode=__HW_MODE__
+channel=__AP_CHANNEL__
+
+# Conservative, widely-compatible defaults. No captive portal in this phase.
+wmm_enabled=1
+auth_algs=1
+ignore_broadcast_ssid=0
+macaddr_acl=0
+__WPA_BLOCK__

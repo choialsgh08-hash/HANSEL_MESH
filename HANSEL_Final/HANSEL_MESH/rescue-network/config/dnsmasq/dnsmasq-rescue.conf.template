@@ -1,0 +1,23 @@
+# dnsmasq config for the rescue victim AP — RENDERED by scripts/configure-ap.sh.
+# Serves DHCP (and local DNS) ONLY on the AP interface. No captive-portal
+# redirect in this phase: victims reach the form by typing the AP address.
+# Placeholders __LIKE_THIS__ are substituted from ap.env.
+
+# Bind strictly to the AP interface so we never interfere with other networks.
+interface=__AP_INTERFACE__
+bind-interfaces
+except-interface=lo
+
+# DHCP pool for phones.
+dhcp-range=__DHCP_RANGE_START__,__DHCP_RANGE_END__,__DHCP_LEASE__
+# Gateway + DNS advertised to clients = the AP itself.
+dhcp-option=3,__AP_IP__
+dhcp-option=6,__AP_IP__
+
+# Do not forward to upstream DNS (no internet in a disaster) — answer locally.
+no-resolv
+# Make the AP address resolvable by name (optional convenience).
+address=/rescue.local/__AP_IP__
+
+# Keep logs modest.
+dhcp-authoritative

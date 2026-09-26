@@ -1,0 +1,18 @@
+{
+  "base": "hansel@192.168.60.1",
+  "head": "hansel@192.168.50.10",
+  "head_ip": "192.168.50.10",
+  "pc_ip": "192.168.60.2",
+  "ros_root": "/home/hansel/HANSEL_MESH_ROS2",
+  "radar_root": "/home/hansel/HANSEL_MESH",
+  "nano_port": "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+  "radar_port": "/dev/serial/by-id/usb-Texas_Instruments_XDS110__03.00.00.43__Embed_with_CMSIS-DAP_RI32RI32-if00",
+  "maximum_pwm_percent": 75.0,
+  "node1": "hansel@192.168.50.11",
+  "node2": "hansel@192.168.50.12",
+  "speed_scale": 0.2,
+  "mesh_domain": 0,
+  "local_domain": 42,
+  "map_local_port": 8083,
+  "video_port": 5600
+}

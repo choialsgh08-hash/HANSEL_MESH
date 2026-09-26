@@ -1,0 +1,7 @@
+uint64 request_sequence
+string released_unit_id
+---
+bool accepted
+bool command_completed
+string message
+

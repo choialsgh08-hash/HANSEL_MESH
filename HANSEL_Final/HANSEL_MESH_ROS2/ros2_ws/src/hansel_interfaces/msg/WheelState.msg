@@ -1,0 +1,19 @@
+builtin_interfaces/Time stamp
+string command
+float32 target_left_cps
+float32 target_right_cps
+float32 actual_left_cps
+float32 actual_right_cps
+float32 target_left_rpm
+float32 target_right_rpm
+float32 actual_left_rpm
+float32 actual_right_rpm
+float32 pwm_left
+float32 pwm_right
+bool drive_enabled
+# Raw rear encoder totals, never inferred from commanded speed or PWM.
+bool encoder_counts_valid
+string encoder_epoch
+uint64 encoder_sample_id
+int64 left_encoder_count
+int64 right_encoder_count

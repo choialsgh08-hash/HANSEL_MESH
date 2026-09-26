@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hansel_unit_control</name>
+  <version>0.2.0</version>
+  <description>HANSEL unit safety, state, PID/PWM, and hardware adapters.</description>
+  <maintainer email="hansel@example.com">HANSEL Team</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>diagnostic_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>hansel_interfaces</depend>
+  <exec_depend>python3-serial</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <!-- Rear-only GPIO: install python3-pigpio and the pigpiod daemon on the Pi.
+       Python extra [gpio] is optional so Head/Nano does not require pigpio. -->
+
+  <test_depend>ament_pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
+

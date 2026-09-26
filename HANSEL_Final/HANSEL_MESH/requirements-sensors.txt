@@ -1,0 +1,2 @@
+# Optional on both Raspberry Pi and a Windows bench PC.
+pyserial>=3.5,<4

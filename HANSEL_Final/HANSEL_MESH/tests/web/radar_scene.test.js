@@ -1,0 +1,2138 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const childProcess = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
+const sceneApi = require("../../monitor/web/radar_scene.js");
+
+const ADDITIVE_DIAGNOSTIC_KEYS = [
+  "raw_point_count",
+  "ground_rejected_count",
+  "ground_fringe_rejected_count",
+  "reflectivity_surface_cell_count",
+  "self_clutter_rejected_count",
+  "quality_gate_rejected_count",
+  "tentative_point_track_count",
+  "confirmed_point_track_count",
+  "heatmap_reflection_count",
+  "heatmap_cells_observed",
+  "confirmed_heatmap_track_count",
+  "probability_active_cell_count",
+  "probability_occupied_cell_count",
+  "probability_decayed_cell_count",
+  "probability_ttl_expired_cell_count",
+  "path_switch_pending_count",
+  "path_switch_accepted_count",
+  "scene_epoch",
+];
+
+function makeGrid(forwardCells = 2, lateralCells = 3) {
+  const bytes = Uint8Array.from({ length: forwardCells * lateralCells }, () => 0);
+  return {
+    bytes,
+    payload: {
+      encoding: "occupancy-u8-base64",
+      layout: "forward-major_lateral-minor",
+      unknown_value: 0,
+      resolution_m: 0.05,
+      forward_cells: forwardCells,
+      lateral_cells: lateralCells,
+      origin_forward_cell: 0,
+      origin_lateral_cell: Math.floor(lateralCells / 2),
+      data_base64: Buffer.from(bytes).toString("base64"),
+    },
+  };
+}
+
+function makePointTrack(overrides = {}) {
+  return {
+    track_id: 1,
+    age_ms: 0,
+    source: "point",
+    classification: "confirmed_obstacle",
+    point_confirmed: true,
+    map_confirmed: true,
+    forward_m: 0.40,
+    lateral_m: 0.0,
+    distance_m: 0.40,
+    hazard_distance_m: 0.40,
+    height_m: 0.0,
+    height_band: "sensor_level",
+    height_reference: "sensor_relative_uncalibrated",
+    confidence: 0.9,
+    range_uncertainty_m: 0.049,
+    lateral_uncertainty_m: 0.05,
+    ...overrides,
+  };
+}
+
+function makeHeatmapTrack(overrides = {}) {
+  return {
+    track_id: 2,
+    age_ms: 0,
+    source: "heatmap",
+    classification: "reflection_evidence",
+    heatmap_confirmed: false,
+    forward_m: 0.35,
+    lateral_m: -0.03,
+    distance_m: 0.351,
+    height_m: null,
+    height_band: "unknown",
+    height_reference: "unavailable",
+    confidence: 0.5,
+    range_uncertainty_m: 0.098,
+    lateral_uncertainty_m: 0.06,
+    ...overrides,
+  };
+}
+
+function makeProbabilityCell(overrides = {}) {
+  return {
+    forward_m: 0.25,
+    lateral_m: 0.05,
+    probability: 0.8,
+    confidence: 0.9,
+    occupied: true,
+    hits: 3,
+    age_ms: 125,
+    range_uncertainty_m: 0.049,
+    lateral_uncertainty_m: 0.06,
+    source: "point",
+    ...overrides,
+  };
+}
+
+function makeReflectivityCell(overrides = {}) {
+  return {
+    forward_m: 0.40,
+    lateral_m: 0.05,
+    intensity: 0.9,
+    persistence: 0.6,
+    hits: 3,
+    age_ms: 0,
+    ...overrides,
+  };
+}
+
+function makeFullEvidenceCell(overrides = {}) {
+  return {
+    range_index: 3,
+    azimuth_index: 18,
+    range_m: 0.175781,
+    azimuth_deg: 7.180756,
+    forward_m: 0.174402,
+    lateral_m: 0.021973,
+    intensity: 0.78,
+    confidence: 0.55,
+    persistence: 0.2,
+    hits: 1,
+    verified: false,
+    age_ms: 0,
+    relative_db: 3.25,
+    calibrated_residual_db: 3.25,
+    scene_change_score: 0.8,
+    range_uncertainty_m: 0.029297,
+    angular_uncertainty_deg: 14.5,
+    ...overrides,
+  };
+}
+
+function makeFullEvidenceSurface(overrides = {}) {
+  return {
+    radius_m: 0.50,
+    range_step_m: 0.058594,
+    angular_resolution_deg: 29.0,
+    history_frames: 5,
+    required_hits: 3,
+    retention: "continuous_five_frame_evidence",
+    pose_mode: "sensor_relative_short_memory",
+    source: "full_range_azimuth_heatmap",
+    normalization: "current_range_common_mode_physical_beam",
+    calibrated: true,
+    room_baseline_used: false,
+    valid_min_range_m: 0.12,
+    independent_beam_count: 5,
+    cells: [makeFullEvidenceCell()],
+    ...overrides,
+  };
+}
+
+function makeAdcAngleSurface(overrides = {}) {
+  return {
+    source: "uart_last_chirp_pair_adc",
+    direction_semantics: "range_azimuth",
+    processing: "bpm_decode_hann_range_fft_four_element_das",
+    phase_calibration: "evm_design_default",
+    history_frames: 5,
+    required_hits: 3,
+    retention: "three_of_five_complete_frames",
+    range_step_m: 0.05859375,
+    angle_min_deg: -60,
+    angle_max_deg: 60,
+    angle_step_deg: 2,
+    angular_resolution_deg: 29,
+    complete_frame_adc: false,
+    cells: [{
+      range_index: 4, azimuth_index: 45, range_m: 0.234375,
+      azimuth_deg: 30, forward_m: 0.202975, lateral_m: 0.117188,
+      intensity: 0.91, relative_db: 7.2, coherence: 0.92,
+    }],
+    peaks: [{
+      range_index: 4, range_m: 0.234375, azimuth_deg: 30,
+      forward_m: 0.202975, lateral_m: 0.117188,
+      relative_db: 7.2, coherence: 0.92, confidence: 0.84,
+      hits: 3, verified: true, age_ms: 0,
+      angular_uncertainty_deg: 14.5,
+    }],
+    ...overrides,
+  };
+}
+
+function makeReflectivityCorridor(overrides = {}) {
+  return {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 65.556027,
+    guidance_heading_deg: 55.0,
+    width_m: 0.19321,
+    confidence: 0.90049,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: 67.380135,
+        normal_offset_m: -0.461538,
+        support_cells: 6,
+        span_m: 0.413462,
+        mean_intensity: 0.658333,
+        start: [0.340976, -0.381657],
+        end: [0.5, 0.0],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: 63.434949,
+        normal_offset_m: -0.268328,
+        support_cells: 12,
+        span_m: 0.570197,
+        mean_intensity: 0.545583,
+        start: [0.17, -0.26],
+        end: [0.425, 0.25],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function makeUnavailableReflectivityCorridor() {
+  return {
+    status: "unavailable",
+    method: "deterministic_boundary_fit",
+    geometry: null,
+    history_frames: 5,
+    required_hits: 3,
+    hits: 0,
+    measured_heading_deg: null,
+    guidance_heading_deg: null,
+    width_m: null,
+    confidence: 0.0,
+    walls: [],
+  };
+}
+
+function makeReflectivityBoundaries(overrides = {}) {
+  return {
+    status: "confirmed",
+    method: "independent_boundary_fit",
+    history_frames: 5,
+    required_hits: 3,
+    walls: [
+      {
+        wall_id: "boundary_right",
+        evidence_kind: "heatmap",
+        side: "right",
+        hits: 3,
+        confidence: 0.81,
+        heading_deg: -58.324531,
+        normal_offset_m: 0.47486,
+        support_cells: 5,
+        span_m: 0.285656,
+        mean_intensity: 0.99998,
+        start: [0.325, 0.377586],
+        end: [0.475, 0.134483],
+      },
+    ],
+    ...overrides,
+  };
+}
+
+function makeUnavailableReflectivityBoundaries() {
+  return {
+    status: "unavailable",
+    method: "independent_boundary_fit",
+    history_frames: 5,
+    required_hits: 3,
+    walls: [],
+  };
+}
+
+function makeReflectivityContours(overrides = {}) {
+  return {
+    status: "confirmed",
+    method: "calibrated_nearest_reflection_segments",
+    history_frames: 5,
+    required_hits: 3,
+    max_range_m: 0.30,
+    segments: [{
+      segment_id: "contour_1",
+      evidence_kind: "calibrated_heatmap_prominence",
+      hits: 3,
+      confidence: 0.72,
+      heading_deg: 90.0,
+      support_cells: 7,
+      span_m: 0.08,
+      mean_prominence_db: 0.4,
+      start: [0.18, -0.04],
+      end: [0.18, 0.04],
+    }],
+    ...overrides,
+  };
+}
+
+function makeUnavailableReflectivityContours() {
+  return makeReflectivityContours({ status: "unavailable", segments: [] });
+}
+
+function makeSnapshot(overrides = {}) {
+  const grid = makeGrid(60, 60).payload;
+  const diagnostics = Object.fromEntries(
+    ADDITIVE_DIAGNOSTIC_KEYS.map((key) => [key, 0]),
+  );
+  const snapshot = {
+    status: "live",
+    scene: {
+      schema_version: 1,
+      pose_mode: "robot_relative_short_memory",
+      calibration_status: "ok",
+      ground_filter: {
+        sensor_height_m: 0.065,
+        sensor_pitch_deg: 0.0,
+        ground_rejection_height_m: 0.035,
+        ground_uncertainty_m: 0.015,
+        effective_rejection_height_m: 0.05,
+        filter_range_m: 0.60,
+        pitch_convention: "positive_up",
+        status: "configured",
+      },
+      grid,
+      tracks: [],
+      obstacle_tracks: [],
+      reference_tracks: [],
+      reflectivity_surface: {
+        radius_m: 0.50,
+        resolution_m: 0.025,
+        history_frames: 5,
+        required_hits: 3,
+        retention: "three_of_five_complete_frames",
+        pose_mode: "sensor_relative_short_memory",
+        source: "calibrated_heatmap_residual",
+        cells: [],
+      },
+      reflectivity_corridor: makeReflectivityCorridor(),
+      reflectivity_boundaries: makeReflectivityBoundaries(),
+      reflectivity_contours: makeReflectivityContours(),
+      probabilistic_local_map: {
+        radius_m: 0.50,
+        resolution_m: 0.05,
+        occupied_threshold: 0.75,
+        decay_half_life_ms: 1000,
+        ttl_ms: 2500,
+        retention: "probability_decay_with_ttl",
+        pose_mode: "robot_relative_short_memory",
+        cells: [],
+      },
+      rolling_local_map: {
+        radius_m: 0.50,
+        resolution_m: 0.05,
+        minimum_hits: 1,
+        motion_relative: true,
+        retention: "probability_decay_with_ttl",
+        cells: [],
+      },
+      planned_path: {
+        status: "clear",
+        stability_status: "replanned",
+        resolution_m: 0.01,
+        length_m: 0.02,
+        curvature_per_m: 0.0,
+        points: [[0.0, 0.0], [0.01, 0.0], [0.02, 0.0]],
+        robot_width_m: 0.15,
+        safety_margin_m: 0.03,
+        minimum_passage_width_m: 0.21,
+        minimum_hold_ms: 0,
+        switch_confirm_frames: 3,
+        pending_switch_frames: 0,
+        switch_accepted: false,
+        replan_every_frame: true,
+        blocked_previous_path: null,
+      },
+      diagnostics,
+      hazard: {
+        level: "NORMAL",
+        threshold_m: 0.1,
+        reason: "confirmed_point_outside_threshold",
+      },
+    },
+  };
+  return {
+    ...snapshot,
+    ...overrides,
+    scene: { ...snapshot.scene, ...(overrides.scene || {}) },
+  };
+}
+
+function makeLegacySnapshot(overrides = {}) {
+  const snapshot = makeSnapshot(overrides);
+  delete snapshot.scene.probabilistic_local_map;
+  delete snapshot.scene.ground_filter;
+  delete snapshot.scene.reflectivity_corridor;
+  delete snapshot.scene.reflectivity_boundaries;
+  delete snapshot.scene.reflectivity_contours;
+  snapshot.scene.pose_mode = "robot_relative";
+  for (const key of ADDITIVE_DIAGNOSTIC_KEYS) {
+    delete snapshot.scene.diagnostics[key];
+  }
+  snapshot.scene.rolling_local_map = {
+    radius_m: 0.50,
+    resolution_m: 0.005,
+    minimum_hits: 2,
+    motion_relative: true,
+    retention: "until_outside_radius_or_scene_reset",
+    cells: [{
+      forward_m: -0.20,
+      lateral_m: 0.10,
+      confidence: 0.95,
+      hits: 4,
+      age_ms: 60_000,
+    }],
+  };
+  snapshot.scene.planned_path = {
+    status: "limited",
+    resolution_m: 0.01,
+    length_m: 0.02,
+    points: [[0, 0], [0.01, 0], [0.02, 0.001]],
+  };
+  return snapshot;
+}
+
+function setPath(snapshot, overrides) {
+  snapshot.scene.planned_path = {
+    ...snapshot.scene.planned_path,
+    ...overrides,
+  };
+}
+
+test("decodes forward-major occupancy and preserves zero as UNKNOWN", () => {
+  const grid = makeGrid(60, 60);
+  grid.bytes[59 * 60 + 30] = 255;
+  grid.payload.data_base64 = Buffer.from(grid.bytes).toString("base64");
+  const decoded = sceneApi.decodeOccupancyGrid(grid.payload);
+  assert.equal(decoded.length, 3600);
+  assert.equal(decoded[0], 0);
+  assert.equal(decoded[59 * 60 + 30], 255);
+});
+
+test("rejects malformed occupancy payloads", async (t) => {
+  await t.test("non-canonical base64", () => {
+    const grid = makeGrid(1, 1).payload;
+    grid.data_base64 = "AP==";
+    assert.throws(() => sceneApi.decodeOccupancyGrid(grid), /base64/);
+  });
+  await t.test("length mismatch", () => {
+    const grid = makeGrid(2, 2).payload;
+    grid.data_base64 = Buffer.from([0, 1, 2]).toString("base64");
+    assert.throws(() => sceneApi.decodeOccupancyGrid(grid), /length/);
+  });
+  await t.test("out-of-range origin", () => {
+    const grid = makeGrid(2, 2).payload;
+    grid.origin_lateral_cell = 2;
+    assert.throws(() => sceneApi.decodeOccupancyGrid(grid), /grid contract/);
+  });
+});
+
+test("drops a track at the exact 300ms freshness boundary", () => {
+  const tracks = [
+    { track_id: 1, age_ms: 299 },
+    { track_id: 2, age_ms: 300 },
+    { track_id: 3, age_ms: -1 },
+  ];
+  assert.deepEqual(sceneApi.filterFreshTracks(tracks), [{ track_id: 1, age_ms: 299 }]);
+});
+
+test("prefers probability cells over the rolling compatibility alias", () => {
+  const probabilityCell = makeProbabilityCell();
+  const snapshot = makeSnapshot();
+  snapshot.scene.probabilistic_local_map.cells = [probabilityCell];
+  snapshot.scene.rolling_local_map.cells = [
+    { ...probabilityCell, forward_m: 0.45 },
+  ];
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.probabilisticLocalMap.sourceField, "probabilistic_local_map");
+  assert.deepEqual(parsed.probabilisticLocalMap.cells, [probabilityCell]);
+  assert.equal(parsed.probabilisticLocalMap.radiusM, 0.50);
+  assert.equal(parsed.probabilisticLocalMap.resolutionM, 0.05);
+  assert.equal(parsed.probabilisticLocalMap.occupiedThreshold, 0.75);
+  assert.equal(parsed.probabilisticLocalMap.decayHalfLifeMs, 1000);
+  assert.equal(parsed.probabilisticLocalMap.ttlMs, 2500);
+  assert.equal(parsed.probabilisticLocalMap.retention, "probability_decay_with_ttl");
+  assert.equal(parsed.probabilisticLocalMap.poseMode, "robot_relative_short_memory");
+});
+
+test("accepts independently corroborated ADC and heatmap probability cells", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.probabilistic_local_map.cells = [makeProbabilityCell({
+    source: "adc_heatmap_fused",
+  })];
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.equal(
+    parsed.probabilisticLocalMap.cells[0].source,
+    "adc_heatmap_fused",
+  );
+});
+
+test("validates and detaches the display-only reflectivity surface", () => {
+  const snapshot = makeSnapshot();
+  const cell = makeReflectivityCell();
+  snapshot.scene.reflectivity_surface.cells = [cell];
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivitySurface, {
+    radiusM: 0.50,
+    resolutionM: 0.025,
+    historyFrames: 5,
+    requiredHits: 3,
+    retention: "three_of_five_complete_frames",
+    poseMode: "sensor_relative_short_memory",
+    source: "calibrated_heatmap_residual",
+    cells: [cell],
+  });
+  snapshot.scene.reflectivity_surface.cells[0].intensity = 0.1;
+  assert.equal(parsed.reflectivitySurface.cells[0].intensity, 0.9);
+});
+
+test("preserves unverified full heatmap cells instead of blanking the view", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_surface = makeFullEvidenceSurface();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.equal(parsed.blocked, false);
+  assert.equal(parsed.reflectivitySurface.source, "full_range_azimuth_heatmap");
+  assert.equal(parsed.reflectivitySurface.cells.length, 1);
+  assert.equal(parsed.reflectivitySurface.cells[0].verified, false);
+  assert.equal(parsed.reflectivitySurface.cells[0].intensity, 0.78);
+});
+
+test("validates and detaches phase-preserving UART ADC angle evidence", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.adc_range_angle_surface = makeAdcAngleSurface();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.equal(parsed.adcRangeAngleSurface.directionSemantics, "range_azimuth");
+  assert.equal(parsed.adcRangeAngleSurface.peaks.length, 1);
+  assert.equal(parsed.adcRangeAngleSurface.peaks[0].azimuth_deg, 30);
+  snapshot.scene.adc_range_angle_surface.peaks[0].azimuth_deg = -30;
+  assert.equal(parsed.adcRangeAngleSurface.peaks[0].azimuth_deg, 30);
+});
+
+test("malformed optional ADC angle evidence degrades only that overlay", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.adc_range_angle_surface = makeAdcAngleSurface({
+    peaks: [{ ...makeAdcAngleSurface().peaks[0], confidence: Infinity }],
+  });
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.blocked, false);
+  assert.equal(parsed.adcRangeAngleSurface, null);
+  assert.match(parsed.sceneWarnings.join(" "), /adc_range_angle_surface/);
+});
+
+test("evidence fallback preserves current heatmap when another scene contract fails", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_surface = makeFullEvidenceSurface();
+  snapshot.scene.planned_path.points = [["bad", 0]];
+
+  assert.throws(() => sceneApi.parseRadarScene(snapshot));
+  const parsed = sceneApi.parseRadarEvidenceFallback(
+    snapshot, new Error("invalid planned path contract"),
+  );
+
+  assert.equal(parsed.blocked, false);
+  assert.equal(parsed.evidenceOnly, true);
+  assert.equal(parsed.sceneContractFallback, true);
+  assert.equal(parsed.hazard.level, "UNKNOWN");
+  assert.equal(parsed.plannedPath.status, "unavailable");
+  assert.equal(parsed.reflectivitySurface.source, "full_range_azimuth_heatmap");
+  assert.equal(parsed.reflectivitySurface.cells.length, 1);
+  assert.equal(parsed.sceneVerification, undefined);
+  assert.match(parsed.sceneWarnings.join(" "), /scene_contract_evidence_fallback/);
+});
+
+test("live full heatmap remains visible when obstacle calibration is unavailable", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.calibration_status = "calibration_unavailable";
+  snapshot.scene.reflectivity_surface = makeFullEvidenceSurface();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.equal(parsed.blocked, false);
+  assert.equal(parsed.evidenceOnly, true);
+  assert.equal(parsed.reflectivitySurface.cells.length, 1);
+  assert.equal(parsed.hazard.level, "UNKNOWN");
+  assert.deepEqual(parsed.plannedPath.points, []);
+});
+
+test("validates and detaches arbitrary calibrated contour segments", () => {
+  const snapshot = makeSnapshot();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivityContours, {
+    status: "confirmed",
+    method: "calibrated_nearest_reflection_segments",
+    historyFrames: 5,
+    requiredHits: 3,
+    maxRangeM: 0.30,
+    segments: [{
+      segmentId: "contour_1",
+      evidenceKind: "calibrated_heatmap_prominence",
+      hits: 3,
+      confidence: 0.72,
+      headingDeg: 90.0,
+      supportCells: 7,
+      spanM: 0.08,
+      meanProminenceDb: 0.4,
+      start: [0.18, -0.04],
+      end: [0.18, 0.04],
+    }],
+  });
+  snapshot.scene.reflectivity_contours.segments[0].start[0] = 9.0;
+  assert.equal(parsed.reflectivityContours.segments[0].start[0], 0.18);
+});
+
+test("malformed optional contours degrade only the overlay", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_contours = makeUnavailableReflectivityContours();
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.reflectivityContours.status, "unavailable");
+  assert.deepEqual(parsed.reflectivityContours.segments, []);
+
+  snapshot.scene.reflectivity_contours.segments = [
+    makeReflectivityContours().segments[0],
+  ];
+  const degraded = sceneApi.parseRadarScene(snapshot);
+  assert.equal(degraded.blocked, false);
+  assert.equal(degraded.reflectivityContours.status, "unavailable");
+  assert.match(degraded.sceneWarnings.join(" "), /reflectivity_contours/);
+});
+
+test("malformed calibrated contour geometry never blanks sensor evidence", () => {
+  const mutations = [
+    (value) => { value.method = "corridor"; },
+    (value) => { value.max_range_m = 0.50; },
+    (value) => { value.segments[0].support_cells = 2; },
+    (value) => { value.segments[0].confidence = Infinity; },
+    (value) => { value.segments[0].start = [0.31, 0.0]; },
+    (value) => { value.segments[0].span_m = 0.12; },
+  ];
+  for (const mutate of mutations) {
+    const snapshot = makeSnapshot();
+    mutate(snapshot.scene.reflectivity_contours);
+    const parsed = sceneApi.parseRadarScene(snapshot);
+    assert.equal(parsed.blocked, false);
+    assert.equal(parsed.reflectivityContours.status, "unavailable");
+    assert.match(parsed.sceneWarnings.join(" "), /reflectivity_contours/);
+  }
+});
+
+test("malformed wall overlays degrade independently in a full heatmap scene", () => {
+  const mutations = [
+    {
+      mutate: (scene) => { scene.reflectivity_corridor.status = "broken"; },
+      unavailable: "reflectivityCorridor",
+      preserved: "reflectivityBoundaries",
+      warning: /reflectivity_corridor/,
+    },
+    {
+      mutate: (scene) => {
+        scene.reflectivity_boundaries.walls[0].heading_deg = Infinity;
+      },
+      unavailable: "reflectivityBoundaries",
+      preserved: "reflectivityCorridor",
+      warning: /reflectivity_boundaries/,
+    },
+  ];
+  for (const { mutate, unavailable, preserved, warning } of mutations) {
+    const snapshot = makeSnapshot();
+    snapshot.scene.reflectivity_surface = makeFullEvidenceSurface();
+    mutate(snapshot.scene);
+
+    const parsed = sceneApi.parseRadarScene(snapshot);
+
+    assert.equal(parsed.blocked, false);
+    assert.equal(parsed.reflectivitySurface.cells.length, 1);
+    assert.equal(parsed[unavailable].status, "unavailable");
+    assert.equal(parsed[preserved].status, "confirmed");
+    assert.match(parsed.sceneWarnings.join(" "), warning);
+  }
+});
+
+test("validates and detaches one confirmed independent boundary", () => {
+  const snapshot = makeSnapshot();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivityBoundaries, {
+    status: "confirmed",
+    method: "independent_boundary_fit",
+    historyFrames: 5,
+    requiredHits: 3,
+    walls: [{
+      wallId: "boundary_right",
+      evidenceKind: "heatmap",
+      side: "right",
+      hits: 3,
+      confidence: 0.81,
+      headingDeg: -58.324531,
+      normalOffsetM: 0.47486,
+      supportCells: 5,
+      spanM: 0.285656,
+      meanIntensity: 0.99998,
+      start: [0.325, 0.377586],
+      end: [0.475, 0.134483],
+    }],
+  });
+  snapshot.scene.reflectivity_boundaries.walls[0].start[0] = 9.0;
+  assert.equal(parsed.reflectivityBoundaries.walls[0].start[0], 0.325);
+});
+
+test("accepts only canonical unavailable independent boundaries", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_boundaries = makeUnavailableReflectivityBoundaries();
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.deepEqual(parsed.reflectivityBoundaries.walls, []);
+  assert.equal(parsed.reflectivityBoundaries.status, "unavailable");
+});
+
+test("accepts a measured short point-backed boundary", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_boundaries.walls = [{
+    wall_id: "boundary_right",
+    evidence_kind: "point",
+    side: "right",
+    hits: 5,
+    confidence: 0.79139,
+    heading_deg: -26.819879,
+    normal_offset_m: 0.306238,
+    support_cells: 3,
+    span_m: 0.213127,
+    mean_intensity: 0.569444,
+    start: [0.222702, 0.230559],
+    end: [0.412903, 0.134399],
+  }];
+
+  const wall = sceneApi.parseRadarScene(snapshot)
+    .reflectivityBoundaries.walls[0];
+
+  assert.equal(wall.evidenceKind, "point");
+  assert.equal(wall.supportCells, 3);
+  assert.equal(wall.meanIntensity, 0.569444);
+});
+
+test("rejects malformed independent boundary contracts", async (t) => {
+  const cases = [
+    ["missing", (scene) => delete scene.reflectivity_boundaries],
+    ["method", (scene) => { scene.reflectivity_boundaries.method = "hough"; }],
+    ["candidate status", (scene) => { scene.reflectivity_boundaries.status = "candidate"; }],
+    ["too few hits", (scene) => { scene.reflectivity_boundaries.walls[0].hits = 2; }],
+    ["side", (scene) => { scene.reflectivity_boundaries.walls[0].side = "center"; }],
+    ["evidence kind", (scene) => { scene.reflectivity_boundaries.walls[0].evidence_kind = "camera"; }],
+    ["side geometry", (scene) => {
+      scene.reflectivity_boundaries.walls[0].side = "left";
+      scene.reflectivity_boundaries.walls[0].wall_id = "boundary_left";
+    }],
+    ["weak intensity", (scene) => { scene.reflectivity_boundaries.walls[0].mean_intensity = 0.89; }],
+    ["short span", (scene) => { scene.reflectivity_boundaries.walls[0].span_m = 0.17; }],
+    ["endpoint mismatch", (scene) => { scene.reflectivity_boundaries.walls[0].end[1] += 0.02; }],
+    ["duplicate side", (scene) => {
+      scene.reflectivity_boundaries.walls.push({
+        ...scene.reflectivity_boundaries.walls[0],
+      });
+    }],
+    ["unavailable walls", (scene) => {
+      scene.reflectivity_boundaries.status = "unavailable";
+    }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      mutate(snapshot.scene);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity boundary contract/,
+      );
+    });
+  }
+});
+
+test("validates and detaches the measured two-wall reflectivity corridor", () => {
+  const snapshot = makeSnapshot();
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.deepEqual(parsed.reflectivityCorridor, {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
+    historyFrames: 5,
+    requiredHits: 3,
+    hits: 3,
+    measuredHeadingDeg: 65.556027,
+    guidanceHeadingDeg: 55.0,
+    widthM: 0.19321,
+    confidence: 0.90049,
+    walls: [
+      {
+        wallId: "wall_1",
+        headingDeg: 67.380135,
+        normalOffsetM: -0.461538,
+        supportCells: 6,
+        spanM: 0.413462,
+        meanIntensity: 0.658333,
+        start: [0.340976, -0.381657],
+        end: [0.5, 0.0],
+      },
+      {
+        wallId: "wall_2",
+        headingDeg: 63.434949,
+        normalOffsetM: -0.268328,
+        supportCells: 12,
+        spanM: 0.570197,
+        meanIntensity: 0.545583,
+        start: [0.17, -0.26],
+        end: [0.425, 0.25],
+      },
+    ],
+  });
+  snapshot.scene.reflectivity_corridor.walls[0].start[0] = 9.0;
+  assert.equal(parsed.reflectivityCorridor.walls[0].start[0], 0.340976);
+});
+
+test("accepts point-seeded walls extrapolated back to the sensor body", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 5,
+    measured_heading_deg: -19.25732,
+    guidance_heading_deg: -19.25732,
+    width_m: 0.139151,
+    confidence: 0.435099,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: -19.25732,
+        normal_offset_m: -0.084609,
+        support_cells: 2,
+        span_m: 0.087294,
+        mean_intensity: 0.46205,
+        start: [0.0, -0.089623],
+        end: [0.425, -0.238101],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -19.25732,
+        normal_offset_m: 0.054542,
+        support_cells: 2,
+        span_m: 0.126455,
+        mean_intensity: 0.4375,
+        start: [0.0, 0.057771],
+        end: [0.362396, -0.068835],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.status, "confirmed");
+  assert.equal(parsed.widthM, 0.139151);
+  assert.equal(parsed.walls[0].supportCells, 2);
+  assert.deepEqual(parsed.walls[0].start, [0.0, -0.089623]);
+});
+
+test("accepts a short near-sensor wall supported by two consistent points", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 5,
+    measured_heading_deg: -45.590657,
+    guidance_heading_deg: -45.590657,
+    width_m: 0.294102,
+    confidence: 0.740123,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: -45.590657,
+        normal_offset_m: -0.008359,
+        support_cells: 2,
+        span_m: 0.05206,
+        mean_intensity: 0.679167,
+        start: [0.0, -0.011945],
+        end: [0.140762, -0.15564],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -45.590657,
+        normal_offset_m: 0.285743,
+        support_cells: 7,
+        span_m: 0.441736,
+        mean_intensity: 0.896343,
+        start: [0.0, 0.408333],
+        end: [0.475, -0.076562],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+  assert.equal(parsed.status, "confirmed");
+  assert.ok(parsed.measuredHeadingDeg < -45);
+  assert.equal(parsed.walls[0].spanM, 0.05206);
+});
+
+test("accepts parallel wall centerline from independent headings", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "parallel",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 2.504769,
+    guidance_heading_deg: 2.504769,
+    width_m: 0.399239,
+    confidence: 0.793333,
+    walls: [
+      {
+        wall_id: "wall_1", heading_deg: 0.0,
+        normal_offset_m: -0.2, support_cells: 5,
+        span_m: 0.2, mean_intensity: 0.9,
+        start: [0.10, -0.20], end: [0.30, -0.20],
+      },
+      {
+        wall_id: "wall_2", heading_deg: 5.0,
+        normal_offset_m: 0.199239, support_cells: 5,
+        span_m: 0.200764, mean_intensity: 0.9,
+        start: [0.11, 0.209624], end: [0.31, 0.227121],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.measuredHeadingDeg, 2.504769);
+  assert.equal(parsed.walls[1].headingDeg, 5.0);
+});
+
+test("accepts independently measured converging walls and bottleneck width", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "converging",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 0.0,
+    guidance_heading_deg: 0.0,
+    width_m: 0.10,
+    confidence: 0.86,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: 45.0,
+        normal_offset_m: -0.318198,
+        support_cells: 5,
+        span_m: 0.282843,
+        mean_intensity: 0.82,
+        start: [0.20, -0.25],
+        end: [0.40, -0.05],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -45.0,
+        normal_offset_m: 0.318198,
+        support_cells: 5,
+        span_m: 0.282843,
+        mean_intensity: 0.82,
+        start: [0.20, 0.25],
+        end: [0.40, 0.05],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.geometry, "converging");
+  assert.equal(parsed.widthM, 0.10);
+  assert.equal(parsed.measuredHeadingDeg, 0.0);
+  assert.deepEqual(parsed.walls[0].start, [0.20, -0.25]);
+  assert.deepEqual(parsed.walls[1].end, [0.40, 0.05]);
+});
+
+test("accepts a steep four-row converging pair with short forward projection", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "converging",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 4,
+    measured_heading_deg: 0.0,
+    guidance_heading_deg: 0.0,
+    width_m: 0.173334,
+    confidence: 0.707176,
+    walls: [
+      {
+        wall_id: "wall_1", heading_deg: 58.798249,
+        normal_offset_m: -0.25457, support_cells: 4,
+        span_m: 0.099096, mean_intensity: 0.945903,
+        start: [0.193793, -0.171429], end: [0.24513, -0.086667],
+      },
+      {
+        wall_id: "wall_2", heading_deg: -58.798249,
+        normal_offset_m: 0.25457, support_cells: 4,
+        span_m: 0.099096, mean_intensity: 0.911989,
+        start: [0.193793, 0.171429], end: [0.24513, 0.086667],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.status, "confirmed");
+  assert.equal(parsed.geometry, "converging");
+  assert.equal(parsed.widthM, 0.173334);
+});
+
+test("accepts converging walls with independently measured extents", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_corridor = {
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "converging",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: -26.565051,
+    guidance_heading_deg: -26.565051,
+    width_m: 0.30,
+    confidence: 0.82,
+    walls: [
+      {
+        wall_id: "wall_1",
+        heading_deg: 0.0,
+        normal_offset_m: -0.25,
+        support_cells: 5,
+        span_m: 0.30,
+        mean_intensity: 0.90,
+        start: [0.10, -0.25],
+        end: [0.40, -0.25],
+      },
+      {
+        wall_id: "wall_2",
+        heading_deg: -45.0,
+        normal_offset_m: 0.318198,
+        support_cells: 5,
+        span_m: 0.424264,
+        mean_intensity: 0.91,
+        start: [0.20, 0.25],
+        end: [0.50, -0.05],
+      },
+    ],
+  };
+
+  const parsed = sceneApi.parseRadarScene(snapshot).reflectivityCorridor;
+
+  assert.equal(parsed.measuredHeadingDeg, -26.565051);
+  assert.deepEqual(parsed.walls[0].start, [0.10, -0.25]);
+  assert.deepEqual(parsed.walls[1].end, [0.50, -0.05]);
+});
+
+test("accepts only canonical unavailable and candidate corridor states", () => {
+  const unavailable = makeSnapshot();
+  unavailable.scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+  assert.equal(
+    sceneApi.parseRadarScene(unavailable).reflectivityCorridor.status,
+    "unavailable",
+  );
+
+  const candidate = makeSnapshot();
+  candidate.scene.reflectivity_corridor.status = "candidate";
+  candidate.scene.reflectivity_corridor.hits = 2;
+  assert.equal(
+    sceneApi.parseRadarScene(candidate).reflectivityCorridor.status,
+    "candidate",
+  );
+});
+
+test("rejects every strict reflectivity-corridor metadata violation", async (t) => {
+  const cases = [
+    ["missing", (scene) => delete scene.reflectivity_corridor],
+    ["null", (scene) => { scene.reflectivity_corridor = null; }],
+    ["array", (scene) => { scene.reflectivity_corridor = []; }],
+    ["status", (scene) => { scene.reflectivity_corridor.status = "stable"; }],
+    ["method", (scene) => { scene.reflectivity_corridor.method = "least_squares"; }],
+    ["geometry", (scene) => { scene.reflectivity_corridor.geometry = "triangle"; }],
+    ["history", (scene) => { scene.reflectivity_corridor.history_frames = 4; }],
+    ["required", (scene) => { scene.reflectivity_corridor.required_hits = 2; }],
+    ["fractional hits", (scene) => { scene.reflectivity_corridor.hits = 3.5; }],
+    ["confirmed too few hits", (scene) => { scene.reflectivity_corridor.hits = 2; }],
+    ["candidate too many hits", (scene) => {
+      scene.reflectivity_corridor.status = "candidate";
+      scene.reflectivity_corridor.hits = 3;
+    }],
+    ["measured null", (scene) => { scene.reflectivity_corridor.measured_heading_deg = null; }],
+    ["measured nonfinite", (scene) => { scene.reflectivity_corridor.measured_heading_deg = Infinity; }],
+    ["measured out of range", (scene) => { scene.reflectivity_corridor.measured_heading_deg = 76; }],
+    ["guidance nonfinite", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = NaN; }],
+    ["guidance over clamp", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = 56; }],
+    ["guidance wrong clamp", (scene) => { scene.reflectivity_corridor.guidance_heading_deg = 54; }],
+    ["width too narrow", (scene) => { scene.reflectivity_corridor.width_m = 0.059; }],
+    ["width too wide", (scene) => { scene.reflectivity_corridor.width_m = 0.551; }],
+    ["confidence negative", (scene) => { scene.reflectivity_corridor.confidence = -0.01; }],
+    ["confidence nonfinite", (scene) => { scene.reflectivity_corridor.confidence = Infinity; }],
+    ["wall count", (scene) => { scene.reflectivity_corridor.walls.pop(); }],
+    ["unavailable geometry", (scene) => {
+      scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+      scene.reflectivity_corridor.width_m = 0.2;
+    }],
+    ["unavailable walls", (scene) => {
+      scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+      scene.reflectivity_corridor.walls = makeReflectivityCorridor().walls;
+    }],
+    ["unavailable geometry kind", (scene) => {
+      scene.reflectivity_corridor = makeUnavailableReflectivityCorridor();
+      scene.reflectivity_corridor.geometry = "parallel";
+    }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      mutate(snapshot.scene);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity corridor contract/,
+      );
+    });
+  }
+});
+
+test("rejects malformed measured wall geometry and inconsistent pairs", async (t) => {
+  const cases = [
+    ["wall object", (corridor) => { corridor.walls[0] = null; }],
+    ["wall id", (corridor) => { corridor.walls[0].wall_id = "left"; }],
+    ["duplicate id", (corridor) => { corridor.walls[1].wall_id = "wall_1"; }],
+    ["heading nonfinite", (corridor) => { corridor.walls[0].heading_deg = NaN; }],
+    ["heading out of range", (corridor) => { corridor.walls[0].heading_deg = 76; }],
+    ["normal nonfinite", (corridor) => { corridor.walls[0].normal_offset_m = Infinity; }],
+    ["support too low", (corridor) => { corridor.walls[0].support_cells = 1; }],
+    ["support fractional", (corridor) => { corridor.walls[0].support_cells = 2.5; }],
+    ["span too short", (corridor) => { corridor.walls[0].span_m = 0.039; }],
+    ["intensity too low", (corridor) => { corridor.walls[0].mean_intensity = 0.299; }],
+    ["intensity too high", (corridor) => { corridor.walls[0].mean_intensity = 1.01; }],
+    ["start arity", (corridor) => { corridor.walls[0].start = [0.1]; }],
+    ["end nonfinite", (corridor) => { corridor.walls[0].end[1] = Infinity; }],
+    ["reversed endpoints", (corridor) => {
+      [corridor.walls[0].start, corridor.walls[0].end] =
+        [corridor.walls[0].end, corridor.walls[0].start];
+    }],
+    ["endpoint span mismatch", (corridor) => { corridor.walls[0].end[0] -= 0.1; }],
+    ["nonparallel pair", (corridor) => { corridor.walls[1].heading_deg = 50; }],
+    ["width mismatch", (corridor) => { corridor.walls[1].normal_offset_m += 0.02; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      mutate(snapshot.scene.reflectivity_corridor);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity corridor contract/,
+      );
+    });
+  }
+});
+
+test("rejects converging wall pairs that do not describe their measured bottleneck", async (t) => {
+  const converging = () => ({
+    status: "confirmed",
+    method: "deterministic_boundary_fit",
+    geometry: "converging",
+    history_frames: 5,
+    required_hits: 3,
+    hits: 3,
+    measured_heading_deg: 0.0,
+    guidance_heading_deg: 0.0,
+    width_m: 0.10,
+    confidence: 0.86,
+    walls: [
+      {
+        wall_id: "wall_1", heading_deg: 45.0,
+        normal_offset_m: -0.318198, support_cells: 5,
+        span_m: 0.282843, mean_intensity: 0.82,
+        start: [0.20, -0.25], end: [0.40, -0.05],
+      },
+      {
+        wall_id: "wall_2", heading_deg: -45.0,
+        normal_offset_m: 0.318198, support_cells: 5,
+        span_m: 0.282843, mean_intensity: 0.82,
+        start: [0.20, 0.25], end: [0.40, 0.05],
+      },
+    ],
+  });
+  const cases = [
+    ["not narrowing", (corridor) => { corridor.walls[1].end[1] = 0.35; }],
+    ["wrong bottleneck", (corridor) => { corridor.width_m = 0.11; }],
+    ["wrong centerline", (corridor) => {
+      corridor.measured_heading_deg = 5;
+      corridor.guidance_heading_deg = 5;
+    }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.reflectivity_corridor = converging();
+      mutate(snapshot.scene.reflectivity_corridor);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity corridor contract/,
+      );
+    });
+  }
+});
+
+test("rejects every strict reflectivity-surface metadata mismatch", async (t) => {
+  const cases = [
+    ["missing", (scene) => delete scene.reflectivity_surface],
+    ["null", (scene) => { scene.reflectivity_surface = null; }],
+    ["radius_m", (scene) => { scene.reflectivity_surface.radius_m = 0.30; }],
+    ["resolution_m", (scene) => { scene.reflectivity_surface.resolution_m = 0.05; }],
+    ["history_frames", (scene) => { scene.reflectivity_surface.history_frames = 4; }],
+    ["required_hits", (scene) => { scene.reflectivity_surface.required_hits = 2; }],
+    ["retention", (scene) => { scene.reflectivity_surface.retention = "ttl"; }],
+    ["pose_mode", (scene) => { scene.reflectivity_surface.pose_mode = "robot_relative"; }],
+    ["source", (scene) => { scene.reflectivity_surface.source = "raw_heatmap"; }],
+    ["normalization", (scene) => { scene.reflectivity_surface.normalization = "row_peak"; }],
+    ["calibrated", (scene) => { scene.reflectivity_surface.calibrated = false; }],
+    ["room_baseline_used", (scene) => { scene.reflectivity_surface.room_baseline_used = true; }],
+    ["valid_min_range_m", (scene) => { scene.reflectivity_surface.valid_min_range_m = 0.01; }],
+    ["independent_beam_count", (scene) => { scene.reflectivity_surface.independent_beam_count = 32; }],
+    ["cells", (scene) => { scene.reflectivity_surface.cells = null; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.reflectivity_surface = makeFullEvidenceSurface();
+      mutate(snapshot.scene);
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity surface contract/,
+      );
+    });
+  }
+});
+
+test("parsed reflectivity surface preserves physical beam metadata", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_surface = makeFullEvidenceSurface();
+  const parsed = sceneApi.parseRadarScene(snapshot);
+
+  assert.equal(parsed.reflectivitySurface.calibrated, true);
+  assert.equal(
+    parsed.reflectivitySurface.normalization,
+    "current_range_common_mode_physical_beam",
+  );
+  assert.equal(parsed.reflectivitySurface.roomBaselineUsed, false);
+  assert.equal(parsed.reflectivitySurface.validMinRangeM, 0.12);
+  assert.equal(parsed.reflectivitySurface.independentBeamCount, 5);
+});
+
+test("rejects every strict reflectivity cell violation", async (t) => {
+  const cases = [
+    ["missing forward", (cell) => delete cell.forward_m],
+    ["non-finite forward", (cell) => { cell.forward_m = Infinity; }],
+    ["behind radar", (cell) => { cell.forward_m = -0.025; }],
+    ["non-finite lateral", (cell) => { cell.lateral_m = NaN; }],
+    ["outside radius", (cell) => { cell.forward_m = 0.40; cell.lateral_m = 0.325; }],
+    ["off-grid forward", (cell) => { cell.forward_m = 0.401; }],
+    ["off-grid lateral", (cell) => { cell.lateral_m = 0.051; }],
+    ["negative intensity", (cell) => { cell.intensity = -0.01; }],
+    ["intensity above one", (cell) => { cell.intensity = 1.01; }],
+    ["non-finite intensity", (cell) => { cell.intensity = Infinity; }],
+    ["zero persistence", (cell) => { cell.persistence = 0; }],
+    ["persistence above one", (cell) => { cell.persistence = 1.01; }],
+    ["non-finite persistence", (cell) => { cell.persistence = NaN; }],
+    ["hits below required", (cell) => { cell.hits = 2; cell.persistence = 0.4; }],
+    ["hits above history", (cell) => { cell.hits = 6; cell.persistence = 1.2; }],
+    ["fractional hits", (cell) => { cell.hits = 3.5; cell.persistence = 0.7; }],
+    ["persistence mismatch", (cell) => { cell.persistence = 0.8; }],
+    ["negative age", (cell) => { cell.age_ms = -1; }],
+    ["fractional age", (cell) => { cell.age_ms = 0.5; }],
+    ["non-finite age", (cell) => { cell.age_ms = Infinity; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      const cell = makeReflectivityCell();
+      mutate(cell);
+      snapshot.scene.reflectivity_surface.cells = [cell];
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /reflectivity surface contract/,
+      );
+    });
+  }
+});
+
+test("rejects duplicate reflectivity grid coordinates", () => {
+  const snapshot = makeSnapshot();
+  snapshot.scene.reflectivity_surface.cells = [
+    makeReflectivityCell(),
+    makeReflectivityCell({ intensity: 0.7 }),
+  ];
+
+  assert.throws(
+    () => sceneApi.parseRadarScene(snapshot),
+    /reflectivity surface contract/,
+  );
+});
+
+test("presence selects new mode and invalid present data never falls back", async (t) => {
+  for (const [name, value] of [
+    ["null", null],
+    ["string", "invalid"],
+    ["array", []],
+    ["number", 1],
+  ]) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.probabilistic_local_map = value;
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /probabilistic map contract/);
+    });
+  }
+  await t.test("invalid object with valid rolling alias", () => {
+    const snapshot = makeSnapshot();
+    snapshot.scene.probabilistic_local_map.radius_m = 0.49;
+    assert.throws(() => sceneApi.parseRadarScene(snapshot), /probabilistic map contract/);
+  });
+});
+
+test("rejects every strict probability-map metadata mismatch", async (t) => {
+  const cases = [
+    ["radius_m", 0.49],
+    ["resolution_m", 0.10],
+    ["occupied_threshold", 0.70],
+    ["decay_half_life_ms", 999],
+    ["ttl_ms", 2499],
+    ["retention", "until_reset"],
+    ["pose_mode", "robot_relative"],
+    ["cells", null],
+  ];
+  for (const [field, invalid] of cases) {
+    await t.test(field, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.probabilistic_local_map[field] = invalid;
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /probabilistic map contract/);
+    });
+  }
+});
+
+test("rejects every strict probability cell violation", async (t) => {
+  const cases = [
+    ["missing forward_m", (cell) => delete cell.forward_m],
+    ["non-finite forward_m", (cell) => { cell.forward_m = Infinity; }],
+    ["non-finite lateral_m", (cell) => { cell.lateral_m = NaN; }],
+    ["outside radial boundary", (cell) => { cell.forward_m = 0.40; cell.lateral_m = 0.40; }],
+    ["probability at prior", (cell) => { cell.probability = 0.50; cell.occupied = false; }],
+    ["probability above cap", (cell) => { cell.probability = 0.98; }],
+    ["non-finite probability", (cell) => { cell.probability = NaN; }],
+    ["negative confidence", (cell) => { cell.confidence = -0.01; }],
+    ["confidence above one", (cell) => { cell.confidence = 1.01; }],
+    ["non-finite confidence", (cell) => { cell.confidence = Infinity; }],
+    ["non-boolean occupied", (cell) => { cell.occupied = 1; }],
+    ["zero hits", (cell) => { cell.hits = 0; }],
+    ["negative hits", (cell) => { cell.hits = -1; }],
+    ["fractional hits", (cell) => { cell.hits = 1.5; }],
+    ["missing hits", (cell) => delete cell.hits],
+    ["negative age", (cell) => { cell.age_ms = -1; }],
+    ["age at ttl", (cell) => { cell.age_ms = 2500; }],
+    ["non-finite age", (cell) => { cell.age_ms = Infinity; }],
+    ["missing range uncertainty", (cell) => delete cell.range_uncertainty_m],
+    ["negative range uncertainty", (cell) => { cell.range_uncertainty_m = -0.01; }],
+    ["non-finite range uncertainty", (cell) => { cell.range_uncertainty_m = NaN; }],
+    ["missing lateral uncertainty", (cell) => delete cell.lateral_uncertainty_m],
+    ["negative lateral uncertainty", (cell) => { cell.lateral_uncertainty_m = -0.01; }],
+    ["non-finite lateral uncertainty", (cell) => { cell.lateral_uncertainty_m = Infinity; }],
+    ["invalid source", (cell) => { cell.source = "camera"; }],
+    ["occupied below threshold", (cell) => { cell.probability = 0.70; cell.occupied = true; }],
+    ["unoccupied at threshold", (cell) => { cell.probability = 0.75; cell.occupied = false; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      const cell = makeProbabilityCell();
+      mutate(cell);
+      snapshot.scene.probabilistic_local_map.cells = [cell];
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /probabilistic map contract/);
+    });
+  }
+});
+
+test("validates and preserves each supported height band/reference pairing", async (t) => {
+  const cases = [
+    ["below sensor", makePointTrack({ height_m: -0.11, height_band: "below_sensor" })],
+    ["sensor level", makePointTrack({ height_m: 0.0, height_band: "sensor_level" })],
+    ["above sensor", makePointTrack({ height_m: 0.11, height_band: "above_sensor" })],
+    ["heatmap unavailable", makeHeatmapTrack()],
+  ];
+  for (const [name, track] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.tracks = [track];
+      const parsed = sceneApi.parseRadarScene(snapshot);
+      assert.deepEqual(parsed.filteredTracks, [track]);
+    });
+  }
+});
+
+test("rejects every strict new-mode track violation before freshness filtering", async (t) => {
+  const cases = [
+    ["missing identity", () => makePointTrack({ track_id: undefined })],
+    ["zero identity", () => makePointTrack({ track_id: 0 })],
+    ["negative identity", () => makePointTrack({ track_id: -1 })],
+    ["fractional identity", () => makePointTrack({ track_id: 1.5 })],
+    ["missing age", () => makePointTrack({ age_ms: undefined })],
+    ["negative age", () => makePointTrack({ age_ms: -1 })],
+    ["fractional stale age", () => makePointTrack({ age_ms: 300.5 })],
+    ["non-finite age", () => makePointTrack({ age_ms: Infinity })],
+    ["invalid source", () => makePointTrack({ source: "camera" })],
+    ["invalid classification", () => makePointTrack({ classification: "wall" })],
+    ["missing forward", () => makePointTrack({ forward_m: undefined })],
+    ["non-finite forward", () => makePointTrack({ forward_m: Infinity })],
+    ["non-finite lateral", () => makePointTrack({ lateral_m: NaN })],
+    ["non-finite distance", () => makePointTrack({ distance_m: Infinity })],
+    ["distance/hypot mismatch", () => makePointTrack({ distance_m: 0.402 })],
+    ["missing point hazard distance", () => makePointTrack({ hazard_distance_m: undefined })],
+    ["negative point hazard distance", () => makePointTrack({ hazard_distance_m: -0.01 })],
+    ["non-finite point hazard distance", () => makePointTrack({ hazard_distance_m: Infinity })],
+    ["negative confidence", () => makePointTrack({ confidence: -0.01 })],
+    ["confidence above one", () => makePointTrack({ confidence: 1.01 })],
+    ["missing range uncertainty", () => makePointTrack({ range_uncertainty_m: undefined })],
+    ["negative range uncertainty", () => makePointTrack({ range_uncertainty_m: -0.01 })],
+    ["non-finite range uncertainty", () => makePointTrack({ range_uncertainty_m: NaN })],
+    ["missing lateral uncertainty", () => makePointTrack({ lateral_uncertainty_m: undefined })],
+    ["negative lateral uncertainty", () => makePointTrack({ lateral_uncertainty_m: -0.01 })],
+    ["non-finite lateral uncertainty", () => makePointTrack({ lateral_uncertainty_m: Infinity })],
+    ["point classification mismatch", () => makePointTrack({ point_confirmed: false })],
+    ["missing point confirmation", () => makePointTrack({ point_confirmed: undefined })],
+    ["missing map confirmation", () => makePointTrack({ map_confirmed: undefined })],
+    ["non-boolean map confirmation", () => makePointTrack({ map_confirmed: 1 })],
+    ["point wrong height band", () => makePointTrack({ height_m: 0.11, height_band: "sensor_level" })],
+    ["point unavailable reference", () => makePointTrack({ height_reference: "unavailable" })],
+    ["point missing finite height", () => makePointTrack({ height_m: null, height_band: "unknown" })],
+    ["heatmap classification mismatch", () => makeHeatmapTrack({ heatmap_confirmed: true })],
+    ["missing heatmap confirmation", () => makeHeatmapTrack({ heatmap_confirmed: undefined })],
+    ["heatmap invented height", () => makeHeatmapTrack({ height_m: 0, height_band: "sensor_level", height_reference: "sensor_relative_uncalibrated" })],
+    ["heatmap invented reference", () => makeHeatmapTrack({ height_reference: "sensor_relative_uncalibrated" })],
+    ["heatmap invented hazard distance", () => makeHeatmapTrack({ hazard_distance_m: 0.09 })],
+  ];
+  for (const [name, makeTrack] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.tracks = [makeTrack()];
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /track contract/);
+    });
+  }
+});
+
+test("filtered tracks retain tentative point and heatmap reflection evidence", () => {
+  const tracks = [
+    makePointTrack({
+      track_id: 11,
+      classification: "point_candidate",
+      point_confirmed: false,
+      map_confirmed: false,
+      forward_m: 0.30,
+      lateral_m: 0.02,
+      distance_m: 0.301,
+      confidence: 0.6,
+    }),
+    makeHeatmapTrack({ track_id: 12 }),
+  ];
+  const snapshot = makeSnapshot();
+  snapshot.scene.tracks = tracks;
+  snapshot.scene.obstacle_tracks = [];
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.deepEqual(parsed.filteredTracks.map((track) => track.track_id), [11, 12]);
+  assert.deepEqual(parsed.tracks, []);
+});
+
+test("separates confirmed obstacles from validated reflection evidence", () => {
+  const obstacle = makePointTrack();
+  const reflection = makeHeatmapTrack();
+  const snapshot = makeSnapshot();
+  snapshot.scene.tracks = [obstacle, reflection];
+  snapshot.scene.obstacle_tracks = [obstacle];
+  snapshot.scene.reference_tracks = [reflection];
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.deepEqual(parsed.tracks.map((track) => track.track_id), [1]);
+  assert.deepEqual(parsed.referenceTracks.map((track) => track.track_id), [2]);
+});
+
+test("requires every additive diagnostic to be a non-negative integer", async (t) => {
+  const invalidValues = [
+    ["missing", Symbol("delete")],
+    ["null", null],
+    ["negative", -1],
+    ["fractional", 0.5],
+    ["not finite", NaN],
+  ];
+  for (const key of ADDITIVE_DIAGNOSTIC_KEYS) {
+    for (const [label, invalid] of invalidValues) {
+      await t.test(`${key} ${label}`, () => {
+        const snapshot = makeSnapshot();
+        if (typeof invalid === "symbol") {
+          delete snapshot.scene.diagnostics[key];
+        } else {
+          snapshot.scene.diagnostics[key] = invalid;
+        }
+        assert.throws(() => sceneApi.parseRadarScene(snapshot), /diagnostics contract/);
+      });
+    }
+  }
+});
+
+test("parses a detached configured ground filter for probability scenes", () => {
+  const snapshot = makeSnapshot();
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.deepEqual(parsed.groundFilter, {
+    sensorHeightM: 0.065,
+    sensorPitchDeg: 0.0,
+    groundRejectionHeightM: 0.035,
+    groundUncertaintyM: 0.015,
+    effectiveRejectionHeightM: 0.05,
+    filterRangeM: 0.60,
+    pitchConvention: "positive_up",
+    status: "configured",
+  });
+  snapshot.scene.ground_filter.sensor_height_m = 0.5;
+  assert.equal(parsed.groundFilter.sensorHeightM, 0.065);
+});
+
+test("rejects malformed probability-scene ground filter contracts", async (t) => {
+  const remove = Symbol("delete");
+  const cases = [
+    ["object missing", "ground_filter", remove],
+    ["height missing", "sensor_height_m", remove],
+    ["height string", "sensor_height_m", "0.065"],
+    ["height boolean", "sensor_height_m", true],
+    ["height nan", "sensor_height_m", NaN],
+    ["height infinity", "sensor_height_m", Infinity],
+    ["height negative", "sensor_height_m", -0.001],
+    ["pitch missing", "sensor_pitch_deg", remove],
+    ["pitch boolean", "sensor_pitch_deg", false],
+    ["pitch nan", "sensor_pitch_deg", NaN],
+    ["rejection missing", "ground_rejection_height_m", remove],
+    ["rejection string", "ground_rejection_height_m", "0.035"],
+    ["rejection boolean", "ground_rejection_height_m", true],
+    ["rejection negative", "ground_rejection_height_m", -0.001],
+    ["rejection equals height", "ground_rejection_height_m", 0.065],
+    ["rejection above height", "ground_rejection_height_m", 0.07],
+    ["uncertainty missing", "ground_uncertainty_m", remove],
+    ["uncertainty string", "ground_uncertainty_m", "0.015"],
+    ["uncertainty boolean", "ground_uncertainty_m", true],
+    ["uncertainty negative", "ground_uncertainty_m", -0.001],
+    ["uncertainty nan", "ground_uncertainty_m", NaN],
+    ["effective missing", "effective_rejection_height_m", remove],
+    ["effective mismatch", "effective_rejection_height_m", 0.049],
+    ["effective reaches sensor", "ground_uncertainty_m", 0.03],
+    ["range missing", "filter_range_m", remove],
+    ["range string", "filter_range_m", "0.60"],
+    ["range boolean", "filter_range_m", true],
+    ["range zero", "filter_range_m", 0],
+    ["range negative", "filter_range_m", -0.1],
+    ["range infinity", "filter_range_m", Infinity],
+    ["convention missing", "pitch_convention", remove],
+    ["convention wrong", "pitch_convention", "positive_down"],
+    ["status missing", "status", remove],
+    ["status wrong", "status", "disabled"],
+  ];
+  for (const [label, key, invalid] of cases) {
+    await t.test(label, () => {
+      const snapshot = makeSnapshot();
+      if (key === "ground_filter") {
+        delete snapshot.scene.ground_filter;
+      } else if (typeof invalid === "symbol") {
+        delete snapshot.scene.ground_filter[key];
+      } else {
+        snapshot.scene.ground_filter[key] = invalid;
+      }
+      assert.throws(
+        () => sceneApi.parseRadarScene(snapshot),
+        /ground filter contract/,
+      );
+    });
+  }
+});
+
+test("legacy scenes remain compatible without a ground filter", () => {
+  const parsed = sceneApi.parseRadarScene(makeLegacySnapshot());
+  assert.equal(parsed.groundFilter, null);
+});
+
+test("returns validated diagnostics and recursively detached presentation data", () => {
+  const snapshot = makeSnapshot();
+  const cell = makeProbabilityCell();
+  const point = makePointTrack();
+  snapshot.scene.probabilistic_local_map.cells = [cell];
+  snapshot.scene.tracks = [point];
+  snapshot.scene.obstacle_tracks = [point];
+  snapshot.scene.diagnostics.raw_point_count = 7;
+  setPath(snapshot, {
+    stability_status: "route_changed_blocked",
+    switch_accepted: true,
+    blocked_previous_path: {
+      points: [[0, 0], [0.01, 0]],
+      segments: [{ start_index: 1, end_index: 1, reason: "occupied" }],
+    },
+  });
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.diagnostics.raw_point_count, 7);
+
+  parsed.diagnostics.nested = { changed: true };
+  parsed.probabilisticLocalMap.cells[0].source = "changed";
+  parsed.filteredTracks[0].height_band = "changed";
+  parsed.tracks[0].height_reference = "changed";
+  parsed.plannedPath.points[1][0] = 99;
+  parsed.plannedPath.blocked_previous_path.points[0][0] = 99;
+  parsed.plannedPath.blocked_previous_path.segments[0].reason = "changed";
+
+  assert.equal(snapshot.scene.diagnostics.nested, undefined);
+  assert.equal(cell.source, "point");
+  assert.equal(point.height_band, "sensor_level");
+  assert.equal(point.height_reference, "sensor_relative_uncalibrated");
+  assert.equal(snapshot.scene.planned_path.points[1][0], 0.01);
+  assert.equal(snapshot.scene.planned_path.blocked_previous_path.points[0][0], 0);
+  assert.equal(snapshot.scene.planned_path.blocked_previous_path.segments[0].reason, "occupied");
+});
+
+test("rejects malformed or missing physical and selector path fields", async (t) => {
+  const cases = [
+    ["missing status", "status", undefined],
+    ["invalid status", "status", "safe"],
+    ["missing stability", "stability_status", undefined],
+    ["invalid stability", "stability_status", "quiet"],
+    ["resolution", "resolution_m", 0.02],
+    ["non-finite length", "length_m", Infinity],
+    ["negative length", "length_m", -0.01],
+    ["non-finite curvature", "curvature_per_m", NaN],
+    ["points", "points", null],
+    ["robot width missing", "robot_width_m", undefined],
+    ["robot width", "robot_width_m", 0.16],
+    ["safety margin missing", "safety_margin_m", undefined],
+    ["safety margin", "safety_margin_m", 0.04],
+    ["passage width missing", "minimum_passage_width_m", undefined],
+    ["passage width", "minimum_passage_width_m", 0.20],
+    ["hold missing", "minimum_hold_ms", undefined],
+    ["hold", "minimum_hold_ms", 1],
+    ["confirmation missing", "switch_confirm_frames", undefined],
+    ["confirmation", "switch_confirm_frames", 2],
+    ["pending missing", "pending_switch_frames", undefined],
+    ["pending negative", "pending_switch_frames", -1],
+    ["pending fractional", "pending_switch_frames", 0.5],
+    ["pending at limit", "pending_switch_frames", 3],
+    ["accepted missing", "switch_accepted", undefined],
+    ["accepted non-boolean", "switch_accepted", 0],
+    ["replan missing", "replan_every_frame", undefined],
+    ["replan false", "replan_every_frame", false],
+    ["blocked overlay missing", "blocked_previous_path", undefined],
+  ];
+  for (const [name, field, invalid] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      if (invalid === undefined) {
+        delete snapshot.scene.planned_path[field];
+      } else {
+        snapshot.scene.planned_path[field] = invalid;
+      }
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /planned path contract/);
+    });
+  }
+});
+
+test("rejects invalid new-mode path geometry and status combinations", async (t) => {
+  const cases = [
+    ["non-pair point", { points: [[0, 0], [0.01]] }],
+    ["non-finite point", { points: [[0, 0], [Infinity, 0]] }],
+    ["route does not start at origin", { points: [[0.01, 0], [0.02, 0], [0.03, 0]] }],
+    ["route is not sampled at one centimeter", { points: [[0, 0], [0.02, 0]], length_m: 0.02 }],
+    ["length disagrees with geometry", { length_m: 0.03 }],
+    ["neutral status with route stability", { status: "initializing" }],
+    ["route status with neutral stability", { stability_status: "reset" }],
+    ["accepted without route change", { switch_accepted: true }],
+    ["route change not accepted", { stability_status: "route_changed_confirmed" }],
+  ];
+  for (const [name, overrides] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      setPath(snapshot, overrides);
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /planned path contract/);
+    });
+  }
+});
+
+test("requires pending path selector count to match diagnostics", () => {
+  const snapshot = makeSnapshot();
+  setPath(snapshot, { stability_status: "holding_candidate", pending_switch_frames: 1 });
+  assert.throws(() => sceneApi.parseRadarScene(snapshot), /planned path contract/);
+});
+
+test("accepts neutral initializing and reset paths without inventing a route", async (t) => {
+  for (const status of ["initializing", "reset"]) {
+    await t.test(status, () => {
+      const snapshot = makeSnapshot();
+      setPath(snapshot, {
+        status,
+        stability_status: status,
+        length_m: 0,
+        points: [[0, 0]],
+      });
+      const parsed = sceneApi.parseRadarScene(snapshot);
+      assert.equal(parsed.plannedPath.status, status);
+      assert.equal(parsed.plannedPath.stability_status, status);
+      assert.equal(parsed.plannedPath.length_m, 0);
+      assert.deepEqual(parsed.plannedPath.points, [[0, 0]]);
+    });
+  }
+});
+
+test("preserves a NORMAL blocked-near-field stop", () => {
+  const snapshot = makeSnapshot();
+  setPath(snapshot, {
+    status: "blocked_near_field",
+    stability_status: "route_changed_blocked",
+    length_m: 0,
+    points: [[0, 0]],
+    switch_accepted: true,
+  });
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.hazard.level, "NORMAL");
+  assert.equal(parsed.plannedPath.status, "blocked_near_field");
+  assert.equal(parsed.plannedPath.stability_status, "route_changed_blocked");
+});
+
+test("preserves two measured turn candidates when the required side is unresolved", () => {
+  const snapshot = makeSnapshot();
+  setPath(snapshot, {
+    status: "turn_side_unresolved",
+    stability_status: "stable",
+    length_m: 0,
+    curvature_per_m: 0,
+    points: [[0, 0]],
+    turn_candidates: [
+      {
+        direction: "left", angle_deg: -20, cost: 0.61,
+        goal_forward_m: 0.244, goal_lateral_m: -0.089,
+        points: [[0, 0], [0.01, -0.0004], [0.02, -0.0015]],
+      },
+      {
+        direction: "right", angle_deg: 20, cost: 0.62,
+        goal_forward_m: 0.244, goal_lateral_m: 0.089,
+        points: [[0, 0], [0.01, 0.0004], [0.02, 0.0015]],
+      },
+    ],
+  });
+
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.plannedPath.status, "turn_side_unresolved");
+  assert.deepEqual(
+    parsed.plannedPath.turn_candidates.map((candidate) => candidate.direction),
+    ["left", "right"],
+  );
+  assert.deepEqual(parsed.plannedPath.points, [[0, 0]]);
+});
+
+test("validates every blocked previous path point and segment field", async (t) => {
+  const validOverlay = () => ({
+    points: [[0, 0], [0.01, 0], [0.02, 0]],
+    segments: [{ start_index: 1, end_index: 2, reason: "occupied" }],
+  });
+  const cases = [
+    ["null points", (overlay) => { overlay.points = null; }],
+    ["non-pair point", (overlay) => { overlay.points[1] = [0.01]; }],
+    ["non-finite point", (overlay) => { overlay.points[1] = [NaN, 0]; }],
+    ["null segments", (overlay) => { overlay.segments = null; }],
+    ["non-object segment", (overlay) => { overlay.segments[0] = null; }],
+    ["fractional start", (overlay) => { overlay.segments[0].start_index = 0.5; }],
+    ["negative start", (overlay) => { overlay.segments[0].start_index = -1; }],
+    ["end outside points", (overlay) => { overlay.segments[0].end_index = 3; }],
+    ["reversed inclusive indices", (overlay) => { overlay.segments[0].start_index = 2; overlay.segments[0].end_index = 1; }],
+    ["empty reason", (overlay) => { overlay.segments[0].reason = ""; }],
+    ["whitespace reason", (overlay) => { overlay.segments[0].reason = "   "; }],
+    ["non-string reason", (overlay) => { overlay.segments[0].reason = 1; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const snapshot = makeSnapshot();
+      const overlay = validOverlay();
+      mutate(overlay);
+      setPath(snapshot, {
+        stability_status: "route_changed_blocked",
+        switch_accepted: true,
+        blocked_previous_path: overlay,
+      });
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /planned path contract/);
+    });
+  }
+});
+
+test("preserves a valid blocked previous path overlay", () => {
+  const snapshot = makeSnapshot();
+  setPath(snapshot, {
+    stability_status: "route_changed_blocked",
+    switch_accepted: true,
+    blocked_previous_path: {
+      points: [[0, 0], [0.01, 0], [0.02, 0]],
+      segments: [{ start_index: 1, end_index: 2, reason: "occupied" }],
+    },
+  });
+  assert.deepEqual(
+    sceneApi.parseRadarScene(snapshot).plannedPath.blocked_previous_path,
+    snapshot.scene.planned_path.blocked_previous_path,
+  );
+});
+
+test("preserves a validated blocked overlay after the changed route stabilizes", () => {
+  const snapshot = makeSnapshot();
+  setPath(snapshot, {
+    stability_status: "stable",
+    blocked_previous_path: {
+      points: [[0, 0], [0.01, 0], [0.02, 0]],
+      segments: [{ start_index: 1, end_index: 2, reason: "occupied" }],
+    },
+  });
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.plannedPath.stability_status, "stable");
+  assert.equal(
+    parsed.plannedPath.blocked_previous_path.segments[0].reason,
+    "occupied",
+  );
+});
+
+test("preserves the one-centimeter planned path and motion estimate", () => {
+  const snapshot = makeSnapshot({
+    scene: {
+      motion_compensation: { status: "ok", applied: true, matched_points: 5 },
+    },
+  });
+  setPath(snapshot, {
+    status: "limited",
+    points: [[0, 0], [0.01, 0], [0.02, 0.001]],
+  });
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.plannedPath.resolution_m, 0.01);
+  assert.equal(parsed.plannedPath.points.length, 3);
+  assert.equal(parsed.motionCompensation.applied, true);
+  assert.equal(parsed.motionCompensation.matched_points, 5);
+});
+
+test("true legacy absence preserves decoded grid and rolling circles", () => {
+  const legacyTrack = {
+    track_id: 41,
+    age_ms: 0,
+    source: "point",
+    point_confirmed: false,
+    forward_m: 0.40,
+    lateral_m: 0,
+  };
+  const snapshot = makeLegacySnapshot();
+  snapshot.scene.tracks = [legacyTrack];
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.equal(parsed.poseMode, "robot_relative");
+  assert.equal(parsed.probabilisticLocalMap, null);
+  assert.equal(parsed.grid.length, 3600);
+  assert.deepEqual(parsed.rollingMapObstacles, snapshot.scene.rolling_local_map.cells);
+  assert.deepEqual(parsed.filteredTracks, [legacyTrack]);
+  assert.notStrictEqual(parsed.filteredTracks[0], legacyTrack);
+  for (const key of ADDITIVE_DIAGNOSTIC_KEYS) {
+    assert.equal(parsed.diagnostics[key], null, key);
+  }
+});
+
+test("new and true legacy modes require their exact pose values", () => {
+  assert.equal(sceneApi.parseRadarScene(makeSnapshot()).poseMode, "robot_relative_short_memory");
+  assert.equal(sceneApi.parseRadarScene(makeLegacySnapshot()).poseMode, "robot_relative");
+
+  const wrongNew = makeSnapshot();
+  wrongNew.scene.pose_mode = "robot_relative";
+  assert.throws(() => sceneApi.parseRadarScene(wrongNew), /pose contract/);
+
+  const wrongLegacy = makeLegacySnapshot();
+  wrongLegacy.scene.pose_mode = "robot_relative_short_memory";
+  assert.throws(() => sceneApi.parseRadarScene(wrongLegacy), /pose contract/);
+});
+
+test("preserves legacy accumulated obstacle, travel trail, and rolling metadata", () => {
+  const snapshot = makeLegacySnapshot();
+  snapshot.scene.accumulated_obstacles = [{
+    obstacle_id: 3,
+    forward_m: 0.7,
+    lateral_m: -0.2,
+    confidence: 0.9,
+    age_ms: 1200,
+    remaining_ms: 3800,
+  }];
+  snapshot.scene.obstacle_memory_window_ms = 5000;
+  snapshot.scene.travel_trail = {
+    radius_m: 0.50,
+    resolution_m: 0.01,
+    motion_relative: true,
+    source: "radar_ego_motion",
+    points: [[-0.20, 0.04], [-0.10, 0.02], [0, 0]],
+  };
+  const parsed = sceneApi.parseRadarScene(snapshot);
+  assert.deepEqual(parsed.accumulatedObstacles, snapshot.scene.accumulated_obstacles);
+  assert.equal(parsed.obstacleMemoryWindowMs, 5000);
+  assert.deepEqual(parsed.travelTrail.points, snapshot.scene.travel_trail.points);
+  assert.equal(parsed.rollingMap.radiusM, 0.50);
+  assert.equal(parsed.rollingMap.motionRelative, true);
+});
+
+test("normal preserves uncertainty without safe or free surface claims", () => {
+  const parsed = sceneApi.parseRadarScene(makeSnapshot());
+  assert.equal(parsed.safe, undefined);
+  assert.equal(parsed.free, undefined);
+  assert.equal(parsed.inferredWall, undefined);
+  assert.equal(parsed.inferredSurface, undefined);
+});
+
+test("rejects unsupported schema and every scene-v1 grid mismatch", async (t) => {
+  assert.throws(
+    () => sceneApi.parseRadarScene(makeSnapshot({ scene: { schema_version: 2 } })),
+    /unsupported scene schema/,
+  );
+  const mismatches = [
+    ["resolution_m", 0.1],
+    ["forward_cells", 59],
+    ["lateral_cells", 61],
+    ["origin_forward_cell", 1],
+    ["origin_lateral_cell", 29],
+    ["encoding", "occupancy-u8"],
+    ["layout", "lateral-major_forward-minor"],
+    ["unknown_value", 255],
+  ];
+  for (const [field, value] of mismatches) {
+    await t.test(field, () => {
+      const snapshot = makeSnapshot();
+      snapshot.scene.grid = { ...snapshot.scene.grid, [field]: value };
+      assert.throws(() => sceneApi.parseRadarScene(snapshot), /scene grid contract/);
+    });
+  }
+});
+
+test("preserves all blocked-source, calibration, and sensor-fault rules", () => {
+  for (const status of ["waiting", "stale", "fault", "replay_end"]) {
+    const parsed = sceneApi.parseRadarScene(makeSnapshot({ status }));
+    assert.deepEqual(parsed, { blocked: true, reason: status });
+  }
+  for (const calibrationStatus of [
+    "calibration_required",
+    "calibration_unavailable",
+    "calibration_mismatch",
+    "profile_mismatch",
+  ]) {
+    const parsed = sceneApi.parseRadarScene(
+      makeSnapshot({ scene: { calibration_status: calibrationStatus } }),
+    );
+    assert.deepEqual(parsed, { blocked: true, reason: calibrationStatus });
+  }
+  const fault = makeSnapshot({
+    scene: {
+      hazard: { level: "SENSOR_FAULT", threshold_m: 0.1, reason: "source_fault" },
+    },
+  });
+  assert.deepEqual(sceneApi.parseRadarScene(fault), { blocked: true, reason: "sensor_fault" });
+});
+
+test("renders only live and degraded sources", () => {
+  for (const status of ["live", "degraded"]) {
+    assert.equal(sceneApi.parseRadarScene(makeSnapshot({ status })).blocked, false);
+  }
+});
+
+test("preserves strict hazard and DANGER consistency rules", async (t) => {
+  for (const level of ["SAFE", "FREE", "unknown"]) {
+    await t.test(`invalid level ${level}`, () => {
+      assert.throws(
+        () => sceneApi.parseRadarScene(makeSnapshot({
+          scene: { hazard: { level, threshold_m: 0.1, reason: "forged" } },
+        })),
+        /hazard contract/,
+      );
+    });
+  }
+  await t.test("non-finite numeric threshold", () => {
+    const snapshot = makeSnapshot();
+    snapshot.scene.hazard.threshold_m = "0.1";
+    assert.throws(() => sceneApi.parseRadarScene(snapshot), /hazard contract/);
+  });
+  await t.test("DANGER without a confirmed point", () => {
+    const snapshot = makeSnapshot();
+    snapshot.scene.tracks = [makeHeatmapTrack({
+      classification: "confirmed_obstacle",
+      heatmap_confirmed: true,
+      forward_m: 0.09,
+      lateral_m: 0,
+      distance_m: 0.09,
+    })];
+    snapshot.scene.obstacle_tracks = [...snapshot.scene.tracks];
+    snapshot.scene.hazard = { level: "DANGER", threshold_m: 0.1, reason: "forged" };
+    assert.throws(() => sceneApi.parseRadarScene(snapshot), /DANGER contract/);
+  });
+  await t.test("DANGER with a fresh confirmed point", () => {
+    const snapshot = makeSnapshot();
+    const point = makePointTrack({
+      forward_m: 0.10,
+      distance_m: 0.10,
+      hazard_distance_m: 0.10,
+    });
+    snapshot.scene.tracks = [point];
+    snapshot.scene.obstacle_tracks = [point];
+    snapshot.scene.hazard = { level: "DANGER", threshold_m: 0.1, reason: "confirmed" };
+    const parsed = sceneApi.parseRadarScene(snapshot);
+    assert.equal(parsed.hazard.level, "DANGER");
+    assert.equal(parsed.tracks[0].track_id, 1);
+  });
+});
+
+test("parses a live producer DANGER snapshot using the current point hazard observation", () => {
+  const repositoryRoot = path.resolve(__dirname, "../..");
+  const source = String.raw`
+import json
+from common.radar_geometry import RadarAxes
+from monitor.radar_scene import RadarSceneEstimator
+from tests.test_radar_scene import point_frame
+
+estimator = RadarSceneEstimator(RadarAxes(), synthetic=True)
+for frame_number, distance_m in enumerate((0.12, 0.12, 0.09), 1):
+    estimator.ingest(
+        point_frame(distance_m, frame_number=frame_number),
+        received_at=20.0 + frame_number / 10.0,
+    )
+print(json.dumps({
+    "status": "live",
+    "scene": estimator.snapshot(now=20.3),
+}, allow_nan=False))
+`;
+  const result = childProcess.spawnSync("python", ["-B", "-c", source], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const parsed = sceneApi.parseRadarScene(JSON.parse(result.stdout));
+  const point = parsed.tracks.find((track) => track.source === "point");
+  assert.equal(parsed.hazard.level, "DANGER");
+  assert.equal(point.distance_m, 0.12);
+  assert.equal(point.hazard_distance_m, 0.09);
+});
+
+test("projects forward and lateral meters into a centered forward map", () => {
+  const transform = sceneApi.makeMapTransform(200, 100, 5, 2);
+  assert.deepEqual(transform, { originX: 100, originY: 100, scale: 20 });
+  assert.deepEqual(sceneApi.projectMapPoint(transform, 1.5, -2), { x: 60, y: 70 });
+});
+
+test("exposes its UMD API and decodes through the browser atob branch", () => {
+  const browserGlobal = {
+    atob: (text) => Buffer.from(text, "base64").toString("binary"),
+    btoa: (text) => Buffer.from(text, "binary").toString("base64"),
+  };
+  const source = fs.readFileSync(
+    require.resolve("../../monitor/web/radar_scene.js"),
+    "utf8",
+  );
+  vm.runInNewContext(source, browserGlobal);
+  const bytes = browserGlobal.HanselRadarScene.decodeOccupancyGrid({
+    encoding: "occupancy-u8-base64",
+    layout: "forward-major_lateral-minor",
+    unknown_value: 0,
+    resolution_m: 0.05,
+    forward_cells: 1,
+    lateral_cells: 1,
+    origin_forward_cell: 0,
+    origin_lateral_cell: 0,
+    data_base64: "AA==",
+  });
+  assert.equal(browserGlobal.HanselRadarScene.TRACK_MAX_AGE_MS, 300);
+  assert.equal(bytes[0], 0);
+});
+
+test("panel diagnostics reads pose only from the validated presentation", () => {
+  const elements = new Map();
+  const document = {
+    querySelector(selector) {
+      if (!elements.has(selector)) {
+        elements.set(selector, { dataset: {}, hidden: false, textContent: "" });
+      }
+      return elements.get(selector);
+    },
+  };
+  const browserGlobal = { document, window: { HanselRadarScene: sceneApi } };
+  const source = fs.readFileSync(
+    require.resolve("../../monitor/web/radar_panel.js"),
+    "utf8",
+  );
+  vm.runInNewContext(source, browserGlobal);
+  const panel = Object.create(browserGlobal.window.HanselRadarPanel.prototype);
+  panel.snapshot = {
+    axes: { forward_axis: "y", forward_sign: 1, lateral_axis: "x", lateral_sign: 1 },
+    frame: null,
+    scene: { pose_mode: "motion_compensated", calibration_status: "ok", diagnostics: {} },
+    counters: {},
+  };
+  panel.updateDiagnostics({
+    blocked: false,
+    poseMode: "robot_relative",
+    tracks: [],
+    grid: new Uint8Array(3600),
+    hazard: { level: "UNKNOWN" },
+  });
+  assert.equal(elements.get("#pose-mode-value").textContent, "ROBOT RELATIVE");
+});

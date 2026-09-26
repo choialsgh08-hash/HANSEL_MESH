@@ -1,0 +1,18 @@
+[Unit]
+Description=HANSEL mesh metrics agent (%i)
+Requires=hansel-mesh@%i.service
+After=hansel-mesh@%i.service
+PartOf=hansel-mesh@%i.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/hansel/HANSEL_MESH
+ExecStart=/home/hansel/HANSEL_MESH/scripts/start_metrics_agent.sh %i
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

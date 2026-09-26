@@ -1,0 +1,2 @@
+"""HANSEL survivor adapter package."""
+

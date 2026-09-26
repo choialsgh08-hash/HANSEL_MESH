@@ -1,0 +1,20 @@
+# Generated files and field recordings are not part of the source release.
+__pycache__/
+.pytest_cache/
+*.pyc
+**/runtime/
+**/ros2_ws/build/
+**/ros2_ws/install/
+**/ros2_ws/log/
+**/logs/
+**/captures/
+**/missions/
+**/report/
+**/monitor_session.jsonl
+**/video_quality.jsonl
+*.sdp
+*.elf
+*.hex
+.env
+*.pem
+*.key

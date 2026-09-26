@@ -1,0 +1,25 @@
+# Rear GPIO calibration and straight speed override; remaining settings use unit_runtime.yaml.
+# GPIO numbers below are BCM, not physical header positions.
+/**:
+  ros__parameters:
+    straight_rpm: 90.0  # 600 CPS at 400 counts/revolution; W/S speed target.
+    gpio_pigpio_port: 8888  # Local pigpiod at 127.0.0.1; no gpio_chip setting.
+    gpio_left_pwm: 18      # physical 12
+    gpio_left_in1: 23      # physical 16
+    gpio_left_in2: 24      # physical 18
+    gpio_right_pwm: 13     # physical 33
+    gpio_right_in1: 27     # physical 13
+    gpio_right_in2: 22     # physical 15
+    gpio_left_encoder_a: 20   # physical 38 / LC1
+    gpio_left_encoder_b: 21   # physical 40 / LC2
+    gpio_right_encoder_a: 26  # physical 37 / RC1
+    gpio_right_encoder_b: 16  # physical 36 / RC2
+    gpio_detach_servo: 6      # physical 31 / MICRO_SIG
+    gpio_pwm_frequency: 1000 # Requested Hz; actual daemon-selected Hz in diagnostics.
+    gpio_left_motor_sign: -1
+    gpio_right_motor_sign: -1
+    gpio_left_encoder_sign: -1
+    gpio_right_encoder_sign: -1
+    gpio_encoder_edges_per_count: 4 # x4 quadrature -> original x1-equivalent CPS.
+    gpio_encoder_pull: up
+    gpio_detach_rest_s: 0.12

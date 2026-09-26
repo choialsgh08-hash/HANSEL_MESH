@@ -1,0 +1,47 @@
+# Field node: victim-facing web form + intake API.
+# Adjust the install paths in the [top of this file] if you did not install to
+# /opt/rescue-network with a `rescue` system user. Secrets live in the
+# EnvironmentFile (chmod 600), never in this unit.
+[Unit]
+Description=Rescue Network - Field Web (form + intake API)
+Documentation=file:///opt/rescue-network/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rescue
+Group=rescue
+WorkingDirectory=/opt/rescue-network
+EnvironmentFile=/etc/rescue-network/field.env
+# WEB_HOST / WEB_PORT come from the EnvironmentFile (default 0.0.0.0:80).
+ExecStart=/opt/rescue-network/.venv/bin/uvicorn rescue_network.field_app:app --host ${WEB_HOST} --port ${WEB_PORT}
+
+# Writable data directory: creates/owns /var/lib/rescue-network (set DATA_DIR
+# to this path in field.env). Shared with the forwarder on the same node.
+StateDirectory=rescue-network
+StateDirectoryMode=0750
+
+# Binding port 80 as a non-root user needs this capability.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Restart policy: keep the rescue form available.
+Restart=always
+RestartSec=3
+# Never give up restarting (rescue system).
+StartLimitIntervalSec=0
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# Logs go to journald (journalctl -u rescue-field-web).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rescue-field-web
+
+[Install]
+WantedBy=multi-user.target

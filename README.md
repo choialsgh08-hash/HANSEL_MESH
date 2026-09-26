@@ -1,88 +1,14 @@
-# HANSEL_MESH
+# HANSEL Final
 
-HANSEL_GRETEL 다유닛 로봇을 위한 BATMAN-adv 기반 Wi-Fi Mesh 릴레이 통신 프로젝트입니다.
+이 브랜치의 최신 코드는 **[HANSEL_Final](HANSEL_Final/)** 폴더에 있다.
 
-- 계층 구조/토폴로지: [Architecture](docs/architecture.md)
-- AR9271 동글 도착 후 실행 절차: [Dongle Arrival Runbook](docs/dongle_arrival_runbook.md)
+구동, 카메라 송수신, 레이더, 오도메트리와 통합 지도를 PC 터미널 하나에서 실행한다.
+키보드는 BASE, 구동과 센서는 Head에서 동작하며 node1/node2도 함께 시작할 수 있다.
 
-## 목표 구조
+**[처음 설치부터 실행·종료까지](HANSEL_Final/README.md)**
 
-```text
-구조자 PC
-   |
-Base Pi
-   |
-Relay Node Pi
-   |
-Head Pi / Robot
-```
+README 순서: 장치 연결 → 코드 다운로드 → Head Nano 업로드 → Pi 전송·빌드 →
+주소·시간 확인 → 통합 실행 → 원점 설정 → 조종·분리 → 종료.
 
-| Hostname | 역할                     | Config            | bat0 IP       |
-| -------- | ------------------------ | ----------------- | ------------- |
-| base     | 구조자 쪽 기준 노드       | configs/base.env  | 192.168.50.1  |
-| head     | 로봇 헤드 / 카메라 / 제어 | configs/head.env  | 192.168.50.10 |
-| node1    | 릴레이 유닛 1            | configs/node1.env | 192.168.50.11 |
-| node2    | 릴레이 유닛 2            | configs/node2.env | 192.168.50.12 |
-
-`node3`는 예비 Pi가 생겼을 때 추가할 optional 릴레이입니다.
-조종 클라이언트의 기본 active 목록도 `head,node1,node2`이다. node3를 실제로
-연결한 시험에서는 `--active-targets head,node1,node2,node3`를 추가한다.
-
-## 기본 실행 순서
-
-```bash
-chmod +x scripts/*.sh
-sudo ./scripts/install_mesh.sh
-sudo ./scripts/start_role_network.sh base
-```
-
-장치별로 `base`만 `head`, `node1`, `node2`로 바꿔서 실행합니다.
-
-## 자동 실행
-
-```bash
-sudo ./scripts/enable_mesh_autostart.sh base
-sudo systemctl start hansel-mesh@base
-```
-
-다른 장치는 `base`를 `head`, `node1`, `node2`로 바꿔서 사용합니다. 자세한 절차는 [Mesh Autostart Runbook](docs/mesh_autostart_runbook.md)을 따른다.
-
-## 상태 확인
-
-```bash
-sudo ./scripts/check_mesh.sh
-ping 192.168.50.1
-sudo batctl n
-sudo batctl o
-```
-
-## 카메라 + 조종
-
-각 노드는 AR9271 동글(`wlan1`)을 Mesh 전용으로 쓰고, 내장 `wlan0`는 조난자 핸드폰 AP 등 향후 용도로 남깁니다. AR9271 동글 도착 전까지는 이 config로 Mesh가 뜨지 않으며, 그 전에 카메라 영상과 조종 명령 경로를 먼저 준비합니다.
-
-실행 순서는 [Camera And Control Quickstart](docs/camera_control_quickstart.md)를 따른다.
-
-다음 현장 테스트 시작 순서는 [Next Field Test Checklist](docs/next_field_test_checklist.md)를 따른다.
-
-실제 GPIO 모터/엔코더 제어는 [Motor Control Quickstart](docs/motor_control_quickstart.md)를 따른다.
-
-내일 구동 + 카메라 테스트 전체 순서는 [Tomorrow Drive + Camera Runbook](docs/tomorrow_drive_camera_runbook.md)을 따른다.
-
-팀원 설명용 코드/원리 문서는 [HANSEL_MESH Code And Network Explainer](docs/hansel_mesh_code_explainer.md)를 따른다.
-
-## 전방 레이더 화면
-
-레이더가 없어도 합성 붕괴현장 점군으로 화면을 먼저 확인할 수 있다.
-
-```bash
-python3 monitor/radar_front.py --demo
-```
-
-실제 IWRL6432 UART 캡처와 화면 연결 절차는
-[IWRL6432 Front Radar View](docs/radar_front_view.md)를 따른다.
-
-## 통신 원칙
-
-Base Pi가 명령 내용을 해석해 각 유닛으로 다시 보내는 dispatcher 구조가 아니라, 모든 유닛이 BATMAN-adv 릴레이 노드로 동작합니다.
-
-데이터는 `bat0` 위에서 end-to-end로 흐르고, 중간 node는 BATMAN-adv next-hop으로 프레임을 포워딩합니다.
+기존 루트 파일과 `260926` 폴더는 이전 기록이다. 이번 실행에는
+`HANSEL_Final/HANSEL_MESH_ROS2`와 `HANSEL_Final/HANSEL_MESH`를 사용한다.

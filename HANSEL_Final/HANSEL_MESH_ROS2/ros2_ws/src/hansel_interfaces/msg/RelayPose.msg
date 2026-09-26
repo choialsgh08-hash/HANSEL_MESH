@@ -1,0 +1,6 @@
+builtin_interfaces/Time stamp
+string unit_id
+geometry_msgs/Pose pose
+float32 head_path_distance_m
+float32 offset_behind_head_m
+bool provisional

@@ -1,0 +1,12 @@
+/**:
+  ros__parameters:
+    imu_transport: uart_rvc
+    imu_serial_port: /dev/serial0
+    imu_yaw_sign: -1.0
+    left_encoder_sign: -1.0
+    right_encoder_sign: 1.0
+    wheel_diameter_m: 0.08
+    encoder_cpr: 400.0
+    left_distance_scale: 0.07073229
+    right_distance_scale: 0.07073229
+    provisional_calibration: true

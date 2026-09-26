@@ -1,0 +1,8 @@
+PING 192.168.50.1 (192.168.50.1) 56(84) bytes of data.
+64 bytes from 192.168.50.1: icmp_seq=1 ttl=64 time=2.11 ms
+64 bytes from 192.168.50.1: icmp_seq=2 ttl=64 time=2.55 ms
+64 bytes from 192.168.50.1: icmp_seq=3 ttl=64 time=2.30 ms
+
+--- 192.168.50.1 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2002ms
+rtt min/avg/max/mdev = 2.110/2.320/2.550/0.180 ms

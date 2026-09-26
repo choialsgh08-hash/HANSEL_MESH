@@ -1,0 +1,3 @@
+pigpio>=1.78,<2
+PyYAML>=6
+# pigpiod is an OS daemon; pip does not install it.

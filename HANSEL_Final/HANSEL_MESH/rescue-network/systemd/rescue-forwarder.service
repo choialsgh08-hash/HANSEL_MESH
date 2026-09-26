@@ -1,0 +1,38 @@
+# Field node: standalone delivery forwarder process.
+# Runs separately from the web server so the two fail independently. Shares the
+# field SQLite DB (DATA_DIR) with rescue-field-web.
+[Unit]
+Description=Rescue Network - Forwarder (delivers stored requests to the receiver)
+Documentation=file:///opt/rescue-network/README.md
+After=network-online.target rescue-field-web.service
+Wants=network-online.target
+# Start/stop alongside the web service, but the forwarder tolerates the receiver
+# being unreachable and simply retries.
+PartOf=rescue-field-web.service
+
+[Service]
+Type=simple
+User=rescue
+Group=rescue
+WorkingDirectory=/opt/rescue-network
+EnvironmentFile=/etc/rescue-network/field.env
+ExecStart=/opt/rescue-network/.venv/bin/python -m rescue_network.forwarder
+
+StateDirectory=rescue-network
+StateDirectoryMode=0750
+
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rescue-forwarder
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,35 @@
+# Receiver (rescue-team) node: receive API + dashboard.
+# Binds the mesh IP/port the field forwarders target (default 0.0.0.0:8080).
+[Unit]
+Description=Rescue Network - Receiver (receive API + dashboard)
+Documentation=file:///opt/rescue-network/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rescue
+Group=rescue
+WorkingDirectory=/opt/rescue-network
+EnvironmentFile=/etc/rescue-network/receiver.env
+# WEB_PORT defaults to 8080 in receiver.env.
+ExecStart=/opt/rescue-network/.venv/bin/uvicorn rescue_network.receiver_app:app --host ${WEB_HOST} --port ${WEB_PORT}
+
+StateDirectory=rescue-network
+StateDirectoryMode=0750
+
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rescue-receiver
+
+[Install]
+WantedBy=multi-user.target

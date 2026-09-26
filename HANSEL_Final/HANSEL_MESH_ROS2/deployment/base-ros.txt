@@ -1,0 +1,13 @@
+controller/run_operator_stack.sh
+controller/run_keyboard_control.sh
+scripts/run_managed.py
+ros2_ws/src/hansel_operator/hansel_operator/operator_input.py
+ros2_ws/src/hansel_operator/hansel_operator/command_router.py
+ros2_ws/src/hansel_operator/hansel_operator/chain_registry.py
+ros2_ws/src/hansel_operator/hansel_operator/detach_coordinator.py
+ros2_ws/src/hansel_interfaces/CMakeLists.txt
+ros2_ws/src/hansel_interfaces/msg/DetachEvent.msg
+ros2_ws/src/hansel_interfaces/msg/WheelState.msg
+ros2_ws/src/hansel_bringup/config/robot_chain.yaml
+ros2_ws/src/hansel_bringup/config/unit_defaults.yaml
+ros2_ws/src/hansel_bringup/launch/operator.launch.py
