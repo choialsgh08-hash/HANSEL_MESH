@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -436,6 +437,11 @@ class SensorCliTests(unittest.TestCase):
                 xds_owner_run_id="managed-run",
             )
             uart_lock = mock.Mock()
+            # POSIX record locks belong to a process, not a thread. Keep this
+            # wiring test deterministic; process-death behavior is tested with
+            # separate processes in test_radar_stack_processes.py.
+            watcher = types.SimpleNamespace(ready=threading.Event(), stop_requested=threading.Event())
+            watcher.ready.set()
             observed_stop_requests = []
 
             def capture_managed(**kwargs):
@@ -452,7 +458,9 @@ class SensorCliTests(unittest.TestCase):
                     "sensors.cli.acquire_radar_owner_lock",
                     return_value=uart_lock,
                     create=True,
-                ) as acquire, contextlib.redirect_stdout(io.StringIO()):
+                ) as acquire, mock.patch(
+                    "sensors.cli.start_parent_death_watcher", return_value=watcher,
+                ) as start_watcher, contextlib.redirect_stdout(io.StringIO()):
                     result = command_radar_live(args)
             finally:
                 lease.release()
@@ -461,6 +469,7 @@ class SensorCliTests(unittest.TestCase):
                     time.sleep(0.01)
 
         self.assertEqual(result, 2)
+        start_watcher.assert_called_once_with(lease.path)
         acquire.assert_called_once_with(
             RADAR_UART_LOCK_ROOT,
             "RI32",

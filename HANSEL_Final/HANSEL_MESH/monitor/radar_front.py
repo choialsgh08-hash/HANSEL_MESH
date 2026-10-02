@@ -1469,15 +1469,27 @@ def run(args: argparse.Namespace) -> int:
         build_handler(state, quiet=args.quiet),
     )
     server.daemon_threads = True
-    if parent_watcher is not None:
-        def shutdown_after_parent_exit() -> None:
-            parent_watcher.stop_requested.wait()
+    source_failed = threading.Event()
+    if parent_watcher is not None or mode == "follow":
+        def shutdown_after_source_or_parent_exit() -> None:
+            while not stop_event.wait(0.05):
+                if parent_watcher is not None and parent_watcher.stop_requested.is_set():
+                    break
+                if mode == "follow" and not source_thread.is_alive():
+                    # HTTP can otherwise survive an uncaught processing error
+                    # forever. Exit this viewer so its supervisor replaces it.
+                    source_failed.set()
+                    state.set_source_error("radar source worker exited")
+                    print("[radar] source worker exited; restarting viewer", file=sys.stderr, flush=True)
+                    break
+            else:
+                return
             stop_event.set()
             server.shutdown()
 
         threading.Thread(
-            target=shutdown_after_parent_exit,
-            name="radar-front-parent-death",
+            target=shutdown_after_source_or_parent_exit,
+            name="radar-front-lifecycle",
             daemon=True,
         ).start()
     print(
@@ -1499,7 +1511,7 @@ def run(args: argparse.Namespace) -> int:
         server.shutdown()
         server.server_close()
         source_thread.join(timeout=2.0)
-    return 0
+    return 1 if source_failed.is_set() else 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

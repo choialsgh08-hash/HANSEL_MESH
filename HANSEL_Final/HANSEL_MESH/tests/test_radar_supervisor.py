@@ -96,6 +96,8 @@ class RadarSupervisorContractTests(unittest.TestCase):
         self.assertEqual(config.frame_timeout_s, 2.5)
         self.assertEqual(config.verification_timeout_s, 8.0)
         self.assertEqual(config.verification_frames, 30)
+        self.assertEqual(config.command_timeout_s, 8.0)
+        self.assertFalse(config.resume_capture_on_exit)
         self.assertEqual(config.retry_initial_s, 0.5)
         self.assertEqual(config.retry_max_s, 5.0)
         self.assertEqual(config.poll_interval_s, 0.05)
@@ -129,6 +131,7 @@ class RadarSupervisorContractTests(unittest.TestCase):
             "first_frame_timeout_s",
             "frame_timeout_s",
             "verification_timeout_s",
+            "command_timeout_s",
             "retry_initial_s",
             "retry_max_s",
             "poll_interval_s",
@@ -907,6 +910,7 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                 "monotonic",
                 "sleep",
                 "utc_now",
+                "stop_sensor",
             ],
         )
         for contract in (
@@ -1191,6 +1195,69 @@ class RadarSupervisorStartupTests(unittest.TestCase):
             payload = json.loads(fixture.manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["port"], "COM9")
             self.assertEqual(payload["xds_serial"], "RI32")
+
+    def test_by_id_port_is_resolved_on_each_inventory_and_keeps_board_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "ttyACM0"
+            second = root / "ttyACM2"
+            first.touch()
+            second.touch()
+            alias = root / "serial-by-id"
+            alias.symlink_to(first)
+            inventory = [application_port(str(first)), application_port(str(second), "OTHER")]
+            fixture = SupervisorFixture(directory, ports=[inventory])
+            fixture.config = replace(fixture.config, explicit_port=str(alias), xds_serial=None)
+            supervisor = RadarSupervisor(fixture.config, fixture.dependencies)
+
+            present, selected = supervisor._matching_port_inventory()
+            self.assertTrue(present)
+            self.assertIsNotNone(selected)
+            self.assertEqual(selected.device, str(first))
+
+            alias.unlink()
+            alias.symlink_to(second)
+            self.assertEqual(supervisor._matching_port_inventory(), (False, None))
+            inventory[:] = [application_port(str(second))]
+            present, selected = supervisor._matching_port_inventory()
+            self.assertTrue(present)
+            self.assertEqual(selected.device, str(second))
+
+            alias.unlink()
+            alias.symlink_to(root / "missing-device")
+            self.assertEqual(supervisor._matching_port_inventory(), (False, None))
+
+    def test_hotplug_enumeration_failure_retries_and_preserves_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = SupervisorFixture(directory, ports=[[application_port("COM3")]])
+            provider = mock.Mock(side_effect=[
+                [application_port("COM3")],
+                TypeError("int() can't convert non-string with explicit base"),
+                OSError("device removed"),
+                [application_port("COM9", "OTHER")],
+                [application_port("COM9")],
+            ])
+            config = replace(fixture.config, xds_serial=None)
+            deps = replace(fixture.dependencies, port_provider=provider)
+            supervisor = RadarSupervisor(config, deps)
+            self.assertTrue(supervisor._matching_port_inventory()[0])
+            for _ in range(3):
+                self.assertEqual(supervisor._matching_port_inventory(), (False, None))
+            self.assertEqual(supervisor._matching_port_inventory()[1].device, "COM9")
+
+    def test_by_id_matching_still_rejects_auxiliary_uart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            device = root / "ttyACM1"
+            device.touch()
+            alias = root / "serial-by-id"
+            alias.symlink_to(device)
+            auxiliary = application_port(str(device))
+            auxiliary.description = "XDS110 Class Auxiliary Data Port"
+            fixture = SupervisorFixture(directory, ports=[[auxiliary]])
+            fixture.config = replace(fixture.config, explicit_port=str(alias))
+            supervisor = RadarSupervisor(fixture.config, fixture.dependencies)
+            self.assertEqual(supervisor._matching_port_inventory(), (False, None))
 
     def test_omitted_serial_latches_first_board_and_rejects_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1654,6 +1721,7 @@ class RadarSupervisorStartupTests(unittest.TestCase):
                         "ended_at": "2026-07-29T01:00:00Z",
                         "end_reason": "shutdown",
                         "capture_exit_code": 23,
+                        "configuration_reused": False,
                     }
                 ],
             )

@@ -194,8 +194,8 @@ class UnitController(Node):
             "head_max_pulse_us": 2500,
             "head_servo_hold": True,
             "detach_duration_s": 0.35,
-            "detach_press_pulse_us": 1515,
-            "detach_rest_pulse_us": 800,
+            "detach_press_pulse_us": 562,
+            "detach_rest_pulse_us": 1038,
             "nano_serial_port": "/dev/ttyUSB0",
             "nano_serial_baudrate": 115200,
             "nano_serial_timeout_s": 0.02,
@@ -325,7 +325,7 @@ class UnitController(Node):
         self.target_right_cps = targets.right_cps
         fixed_pwm = steering_pwm(targets.command, self.left_pid.output_limit)
         if fixed_pwm is not None:
-            # Open-loop steering requests PWM, not a closed-loop CPS setpoint.
+            # Open-loop commands request PWM, not a closed-loop CPS setpoint.
             self.target_left_cps = self.target_right_cps = 0.0
         self._last_command_stamp = msg.stamp
         self.operation_state = (
@@ -419,7 +419,7 @@ class UnitController(Node):
             self.hardware.wait_detach(timeout_s=3.0)
             response.accepted = True
             response.command_completed = True
-            response.message = f"servo press/rest completed for {request.released_unit_id}; physical release unverified"
+            response.message = f"servo press completed and position held for {request.released_unit_id}; physical release unverified"
             self.operation_state = OperationState.STOPPED
         except Exception as exc:
             response.command_completed = False

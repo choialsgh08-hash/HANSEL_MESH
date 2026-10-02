@@ -84,19 +84,33 @@ class Session:
 
     def connect(self):
         for host in self.hosts:
+            ssh_log = self.logs / f"ssh-{host}.log"
             cmd = ["ssh", "-M", "-N", "-f", "-S", self.sockets[host],
+                   "-E", str(ssh_log),
                    "-o", "ControlPersist=no", "-o", "ServerAliveInterval=3",
                    "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10"]
             if host != "base":
                 proxy = shlex.join(["ssh", "-S", self.sockets["base"], "-o", "BatchMode=yes",
                                     "-W", "%h:%p", self.config["base"]])
                 cmd += ["-o", "ProxyCommand=" + proxy]
-            if host == "head":
-                cmd += ["-o", "ExitOnForwardFailure=yes", "-L",
-                        f"127.0.0.1:{self.config['map_local_port']}:{self.config['head_ip']}:8082"]
             print(f"Connecting {host} (SSH authentication stays in SSH)", flush=True)
-            subprocess.run(cmd + [self.config[host]], check=True)
+            try:
+                subprocess.run(cmd + [self.config[host]], check=True)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(
+                    f"SSH connection failed: {host} ({self.config[host]}), exit={exc.returncode}; see {ssh_log}"
+                ) from exc
             self.masters.append(host)
+
+    def forward_map(self):
+        # Old browser tabs poll continuously; do not forward during SSH login.
+        subprocess.run(
+            ["ssh", "-S", self.sockets["head"], "-O", "forward",
+             "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-L",
+             f"127.0.0.1:{self.config['map_local_port']}:{self.config['head_ip']}:8082",
+             self.config["head"]],
+            check=True, timeout=10, capture_output=True, text=True,
+        )
 
     def start(self, host, name, command):
         label = f"{host}-{name}"
@@ -160,6 +174,7 @@ def main(argv=None):
         return 0
     logs = ROOT / "runtime/sessions" / run_id
     logs.mkdir(parents=True)
+    print(f"Session logs: {logs}", flush=True)
     session = Session(c, logs)
     player = None
     try:
@@ -195,11 +210,17 @@ def main(argv=None):
             print(f"{name}: {'running (check data health in map)' if proc.poll() is None else 'FAILED: see ' + str(logs / (name + '.log'))}")
         if not args.no_camera and player is None:
             print("Camera receiver not ready: see head-camera.log; no stale SDP was reused.")
-        if not args.no_browser:
-            webbrowser.open(f"http://127.0.0.1:{c['map_local_port']}/")
         failed_drive = any(proc.poll() is not None for name, proc, _ in session.children if name.endswith(("-unit", "-operator")))
         if failed_drive:
             raise RuntimeError("Drive/operator did not start; inspect logs (possibly an existing manual session).")
+        try:
+            session.forward_map()
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail = getattr(exc, "stderr", None) or str(exc)
+            print(f"Map tunnel not ready: {detail.strip()}; see {logs / 'ssh-head.log'}. Drive session continues.", flush=True)
+        else:
+            if not args.no_browser:
+                webbrowser.open(f"http://127.0.0.1:{c['map_local_port']}/")
         print(f"PWM limit={c['maximum_pwm_percent']}%, target scale={c['speed_scale']}. X stop, G enable, P exit all. Logs: {logs}", flush=True)
         host, _, command = steps[-1]
         # SSH allocates a remote PTY; the team's keyboard remains authoritative.

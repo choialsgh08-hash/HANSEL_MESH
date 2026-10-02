@@ -58,6 +58,123 @@ def test_three_unit_mode_keeps_keyboard_on_base_and_75_percent_everywhere():
     assert all("MAX_PWM=75.0" in command for _, command in drives)
     assert "HEAD_ONLY=false" in next(command for _, name, command in steps if name == "operator")
     assert steps[-1][0] == "base" and "['head','node1','node2']" in steps[-1][2]
+    assert config["speed_scale"] == .75
+    assert "SPEED_SCALE=0.75" in steps[-1][2]
+
+
+@pytest.mark.parametrize("with_nodes", [False, True])
+def test_ssh_authentication_does_not_open_map_tunnel(tmp_path, monkeypatch, with_nodes):
+    config = json.loads((ROOT / "configs/head_session.json").read_text())
+    config["with_nodes"] = with_nodes
+    calls = []
+    monkeypatch.setattr(launcher.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    session = launcher.Session(config, tmp_path)
+    try:
+        session.connect()
+        assert len(calls) == (4 if with_nodes else 2)
+        assert all("-L" not in cmd for cmd in calls)
+        for host, cmd in zip(session.hosts, calls):
+            assert cmd[cmd.index("-E") + 1] == str(tmp_path / f"ssh-{host}.log")
+            assert cmd[-1] == config[host]
+    finally:
+        session.close()
+
+
+def test_map_forward_reuses_head_master(tmp_path, monkeypatch):
+    config = json.loads((ROOT / "configs/head_session.json").read_text())
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    session = launcher.Session(config, tmp_path)
+    try:
+        session.forward_map()
+        cmd, kwargs = calls[0]
+        assert cmd[cmd.index("-O") + 1] == "forward"
+        assert cmd[cmd.index("-S") + 1] == session.sockets["head"]
+        assert cmd[cmd.index("-L") + 1] == "127.0.0.1:8083:192.168.50.10:8082"
+        assert cmd[-1] == config["head"]
+        assert kwargs["timeout"] == 10
+        assert kwargs["check"] is True
+    finally:
+        session.close()
+
+
+def test_failed_authentication_names_host_and_log(tmp_path, monkeypatch):
+    config = json.loads((ROOT / "configs/head_session.json").read_text())
+    config["with_nodes"] = True
+
+    def run(cmd, **kwargs):
+        if "-M" in cmd and cmd[-1] == config["node1"]:
+            raise subprocess.CalledProcessError(255, cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    session = launcher.Session(config, tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="node1.*192.168.50.11.*ssh-node1.log"):
+            session.connect()
+        assert session.masters == ["base", "head"]
+        assert not session.children
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("forward_fails", [False, True])
+def test_main_defers_forward_and_forward_failure_does_not_block_drive(tmp_path, monkeypatch, forward_fails):
+    config_path = ROOT / "configs/head_session.json"
+    events = []
+
+    class FakeSession:
+        def __init__(self, config, logs):
+            self.hosts = ["base", "head", "node1", "node2"]
+            self.children = []
+
+        def connect(self):
+            events.append("connect")
+
+        def read(self, host, command):
+            return b"0"
+
+        def start(self, host, name, command):
+            events.append((host, name))
+
+        def forward_map(self):
+            events.append("forward")
+            if forward_fails:
+                raise subprocess.CalledProcessError(255, ["ssh"], stderr="port in use")
+
+        def ssh(self, host):
+            return ["ssh", "fake-base"]
+
+        def close(self):
+            events.append("close")
+
+    class FakeKeyboard:
+        def __init__(self, *args, **kwargs):
+            events.append("keyboard")
+
+        def wait(self):
+            return 0
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(launcher, "ROOT", tmp_path)
+    monkeypatch.setattr(launcher, "Session", FakeSession)
+    monkeypatch.setattr(launcher.subprocess, "Popen", FakeKeyboard)
+    monkeypatch.setattr(launcher.shutil, "which", lambda _: None)
+    monkeypatch.setattr(launcher.time, "time", lambda: 0)
+    ticks = iter((0, 13))
+    monkeypatch.setattr(launcher.time, "monotonic", lambda: next(ticks))
+    assert launcher.main(["--config", str(config_path), "--with-nodes", "--no-browser"]) == 0
+    assert events[0] == "connect"
+    assert ("head", "map") in events and ("head", "camera") in events
+    assert events.index(("head", "camera")) < events.index("forward") < events.index("keyboard")
+    assert events[-1] == "close"
 
 
 def test_local_socket_freshness_and_exclusive_owner(tmp_path):

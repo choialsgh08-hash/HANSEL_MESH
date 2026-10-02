@@ -47,28 +47,53 @@ def test_nano_waits_for_matching_completion_and_reads_moving_telemetry():
         worker.join(timeout=1)
 
 
-@pytest.mark.parametrize("fail_return", [False, True])
-def test_gpio_completion_tracks_press_rest_and_worker_error(fail_return):
+def gpio_adapter(*, fail_press=False):
     adapter = RaspberryPiHardwareAdapter.__new__(RaspberryPiHardwareAdapter)
     adapter._lock = threading.RLock()
     adapter._stop = threading.Event()
     adapter._closed = adapter._detach_busy = False
     adapter._servo = 6
-    adapter._rest_s = .02
+    adapter._outputs = [6]
+    adapter._callbacks = []
+    adapter._zero = lambda: None
     pulses = []
     def pulse(pin, value):
         assert pin == 6
         pulses.append(value)
-        if fail_return and value == 800:
+        if fail_press and value == 562:
             raise OSError("servo output failed")
         return 0
-    adapter._pi = NS(set_servo_pulsewidth=pulse, write=lambda *args: 0)
-    adapter.trigger_detach(.05, 1515, 800)
-    assert adapter.detach_busy and pulses == [1515]
-    if fail_return:
-        with pytest.raises(RuntimeError, match="output failed"):
-            adapter.wait_detach(.5)
-    else:
+    adapter._pi = NS(set_servo_pulsewidth=pulse, write=lambda *args: 0, stop=lambda: None)
+    return adapter, pulses
+
+
+def test_gpio_completes_without_returning_or_disabling_press():
+    adapter, pulses = gpio_adapter()
+    adapter.trigger_detach(.05, 562, 1038)
+    assert adapter.detach_busy and pulses == [562]
+    adapter.wait_detach(.5)
+    assert not adapter.detach_busy
+    assert pulses == [562]
+    adapter.trigger_detach(.05, 562, 1038)
+    adapter.wait_detach(.5)
+    assert pulses == [562, 562]
+    adapter.close()
+    assert pulses == [562, 562, 0]
+
+
+def test_gpio_press_failure_does_not_report_completion():
+    adapter, pulses = gpio_adapter(fail_press=True)
+    with pytest.raises(OSError, match="output failed"):
+        adapter.trigger_detach(.05, 562, 1038)
+    assert not adapter.detach_busy
+    assert pulses == [562]
+
+
+def test_gpio_close_interrupts_press_without_returning():
+    adapter, pulses = gpio_adapter()
+    adapter.trigger_detach(.2, 562, 1038)
+    adapter.close()
+    with pytest.raises(RuntimeError, match="interrupted"):
         adapter.wait_detach(.5)
     assert not adapter.detach_busy
-    assert pulses == [1515, 800, 0]
+    assert pulses == [562, 0]

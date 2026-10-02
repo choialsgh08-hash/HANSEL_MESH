@@ -50,7 +50,7 @@ class ControlCoreTests(unittest.TestCase):
         self.assertEqual(spin.command, "left")
 
     def test_fixed_pwm_steering_uses_the_configured_limit(self):
-        for command, expected in {"forward_left": (75, 0), "forward_right": (0, 75),
+        for command, expected in {"forward": (75, 75), "forward_left": (75, 0), "forward_right": (0, 75),
                                   "left": (-75, 75), "right": (75, -75)}.items():
             self.assertEqual(steering_pwm(command, 75), expected)
         self.assertIsNone(steering_pwm("backward", 75))

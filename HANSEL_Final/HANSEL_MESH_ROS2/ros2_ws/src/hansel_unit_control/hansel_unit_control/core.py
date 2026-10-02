@@ -53,8 +53,9 @@ class WheelTargets:
 
 
 def steering_pwm(command: str, limit: float) -> tuple[float, float] | None:
-    """Q/E name wheels, not turn directions. A/D counter-rotate."""
+    """Forward and steering use the PWM limit; other commands use PID."""
     directions = {
+        "forward": (1, 1),
         "forward_left": (1, 0), "forward_right": (0, 1),
         "left": (-1, 1), "right": (1, -1),
     }.get(command)

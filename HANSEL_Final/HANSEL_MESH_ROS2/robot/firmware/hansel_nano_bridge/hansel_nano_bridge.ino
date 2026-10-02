@@ -33,9 +33,9 @@ const uint8_t HEAD_SERVO_PIN = 9;
 const uint8_t DETACH_SERVO_PIN = 10;
 
 // The wiring note explicitly says one side must be inverted in software.
-bool rearLeftReverse = false;
+bool rearLeftReverse = true;
 bool rearRightReverse = true;
-bool frontLeftReverse = false;
+bool frontLeftReverse = true;
 bool frontRightReverse = true;
 
 volatile uint32_t leftCount = 0;
@@ -64,7 +64,6 @@ uint8_t detachPhase = 0;
 unsigned long detachPhaseMs = 0;
 unsigned long detachPressMs = 0;
 unsigned long detachToken = 0;
-int detachRestPulseUs = 800;
 
 Servo headServo;
 Servo detachServo;
@@ -169,11 +168,7 @@ void updateServos() {
     else if (!headServoHold && now - headSettledMs >= 500) headServo.detach();
   }
   if (detachPhase == 1 && now - detachPhaseMs >= detachPressMs) {
-    detachServo.writeMicroseconds(detachRestPulseUs);
-    detachPhase = 2;
-    detachPhaseMs = now;
-  } else if (detachPhase == 2 && now - detachPhaseMs >= 120) {
-    detachServo.detach();
+    // Complete the command without releasing the pressed coupling.
     detachPhase = 0;
     Serial.print("D,"); Serial.print(detachToken); Serial.println(",done");
   }
@@ -223,9 +218,9 @@ void handleLine(char *line) {
     stopAllMotors();
     detachToken = requestedToken;
     detachPressMs = constrain(atoi(duration), 50, 2000);
-    detachRestPulseUs = constrain(atoi(rest), 500, 2500);
+    // Keep the legacy rest field in the protocol, but do not return to it.
     detachServo.writeMicroseconds(constrain(atoi(press), 500, 2500));
-    detachServo.attach(DETACH_SERVO_PIN, 500, 2500);
+    if (!detachServo.attached()) detachServo.attach(DETACH_SERVO_PIN, 500, 2500);
     detachPhaseMs = millis();
     detachPhase = 1;
   } else if (strcmp(command, "X") == 0) {

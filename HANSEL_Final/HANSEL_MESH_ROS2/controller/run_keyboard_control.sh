@@ -6,4 +6,4 @@ export HANSEL_ROOT="$ROOT"
 source "$ROOT/scripts/ros_env.sh"
 exec ros2 run hansel_operator operator_input --ros-args \
   -p active_targets:="${ACTIVE_TARGETS:-['head','node1','node2']}" \
-  -p speed_scale:="${SPEED_SCALE:-0.2}"
+  -p speed_scale:="${SPEED_SCALE:-0.75}"

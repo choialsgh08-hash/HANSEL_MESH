@@ -46,8 +46,8 @@ defaults:
   head_servo_hold: true
 
   detach_duration_s: 0.35
-  detach_press_pulse_us: 1515  # 800 + (1350 - 800) * 1.3
-  detach_rest_pulse_us: 800
+  detach_press_pulse_us: 562
+  detach_rest_pulse_us: 1038  # Legacy field; press-only actuation does not return.
 
   nano_serial_port: /dev/ttyUSB0
   nano_serial_baudrate: 115200

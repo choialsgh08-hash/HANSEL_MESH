@@ -36,6 +36,7 @@ from sensors.ti_radar_control import (
     load_commands,
     partition_at_baud,
     reset_xds110_target,
+    stop_sensor,
 )
 
 
@@ -189,6 +190,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=8.0,
     )
     parser.add_argument("--verify-frames", type=_positive_int, default=30)
+    parser.add_argument("--command-timeout", type=_positive_float, default=8.0,
+                        help="CLI reply timeout, independent of frame verification")
+    parser.add_argument("--resume-capture", action="store_true",
+                        help="try the verified stream first after a capture-process exit")
     parser.add_argument(
         "--retry-initial",
         type=_positive_float,
@@ -259,9 +264,13 @@ def _configure_profile(
         port=port.device,
         profile=profile,
         initial_baud=config.initial_baud,
-        command_timeout_s=config.verification_timeout_s,
+        command_timeout_s=config.command_timeout_s,
         reopen_delay_s=config.retry_initial_s,
     )
+
+
+def _stop_sensor(port: RadarPortIdentity, config: RadarSupervisorConfig) -> None:
+    stop_sensor(port.device, config.data_baud)
 
 
 def _reset_target(
@@ -410,6 +419,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         frame_timeout_s=args.frame_timeout,
         verification_timeout_s=args.verification_timeout,
         verification_frames=args.verify_frames,
+        command_timeout_s=args.command_timeout,
+        resume_capture_on_exit=args.resume_capture,
         retry_initial_s=args.retry_initial,
         retry_max_s=args.retry_max,
         http_bind=args.http_bind,
@@ -424,6 +435,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         monotonic=time.monotonic,
         sleep=time.sleep,
         utc_now=_utc_now,
+        stop_sensor=_stop_sensor,
     )
     with _shutdown_requested() as stop_requested:
         RadarSupervisor(config, dependencies).run(stop_requested)

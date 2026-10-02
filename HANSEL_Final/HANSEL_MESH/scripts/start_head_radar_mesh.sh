@@ -20,6 +20,10 @@ RADAR_XDS_SERIAL="${RADAR_XDS_SERIAL:-}"
 RADAR_PROFILE="${RADAR_PROFILE:-$ROOT/configs/radar/iwrl6432_2p5d_operator_nearwall_5hz.cfg}"
 RADAR_CALIBRATION="${RADAR_CALIBRATION:-$ROOT/configs/radar/calibrations/head-nearwall-16az-adc-5hz.json}"
 RADAR_OUTPUT_ROOT="${RADAR_OUTPUT_ROOT:-$ROOT/runtime/radar}"
+RADAR_VERIFY_FRAMES="${RADAR_VERIFY_FRAMES:-3}"
+RADAR_COMMAND_TIMEOUT="${RADAR_COMMAND_TIMEOUT:-3}"
+RADAR_RETRY_INITIAL="${RADAR_RETRY_INITIAL:-0.25}"
+RADAR_RETRY_MAX="${RADAR_RETRY_MAX:-1}"
 
 if ! ip -4 -brief addr show bat0 2>/dev/null | grep -Fq "$RADAR_BIND/"; then
     echo "[ERROR] bat0 does not own $RADAR_BIND." >&2
@@ -46,6 +50,11 @@ ARGS=(
     --http-port "$RADAR_HTTP_PORT"
     --output-root "$RADAR_OUTPUT_ROOT"
     --cfg "$RADAR_PROFILE"
+    --verify-frames "$RADAR_VERIFY_FRAMES"
+    --command-timeout "$RADAR_COMMAND_TIMEOUT"
+    --retry-initial "$RADAR_RETRY_INITIAL"
+    --retry-max "$RADAR_RETRY_MAX"
+    --resume-capture
 )
 if [ -n "$RADAR_CALIBRATION" ]; then
     ARGS+=(--clutter-calibration "$RADAR_CALIBRATION")

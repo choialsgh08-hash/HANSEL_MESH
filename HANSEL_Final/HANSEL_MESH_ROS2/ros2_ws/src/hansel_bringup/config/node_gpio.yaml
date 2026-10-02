@@ -22,4 +22,4 @@
     gpio_right_encoder_sign: -1
     gpio_encoder_edges_per_count: 4 # x4 quadrature -> original x1-equivalent CPS.
     gpio_encoder_pull: up
-    gpio_detach_rest_s: 0.12
+    gpio_detach_rest_s: 0.12  # Legacy field; press-only actuation has no rest phase.

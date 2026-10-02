@@ -178,7 +178,8 @@ def test_hold_release_preserves_manual_disable_and_reports_failed_stop(callbacks
 def test_router_to_controller_max_pwm_ignores_speed_scale(callbacks, monkeypatch, role, command, expected):
     unit = make_unit(callbacks[0], role)
     routed = callbacks[2].CommandRouter._normalize_rear(command) if role != "head" else command
-    assert routed == command
+    assert routed == (command if role == "head" else "stop")
+    expected = expected if role == "head" else (0, 0)
     stamp = NS(sec=10, nanosec=0)
     now = [0.]
     monkeypatch.setattr(callbacks[0].time, "monotonic", lambda: now[0])
@@ -192,6 +193,31 @@ def test_router_to_controller_max_pwm_ignores_speed_scale(callbacks, monkeypatch
         now[0] += .05
         unit._control_tick()
     assert unit.left_pwm == unit.right_pwm == 0
+
+
+@pytest.mark.parametrize("steering", ["left", "right", "forward_left", "forward_right"])
+def test_head_only_steering_stops_rear_and_preserves_active_chain(callbacks, steering):
+    module = callbacks[2]
+    router = module.CommandRouter.__new__(module.CommandRouter)
+    router.ordered_units = ["head", "node1", "node2"]
+    router.active_units = list(router.ordered_units)
+    router.roles = {"head": "head", "node1": "rear", "node2": "rear"}
+    router._input_lease = module.InputLease()
+    router._last_sequence_by_source = {}
+    router.get_clock = lambda: NS(now=lambda: NS(nanoseconds=10_000_000_000))
+    messages = {name: [] for name in router.ordered_units}
+    router._motion_publishers = {name: NS(publish=rows.append) for name, rows in messages.items()}
+    stamp = NS(sec=10, nanosec=0)
+    for seq, command in enumerate(("forward", steering, "backward", "stop")):
+        router._on_command(NS(stamp=stamp, sequence=seq, command=command, speed_scale=.75, source="keyboard:test"))
+    assert [m.command for m in messages["head"]] == ["forward", steering, "backward", "stop"]
+    for unit in ("node1", "node2"):
+        assert [m.command for m in messages[unit]] == ["forward", "stop", "backward", "stop"]
+        assert all(m.speed_scale == .75 and m.source == "keyboard:test" for m in messages[unit])
+        assert [m.sequence for m in messages[unit]] == list(range(4))
+    router._on_active_chain(NS(active_drive_units=["head", "node1"]))
+    router._on_command(NS(stamp=stamp, sequence=4, command="forward", speed_scale=.75, source="keyboard:test"))
+    assert len(messages["node1"]) == 5 and len(messages["node2"]) == 4
 
 
 def test_head_step_and_k_center(callbacks):

@@ -58,9 +58,18 @@ PC tunnel 8083, RTP 5600. Camera UDP still needs the real PC network route;
 the SSH HTTP tunnel does not tunnel RTP. `--no-camera` and `--no-browser` are
 available. Logs go to `runtime/sessions/<session-id>/`.
 
-PWM upper limit is 75%; keyboard speed scale is 0.2. For W/S, speed scale sets
-the velocity target, not a fixed PWM duty. Q/E and A/D explicitly request the
-75% limit on the selected wheels, using the existing PWM ramp. The launcher starts at STOP, never sends G,
+SSH authentication finishes for all selected devices before any runtime starts.
+The map tunnel opens after runtime startup, so an old browser tab cannot send
+map requests while another device is still asking for its SSH password.
+SSH transport errors are recorded separately in `ssh-base.log`, `ssh-head.log`,
+`ssh-node1.log` and `ssh-node2.log` in the session directory. Password prompts
+remain in the terminal; passwords are not recorded. A map tunnel failure warns
+without stopping drive. This does not repair a dropped mesh connection.
+
+PWM upper limit is 75%; keyboard speed scale is 0.75. For W/S, speed scale sets
+the velocity target, not a fixed PWM duty, on all active drive units. Q/E and A/D
+request the 75% limit on the Head wheels, using the existing PWM ramp; the router
+sends STOP to active rear units for these four commands. The launcher starts at STOP, never sends G,
 never clears E-stop and never sends a movement command itself.
 
 Press X/Space to stop. P exits the keyboard and shuts down the session's owned
@@ -125,6 +134,29 @@ it does not step clocks while the robot is running.
    This is a tested hypothesis, not a hardware-confirmed diagnosis of every
    earlier failure. TI protocol reference:
    https://software-dl.ti.com/ra-processors/esd/MMWAVE-L-SDK/05_05_00_02/exports/api_guide_xwrL64xx/MMWAVE_DEMO.html
+   The October recovery update waits for a complete `Done` and the following
+   prompt instead of advancing on either one alone. On normal session exit,
+   capture closes its UART first, then the supervisor stops its own radar stream.
+   A lost stop acknowledgement is checked against a fresh version reply and
+   further frames, not accepted just because a prompt appeared.
+   The Head wrapper verifies three complete frames before opening the viewer
+   (about 0.6 s of frames at 5 Hz), retries failed attempts after 0.25 s up to
+   1 s, and uses a separate 3 s CLI reply timeout. Healthy streaming is not
+   periodically reset. A viewer exit restarts only the viewer; an unexpectedly
+   exited live processing thread also makes the viewer exit for replacement,
+   instead of leaving an HTTP server serving frozen data. A capture-process
+   exit first tries the already verified stream once; missing frames or observed
+   USB removal fall back to full profile application on the same board serial.
+   The offline radar pane retries every second. This does not change motor
+   enable, watchdogs, camera, IMU, odometry, profile, calibration or path planning.
+   The managed radar process has a longer exit grace period for UART cleanup;
+   the other managed processes retain their existing shutdown timing.
+   These changes need the radar Python files (including `monitor/radar_front.py`)
+   and Head wrapper on Head,
+   `scripts/run_managed.py` on Head, and `monitor/odometry_map/radar-retry.js`
+   for the combined map. No ROS interface rebuild or Nano upload is needed
+   for this radar-only update. Hardware power loss, a loose USB cable or a
+   firmware that stops responding still cannot be repaired by UART retries.
 5. IMU: logs with zero raw UART bytes were not valid IMU reception. Loose wires
    and a sensor recovered only by power cycling cannot be repaired in software.
    Diagnostics now distinguish zero bytes, stopped stream and invalid frames.

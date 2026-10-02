@@ -131,7 +131,6 @@ class RaspberryPiHardwareAdapter(HardwareAdapter):
         self._motor_signs = (p['left_motor_sign'], p['right_motor_sign'])
         self._encoder_signs = (p['left_encoder_sign'], p['right_encoder_sign'])
         self._divider = p['encoder_edges_per_count']
-        self._rest_s = float(p['detach_rest_s'])
         self._port = p['pigpio_port']
         self._last_pwm = [0., 0.]
         self._last_counts = (0, 0)
@@ -288,7 +287,7 @@ class RaspberryPiHardwareAdapter(HardwareAdapter):
             checked(self._pi.set_servo_pulsewidth(self._servo, press_pulse_us))
             self._detach_busy = True
             self._thread = threading.Thread(target=self._detach_worker,
-                args=(duration, rest_pulse_us), daemon=True, name='hansel-detach-servo')
+                args=(duration,), daemon=True, name='hansel-detach-servo')
             try:
                 self._thread.start()
             except Exception:
@@ -296,26 +295,16 @@ class RaspberryPiHardwareAdapter(HardwareAdapter):
                 checked(self._pi.set_servo_pulsewidth(self._servo, 0))
                 raise
 
-    def _detach_worker(self, duration, rest):
+    def _detach_worker(self, duration):
         try:
-            if self._stop.wait(duration):
-                return
-            with self._lock:
-                if self._closed:
-                    return
-                checked(self._pi.set_servo_pulsewidth(self._servo, rest))
-            self._stop.wait(self._rest_s)
+            self._stop.wait(duration)
         except Exception as exc:
             with self._lock:
                 self._servo_error = str(exc)
         finally:
             with self._lock:
-                if not self._closed:
-                    try:
-                        checked(self._pi.set_servo_pulsewidth(self._servo, 0))
-                        checked(self._pi.write(self._servo, 0))
-                    except Exception as exc:
-                        self._servo_error = str(exc)
+                # The command finishes, but PWM keeps the coupling pressed.
+                # close() still disables output without commanding a return.
                 self._detach_busy = False
 
     def wait_detach(self, timeout_s):

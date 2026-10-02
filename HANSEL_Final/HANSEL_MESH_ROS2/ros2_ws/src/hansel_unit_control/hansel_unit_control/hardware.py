@@ -67,7 +67,7 @@ class HardwareAdapter(ABC):
     @abstractmethod
     def trigger_detach(self, duration_s: float, press_pulse_us: int,
                        rest_pulse_us: int) -> None:
-        """Run the SG90 detach press/rest sequence."""
+        """Press and hold the SG90; rest_pulse_us is a legacy protocol field."""
 
     @abstractmethod
     def diagnostic_items(self) -> dict[str, str]:
@@ -140,7 +140,7 @@ class NanoSerialHardwareAdapter(HardwareAdapter):
         F,<-1|0|1>,<pwm_percent>
         H,<logical_angle_deg>
         S,<min>,<center>,<max>,<min_us>,<center_us>,<max_us>,<hold:0|1>
-        D,<press_ms>,<press_us>,<rest_us>,<token>
+        D,<press_ms>,<press_us>,<legacy_rest_us>,<token>  (press and hold)
         X
       Nano -> Pi
         T,<left_cps>,<right_cps>,<head_angle>,<moving>,<left_count>,<right_count>,<ms>

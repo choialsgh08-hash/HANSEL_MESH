@@ -10,7 +10,7 @@
   "maximum_pwm_percent": 75.0,
   "node1": "hansel@192.168.50.11",
   "node2": "hansel@192.168.50.12",
-  "speed_scale": 0.2,
+  "speed_scale": 0.75,
   "mesh_domain": 0,
   "local_domain": 42,
   "map_local_port": 8083,

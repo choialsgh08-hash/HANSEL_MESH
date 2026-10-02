@@ -109,6 +109,8 @@ class RadarSupervisorConfig:
     frame_timeout_s: float = 2.5
     verification_timeout_s: float = 8.0
     verification_frames: int = 30
+    command_timeout_s: float = 8.0
+    resume_capture_on_exit: bool = False
     retry_initial_s: float = 0.5
     retry_max_s: float = 5.0
     poll_interval_s: float = 0.05
@@ -159,6 +161,7 @@ class RadarSupervisorConfig:
             "first_frame_timeout_s",
             "frame_timeout_s",
             "verification_timeout_s",
+            "command_timeout_s",
             "retry_initial_s",
             "retry_max_s",
             "poll_interval_s",
@@ -169,6 +172,8 @@ class RadarSupervisorConfig:
             _require_positive_float(getattr(self, name), name)
         if self.retry_initial_s > self.retry_max_s:
             raise ValueError("retry_initial_s must not exceed retry_max_s")
+        if not isinstance(self.resume_capture_on_exit, bool):
+            raise ValueError("resume_capture_on_exit must be a boolean")
         if not isinstance(self.http_bind, str) or not self.http_bind:
             raise ValueError("http_bind must be non-empty")
 
@@ -239,6 +244,7 @@ class RadarSupervisorDependencies:
     monotonic: Callable[[], float]
     sleep: Callable[[float], None]
     utc_now: Callable[[], datetime]
+    stop_sensor: Callable[[RadarPortIdentity, RadarSupervisorConfig], None] | None = None
 
 
 def _epoch_label(epoch: int) -> str:
@@ -424,6 +430,10 @@ class RadarSupervisor:
         self._verified_consecutive_frames = 0
         self._last_reason = "initialized"
         self._last_configuration_error = None
+        self._sensor_configured = False
+        self._sensor_touched = False
+        self._sensor_shutdown_attempted = False
+        self._sensor_shutdown_error: str | None = None
         self._retry_delay_s = self._config.retry_initial_s
         self._fatal_reason = "initial_startup_failed"
 
@@ -456,13 +466,19 @@ class RadarSupervisor:
                         self._stop_active_child(self._active_capture)
                     self._active_watchdog = None
                     self._finalize_epoch(reason=reason)
-                    if not self._backoff(stop_requested):
+                    resume_capture = (
+                        self._config.resume_capture_on_exit
+                        and reason == "capture_exited"
+                        and not port_absence_seen
+                    )
+                    if not resume_capture and not self._backoff(stop_requested):
                         self._shutdown()
                         return
                     if not self._attempt_until_running(
                         stop_requested,
                         recovering=True,
                         usb_absence_seen=port_absence_seen,
+                        resume_capture=resume_capture,
                     ):
                         self._shutdown()
                         return
@@ -472,6 +488,7 @@ class RadarSupervisor:
                     self._stop_registered_children()
                 except BaseException as error:
                     cleanup_error = error
+                self._quiesce_owned_sensor()
                 self._finalize_epoch(reason=self._fatal_reason)
                 self._restore_verified_paths()
                 self._transition(SupervisorState.STOPPED, self._fatal_reason)
@@ -492,14 +509,32 @@ class RadarSupervisor:
         *,
         recovering: bool,
         usb_absence_seen: bool,
+        resume_capture: bool = False,
     ) -> bool:
         while True:
             attempt_usb_absence_seen = usb_absence_seen
             usb_absence_seen = False
             self._transition(SupervisorState.WAIT_PORT, "waiting_for_port")
-            port = self._wait_for_port(stop_requested)
+            port = None
+            if resume_capture:
+                if stop_requested():
+                    return False
+                _, port = self._matching_port_inventory()
+                if port is None:
+                    resume_capture = False
+            if port is None:
+                port = self._wait_for_port(stop_requested)
             if port is None:
                 return False
+            reuse_stream = (
+                resume_capture
+                and self._port is not None
+                and self._port == port
+                and self._sensor_configured
+            )
+            # One capture-only attempt; failed verification falls back to CLI
+            # recovery even if the USB device silently power-cycled.
+            resume_capture = False
             self._port = port
             if self._owner_lock is None:
                 self._owner_lock = acquire_radar_owner_lock(
@@ -514,57 +549,52 @@ class RadarSupervisor:
                     self._config.run_id,
                 )
 
-            reset_reason = "recovery_reset" if recovering else "initial_reset"
-            self._transition(SupervisorState.RESET_TARGET, reset_reason)
-            try:
-                reset_executed = self._dependencies.reset_target(
-                    port,
-                    self._config,
-                )
-            except Exception:
-                self._transition(SupervisorState.RESET_TARGET, "reset_failed")
-                if not self._backoff(stop_requested):
-                    return False
-                continue
+            if not reuse_stream:
+                self._sensor_configured = False
+                reset_reason = "recovery_reset" if recovering else "initial_reset"
+                self._transition(SupervisorState.RESET_TARGET, reset_reason)
+                try:
+                    reset_executed = self._dependencies.reset_target(port, self._config)
+                except Exception:
+                    self._transition(SupervisorState.RESET_TARGET, "reset_failed")
+                    if not self._backoff(stop_requested):
+                        return False
+                    continue
 
-            if reset_executed or not recovering:
-                self._transition(SupervisorState.WAIT_PORT, "waiting_for_port")
-                port = self._wait_for_port(stop_requested)
-                if port is None:
-                    return False
-                self._port = port
-            # Without XDS reset, configure can recover the CLI at its current
-            # baud. Do not require a physical USB cycle before even trying.
-            elif not self._config.software_recovery and not attempt_usb_absence_seen:
-                port = self._wait_for_usb_cycle(stop_requested)
-                if port is None:
-                    return False
-                self._port = port
+                if reset_executed or not recovering:
+                    self._transition(SupervisorState.WAIT_PORT, "waiting_for_port")
+                    port = self._wait_for_port(stop_requested)
+                    if port is None:
+                        return False
+                    self._port = port
+                elif not self._config.software_recovery and not attempt_usb_absence_seen:
+                    port = self._wait_for_usb_cycle(stop_requested)
+                    if port is None:
+                        return False
+                    self._port = port
 
-            self._transition(SupervisorState.CONFIGURE, "configuring")
-            try:
-                profile_result = self._dependencies.configure(
-                    self._port,
-                    self._config,
-                )
-                commands = load_commands(self._config.profile_path)
-                validate_profile_result(
-                    profile_result,
-                    expected_commands=len(commands),
-                    require_first_magic=False,
-                )
-            except Exception as exc:
-                self._last_configuration_error = f"{type(exc).__name__}: {exc}"
-                print(f"[radar] configure failed: {self._last_configuration_error}", flush=True)
-                self._transition(
-                    SupervisorState.CONFIGURE,
-                    "configuration_failed",
-                )
-                if not self._backoff(stop_requested):
-                    return False
-                continue
+                self._transition(SupervisorState.CONFIGURE, "configuring")
+                try:
+                    self._sensor_touched = True
+                    profile_result = self._dependencies.configure(self._port, self._config)
+                    commands = load_commands(self._config.profile_path)
+                    validate_profile_result(
+                        profile_result,
+                        expected_commands=len(commands),
+                        require_first_magic=False,
+                    )
+                except Exception as exc:
+                    self._last_configuration_error = f"{type(exc).__name__}: {exc}"
+                    print(f"[radar] configure failed: {self._last_configuration_error}", flush=True)
+                    self._transition(SupervisorState.CONFIGURE, "configuration_failed")
+                    if not self._backoff(stop_requested):
+                        return False
+                    continue
 
-            self._last_configuration_error = None
+                self._last_configuration_error = None
+                self._sensor_configured = True
+            else:
+                print("[radar] resuming capture without resetting the sensor", flush=True)
 
             self._epoch += 1
             self._paths = allocate_epoch_paths(
@@ -585,6 +615,7 @@ class RadarSupervisor:
                     "ended_at": None,
                     "end_reason": None,
                     "capture_exit_code": None,
+                    "configuration_reused": reuse_stream,
                 }
             )
 
@@ -848,7 +879,12 @@ class RadarSupervisor:
     def _matching_port_inventory(
         self,
     ) -> tuple[bool, RadarPortIdentity | None]:
-        inventory = tuple(self._dependencies.port_provider())
+        try:
+            inventory = tuple(self._dependencies.port_provider())
+        except (OSError, TypeError, ValueError):
+            # USB removal can invalidate sysfs fields mid-enumeration in pyserial.
+            # Let the normal port-wait/recovery loop retry without losing identity.
+            return False, None
         target_serial = self._latched_xds_serial or self._config.xds_serial
         candidates = []
         for port in inventory:
@@ -871,7 +907,8 @@ class RadarSupervisor:
                 else str(location_value).strip()
             )
             if self._config.explicit_port is not None:
-                if device != self._config.explicit_port:
+                # by-id names and enumerated tty names can identify the same UART.
+                if os.path.realpath(device) != os.path.realpath(self._config.explicit_port):
                     continue
             if (getattr(port, "vid", None), getattr(port, "pid", None)) != (
                 0x0451,
@@ -1129,11 +1166,32 @@ class RadarSupervisor:
             self._stop_registered_children()
         except BaseException as error:
             cleanup_error = error
+        self._quiesce_owned_sensor()
         self._finalize_epoch(reason="shutdown")
         self._restore_verified_paths()
         self._transition(SupervisorState.STOPPED, "shutdown")
         if cleanup_error is not None:
             raise cleanup_error
+
+    def _quiesce_owned_sensor(self) -> None:
+        callback = self._dependencies.stop_sensor
+        if (callback is None or self._sensor_shutdown_attempted
+                or self._port is None or self._owner_lock is None
+                or self._active_capture is not None or not self._sensor_touched):
+            return
+        self._sensor_shutdown_attempted = True
+        try:
+            _, selected = self._matching_port_inventory()
+            if selected is None or selected.serial_number != self._port.serial_number:
+                return
+            if self._uart_lock is None:
+                self._uart_lock = acquire_radar_owner_lock(
+                    RADAR_UART_LOCK_ROOT, selected.serial_number, self._config.run_id,
+                )
+            callback(selected, self._config)
+        except Exception as exc:
+            self._sensor_shutdown_error = f"{type(exc).__name__}: {exc}"
+            print(f"[radar] shutdown: {self._sensor_shutdown_error}; next start will recover CLI", flush=True)
 
     def _restore_verified_paths(self) -> None:
         self._paths = self._verified_paths
@@ -1156,6 +1214,8 @@ class RadarSupervisor:
             "state": self._state.value,
             "epoch": self._epoch,
             "recovery_count": self._recovery_count,
+            "sensor_shutdown_attempted": self._sensor_shutdown_attempted,
+            "sensor_shutdown_error": self._sensor_shutdown_error,
             "port": self._port.device if self._port is not None else None,
             "xds_serial": (
                 self._latched_xds_serial

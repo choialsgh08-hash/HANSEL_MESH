@@ -44,6 +44,9 @@ class CommandRouter(Node):
     @staticmethod
     def _normalize_rear(command: str) -> str:
         command = command.strip().lower().replace("-", "_").replace(" ", "_")
+        if command in {"left", "right", "forward_left", "forward_right"}:
+            # Send STOP explicitly so a previous W/S command cannot continue.
+            return "stop"
         if command in {"mild_forward_left", "mild_forward_right"}:
             return "slow_forward"
         if command in {"backward_left", "backward_right", "mild_backward_left", "mild_backward_right"}:

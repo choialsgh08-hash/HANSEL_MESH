@@ -6,12 +6,24 @@ from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import os
+import re
 import subprocess
 import time
 from typing import Callable, Iterable, List, Mapping, Sequence, Tuple
 
 
 TI_MAGIC_WORD = b"\x02\x01\x04\x03\x06\x05\x08\x07"
+CLI_PROMPT = b"mmwDemo:/>"
+# sensorStop can place its text immediately after the last binary frame.
+_DONE_LINE = re.compile(rb"(?:^|[^\x20-\x7e])Done\r?\n")
+_ERROR_LINE = re.compile(
+    rb"(?:^|[\r\n])(?:Error\b[ -~]*|[ -~]*not recognized[ -~]*)[\r\n]",
+    re.IGNORECASE,
+)
+_VERSION_LINE = re.compile(
+    rb"(?:^|[\r\n]|mmwDemo:/>)\s*(?:version\r?\n|Platform\s*:|[ -~]*SDK Version\s*:)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -241,34 +253,77 @@ def _read_until(
 
 
 def _command_failed(response: bytes) -> bool:
-    lower = response.lower()
-    return b"error" in lower or b"not recognized" in lower
+    return _ERROR_LINE.search(response) is not None
 
 
-def _send_command(
+def _write_cli_line(serial_port: object, command: str) -> bytes:
+    """Keep draining the streaming UART while delivering a stop command."""
+    stopping = command.split()[:1] == ["sensorStop"]
+    received = bytearray()
+    for value in (command + "\n").encode("ascii"):
+        serial_port.write(bytes((value,)))
+        serial_port.flush()
+        if stopping:
+            deadline = time.monotonic() + 0.1
+            while time.monotonic() < deadline:
+                received.extend(serial_port.read(4096))
+                if len(received) > 131072:
+                    del received[:-65536]
+        else:
+            time.sleep(0.002)
+    return bytes(received)
+
+
+def _read_cli_reply(
     serial_port: object,
     command: str,
     timeout_s: float,
+    initial: bytes = b"",
 ) -> bytes:
-    serial_port.write((command + "\n").encode("ascii"))
-    serial_port.flush()
-    response = _read_until(
-        serial_port,
-        (b"Done", b"Error", b"not recognized"),
-        timeout_s,
-    )
-    if _command_failed(response):
-        raise RuntimeError(
-            f"command failed: {command!r}: "
-            f"{response.decode('ascii', errors='replace')!r}"
-        )
-    if b"Done" not in response:
-        raise TimeoutError(
-            f"command timed out without Done: {command!r}; "
-            f"baud={getattr(serial_port, 'baudrate', '?')}; "
-            f"response_tail={response[-240:]!r}"
-        )
-    return response
+    response = bytearray(initial)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        # A prompt preceding Done belongs to a previous command. Wait for the
+        # prompt AFTER this completion, even when both arrive in separate reads.
+        version = _VERSION_LINE.search(response) if command == "version" else None
+        start = max(0, version.end() - 1) if version else 0
+        done = _DONE_LINE.search(response, start)
+        prompt = response.find(CLI_PROMPT, done.end()) if done else -1
+        end = prompt + len(CLI_PROMPT) if prompt >= 0 else len(response)
+        if _command_failed(response[:end]):
+            raise RuntimeError(
+                f"command failed: {command!r}: "
+                f"{bytes(response[:end][-500:])!r}"
+            )
+        if prompt >= 0 and (command != "version" or version is not None):
+            return bytes(response)
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"command timed out without complete Done/prompt: {command!r}; "
+                f"baud={getattr(serial_port, 'baudrate', '?')}; "
+                f"response_tail={bytes(response[-240:])!r}"
+            )
+        response.extend(serial_port.read(4096))
+        if len(response) > 131072:
+            del response[:-65536]
+
+
+def _send_command(serial_port: object, command: str, timeout_s: float) -> bytes:
+    response = _write_cli_line(serial_port, command)
+    return _read_cli_reply(serial_port, command, timeout_s, response)
+
+
+def _stop_stream(cli: object, timeout_s: float) -> None:
+    try:
+        _send_command(cli, "sensorStop 0", timeout_s)
+    except TimeoutError as exc:
+        # Some firmware loses the stop reply while the last frame is draining.
+        # A version reply alone is insufficient: it can coexist with frames.
+        print(f"[radar] stop acknowledgement incomplete: {exc}", flush=True)
+        reply = _send_command(cli, "version", min(timeout_s, 1.5))
+        reply += _read_until(cli, (TI_MAGIC_WORD,), 0.4)
+        if TI_MAGIC_WORD in reply:
+            raise TimeoutError("radar still streaming after sensorStop") from exc
 
 
 def establish_cli(cli: object, initial_baud: int, target_baud: int,
@@ -280,32 +335,50 @@ def establish_cli(cli: object, initial_baud: int, target_baud: int,
     already validated profile. The complete requested profile is reapplied.
     """
     observations = []
-    for baud in dict.fromkeys((initial_baud, target_baud)):
+    for baud in dict.fromkeys((target_baud, initial_baud)):
         cli.baudrate = baud
         cli.reset_input_buffer()
-        response = _read_until(cli, (TI_MAGIC_WORD, b"mmwDemo:/>"), min(timeout_s, 0.6))
-        streaming = TI_MAGIC_WORD in response
-        # Flush an incomplete CLI line left by a probe at the other baud.
+        response = _read_until(cli, (TI_MAGIC_WORD, CLI_PROMPT), min(timeout_s, 0.6))
+        if response and TI_MAGIC_WORD not in response and CLI_PROMPT not in response:
+            # Do not inject commands into an active stream at a mismatched baud.
+            observations.append(f"{baud}: unrecognized traffic, bytes={len(response)}")
+            continue
+        # Terminate a partial command left by an interrupted previous process.
+        # Keep the reply: a stream can start during this probe.
         cli.write(b"\n")
         cli.flush()
-        _read_until(cli, (b"mmwDemo:/>",), min(timeout_s, 0.25))
-        cli.reset_input_buffer()
-        if streaming:
-            _send_command(cli, "sensorStop 0", timeout_s)
-            cli.reset_input_buffer()
-        cli.write(b"version\n")
-        cli.flush()
-        probe = _read_until(cli, (b"mmwDemo:/>",), timeout_s)
-        # A leading newline may emit a prompt before version has completed.
-        if b"Done" not in probe:
-            probe += _read_until(cli, (b"Done",), timeout_s)
-        if b"mmwDemo:/>" not in probe:
-            probe += _read_until(cli, (b"mmwDemo:/>",), min(timeout_s, 0.75))
-        if b"Done" in probe and b"mmwDemo:/>" in probe and not _command_failed(probe):
+        response += _read_until(cli, (TI_MAGIC_WORD, CLI_PROMPT), min(timeout_s, 0.6))
+        streaming = TI_MAGIC_WORD in response
+        try:
+            if streaming:
+                print(f"[radar] stopping existing stream: baud={baud}", flush=True)
+                _stop_stream(cli, timeout_s)
+            reply = _send_command(cli, "version", min(timeout_s, 1.5))
+            if TI_MAGIC_WORD in reply:
+                # A prompt can arrive before a frame during the passive probe.
+                streaming = True
+                _stop_stream(cli, timeout_s)
+                _send_command(cli, "version", min(timeout_s, 1.5))
             print(f"[radar] CLI ready: baud={baud} stopped_stream={streaming}", flush=True)
             return baud
-        observations.append(f"{baud}: bytes={len(response) + len(probe)} tail={probe[-120:]!r}")
+        except (TimeoutError, RuntimeError) as exc:
+            observations.append(f"{baud}: {exc}")
+            if streaming:
+                # Magic identified the baud. Retrying at 115200 cannot stop this
+                # stream; leave recovery at this baud to the supervisor retry.
+                break
     raise TimeoutError("Radar CLI unavailable; check power/mode or reset target. " + "; ".join(observations))
+
+
+def stop_sensor(port: str, data_baud: int, timeout_s: float = 1.0) -> None:
+    """Quiesce the owned radar on exit, without resetting USB or other devices."""
+    import serial
+
+    with serial.Serial(port, data_baud, timeout=0.05, write_timeout=1,
+                       **({"exclusive": True} if os.name == "posix" else {})) as cli:
+        # Only use the baud established by this run. A freshly power-cycled
+        # board does not need shutdown commands at its cold-start baud.
+        establish_cli(cli, data_baud, data_baud, timeout_s)
 
 
 def apply_profile(
@@ -323,80 +396,43 @@ def apply_profile(
         ) from exc
 
     completed = 0
-    with serial.Serial(port, initial_baud, timeout=0.05, write_timeout=1,
+    startup = b""
+    started = False
+    begin = time.monotonic()
+    with serial.Serial(port, profile.target_baud, timeout=0.05, write_timeout=1,
                        **({"exclusive": True} if os.name == "posix" else {})) as cli:
         current_baud = establish_cli(cli, initial_baud, profile.target_baud, command_timeout_s)
         for command in profile.before_baud:
+            print(f"[radar] configure: {command}", flush=True)
             _send_command(cli, command, command_timeout_s)
             completed += 1
 
         if current_baud != profile.target_baud:
-            cli.write((profile.baud_command + "\n").encode("ascii"))
-            cli.flush()
-            _read_until(cli, (b"\n",), min(command_timeout_s, 0.25))
-
-    time.sleep(reopen_delay_s)
-    startup = b""
-    started = False
-    verified_by_version = False
-    with serial.Serial(port, profile.target_baud, timeout=0.05, write_timeout=1,
-                       **({"exclusive": True} if os.name == "posix" else {})) as cli:
-        startup = _read_until(
-            cli,
-            (b"mmwDemo:/>", b"Error", b"not recognized"),
-            command_timeout_s,
-        )
-        if _command_failed(startup):
-            raise RuntimeError(
-                "baud switch failed: "
-                + startup.decode("ascii", errors="replace")
-            )
-        if b"Done" not in startup or b"mmwDemo:/>" not in startup:
-            cli.reset_input_buffer()
-            cli.write(b"version\n")
-            cli.flush()
-            version_response = _read_until(
-                cli,
-                (b"Done", b"Error", b"not recognized"),
-                command_timeout_s,
-            )
-            prompt_tail = _read_until(
-                cli,
-                (b"mmwDemo:/>", b"Error", b"not recognized"),
-                min(command_timeout_s, 0.75),
-            )
-            startup += version_response + prompt_tail
-            verified_by_version = True
-            if _command_failed(startup):
-                raise RuntimeError(
-                    "new-baud version probe failed: "
-                    + startup.decode("ascii", errors="replace")
-                )
-            probe_response = version_response + prompt_tail
-            if b"Done" not in probe_response or b"mmwDemo:/>" not in probe_response:
-                raise TimeoutError(
-                    "new-baud prompt and version probe were not observed; "
-                    "reset and retry"
-                )
+            print(f"[radar] switching UART: {current_baud} -> {profile.target_baud}", flush=True)
+            _write_cli_line(cli, profile.baud_command)
+            # Keep exclusive ownership across the switch. The acknowledgement
+            # can be lost while the host changes baud, so verify with version.
+            cli.baudrate = profile.target_baud
+            time.sleep(reopen_delay_s)
+            startup = _read_until(cli, (CLI_PROMPT,), min(command_timeout_s, 0.6))
+            startup += _send_command(cli, "version", command_timeout_s)
+        # If already at target baud, establish_cli has verified it. There is no
+        # unsolicited startup prompt to wait for and no reason to reopen UART.
         completed += 1
 
         for command in profile.after_baud:
+            print(f"[radar] configure: {command}", flush=True)
             response = _send_command(cli, command, command_timeout_s)
             completed += 1
             if command.split(maxsplit=1)[0] == "sensorStart":
-                tail = _read_until(
-                    cli,
-                    (TI_MAGIC_WORD, b"Error"),
-                    min(command_timeout_s, 0.75),
-                )
-                response += tail
-                if _command_failed(response):
-                    raise RuntimeError(
-                        "sensorStart reported an error: "
-                        + response.decode("ascii", errors="replace")
+                if TI_MAGIC_WORD not in response:
+                    response += _read_until(
+                        cli, (TI_MAGIC_WORD,), min(command_timeout_s, 0.75),
                     )
                 started = TI_MAGIC_WORD in response
 
+    elapsed = time.monotonic() - begin
+    print(f"[radar] profile applied: commands={completed} elapsed_s={elapsed:.3f}", flush=True)
     return {
         "port": port,
         "initial_baud": initial_baud,
@@ -405,9 +441,10 @@ def apply_profile(
         "target_baud": profile.target_baud,
         "commands_completed": completed,
         "new_baud_prompt_observed": True,
-        "new_baud_verified_by_version": verified_by_version,
+        "new_baud_verified_by_version": True,
         "first_magic_observed": started,
         "new_baud_startup_bytes": len(startup),
+        "configuration_elapsed_s": elapsed,
     }
 
 
