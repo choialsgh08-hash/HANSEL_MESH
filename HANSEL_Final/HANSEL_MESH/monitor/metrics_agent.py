@@ -143,6 +143,15 @@ def parse_ip_neigh(text: str) -> dict:
     return mac_to_ip
 
 
+def parse_local_macs(link_text: str, originator_text: str) -> list:
+    """Own radio/primary-originator identities, distinct from bat0 ARP MACs."""
+    macs = re.findall(rf"link/ether\s+({MAC_RE})", link_text, re.I)
+    primary = re.search(rf"MainIF/MAC:\s*[^/\s]+/({MAC_RE})", originator_text, re.I)
+    if primary:
+        macs.append(primary.group(1))
+    return sorted({mac.lower() for mac in macs})
+
+
 def parse_ping(text: str) -> dict:
     """Parse Linux `ping -c N` output. Returns {rtt_avg_ms, loss_pct}."""
     result: dict = {}
@@ -310,6 +319,8 @@ def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
 
     return {
         "node": self_name,
+        "mesh_macs": parse_local_macs(links_text.get("local_link", ""),
+                                      links_text.get("batctl_o", "")),
         "mesh_if": mesh_if,
         "bat_if": bat_if,
         "ts": round(timestamp, 3),
@@ -322,6 +333,7 @@ def build_snapshot(self_name: str, mesh_if: str, links_text: dict,
 def collect_real(self_name: str, mesh_if: str, bat_if: str, ping_list: list,
                  timestamp: float) -> dict:
     link_commands = {
+        "local_link": ["ip", "-o", "link", "show", "dev", mesh_if],
         "station": ["iw", "dev", mesh_if, "station", "dump"],
         "batctl_o": ["batctl", "-m", bat_if, "o"],
         "batctl_n": ["batctl", "-m", bat_if, "n"],
@@ -378,6 +390,7 @@ def collect_sample(sample_dir: str, self_name: str, mesh_if: str,
         return ""
 
     links_text = {
+        "local_link": read("local_link.txt"),
         "station": read("station.txt"),
         "batctl_o": read("batctl_o.txt"),
         "batctl_n": read("batctl_n.txt"),

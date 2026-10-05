@@ -36,6 +36,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from metrics_agent import NODES, build_snapshot
+from route_state import video_routes
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -59,6 +60,7 @@ except ImportError:
 # Measured threshold overrides (from calibrate_thresholds output), loaded once
 # at startup so the live judge uses tuned values without any code change.
 QUALITY_OVERRIDES: dict = {}
+DEMO_MODE = False
 
 # Shared state, guarded by LOCK.
 LOCK = threading.Lock()
@@ -270,7 +272,8 @@ def merge_state(now: float) -> dict:
         all_events = list(EVENTS)
     recent = [e for e in all_events if now - e.get("ts", 0.0) < RECONNECT_WINDOW_S]
 
-    return {"nodes": nodes, "edges": edges, "e2e": e2e,
+    return {"nodes": nodes, "edges": edges, "e2e": e2e, "demo": DEMO_MODE,
+            "video_routes": video_routes(latest, now, NODE_TIMEOUT_S),
             "video": video, "quality": quality,
             "link_health": link_health,
             "events": all_events[-15:],
@@ -312,6 +315,7 @@ def sampler_loop(interval: float, log_path: str = None) -> None:
             "net_rssi": state.get("net_rssi_worst"),
             "quality_level": quality.get("level"),
             "quality_status": quality.get("status"),
+            "video_routes": state["video_routes"],
         }
         with LOCK:
             HISTORY.append(rec)
@@ -342,12 +346,13 @@ def udp_listener(host: str, port: int) -> None:
 # Demo data generator (no hardware): a base-node1-node2-head chain.           #
 # --------------------------------------------------------------------------- #
 
-DEMO_CHAIN = ["base", "node1", "node2", "head"]
+DEMO_CHAIN = ["base", "node2", "node1", "head"]
 # Keys normalized through _edge_key so lookups match regardless of order.
 DEMO_RSSI = {
-    _edge_key("base", "node1"): -50,
+    _edge_key("base", "node2"): -50,
     _edge_key("node1", "node2"): -64,
-    _edge_key("node2", "head"): -71,
+    _edge_key("node1", "head"): -71,
+    _edge_key("base", "head"): -58,
 }
 
 
@@ -370,6 +375,9 @@ def demo_loop(interval: float) -> None:
                 neighbors.append(DEMO_CHAIN[idx - 1])
             if idx < len(DEMO_CHAIN) - 1:
                 neighbors.append(DEMO_CHAIN[idx + 1])
+            # Demonstrate a genuine table change between relay and direct.
+            if (tick // 10) % 2 and node in ("base", "head"):
+                neighbors.append("head" if node == "base" else "base")
 
             station_lines = []
             neigh_lines = []
@@ -390,10 +398,19 @@ def demo_loop(interval: float) -> None:
                 neigh_table.append(f"     wlan0\t{mac}\t   0.500s")
                 o_lines.append(f" * {mac}    0.500s   ({tq}) {mac} [ wlan0]")
 
+            for target_idx, target in enumerate(DEMO_CHAIN):
+                if target == node or target in neighbors:
+                    continue
+                hop = DEMO_CHAIN[idx + (1 if target_idx > idx else -1)]
+                target_mac = f"02:aa:bb:00:00:{NODES[target].split('.')[-1].zfill(2)}"
+                hop_mac = f"02:aa:bb:00:00:{NODES[hop].split('.')[-1].zfill(2)}"
+                o_lines.append(f" * {target_mac} 0.500s (150) {hop_mac} [ wlan0]")
+
             ip_lines = [f"{NODES[p]} lladdr 02:aa:bb:00:00:"
                         f"{NODES[p].split('.')[-1].zfill(2)} REACHABLE"
                         for p in neighbors]
             links_text = {
+                "local_link": f"link/ether 02:aa:bb:00:00:{NODES[node].split('.')[-1].zfill(2)}",
                 "station": "\n".join(station_lines),
                 "batctl_o": "\n".join(o_lines),
                 "batctl_n": "IF Neighbor last-seen\n" + "\n".join(neigh_table),
@@ -431,8 +448,10 @@ def demo_loop(interval: float) -> None:
         err_rate = round(stress * 1.5 + random.uniform(0, 1), 2)
         fps = round(max(3.0, 15.0 - stress * 0.45 - random.uniform(0, 0.5)), 1)
         ingest_video({
+            "ts": now,
             "fps": fps,
             "target_fps": 15.0,
+            "fps_ratio": round(fps / 15.0, 3),
             "err_rate": err_rate,
             "drop_rate": round(err_rate * 0.25, 2),
             "bitrate_kbps": round(1200 * fps / 15.0, 1),
@@ -492,7 +511,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    global QUALITY_OVERRIDES
+    global QUALITY_OVERRIDES, DEMO_MODE
+    DEMO_MODE = args.demo
     if load_quality_overrides:
         QUALITY_OVERRIDES = load_quality_overrides(args.quality_config, os.environ)
         if QUALITY_OVERRIDES:

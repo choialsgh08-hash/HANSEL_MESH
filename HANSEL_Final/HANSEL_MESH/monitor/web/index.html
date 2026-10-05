@@ -33,7 +33,7 @@
       render(){
         const nodes = this.nodes.values();
         const edges = this.edges.values();
-        const edgeRows = edges.map(e=>`<tr><td>${e.from} ↔ ${e.to}</td><td>${e.label||""}</td></tr>`).join("");
+        const edgeRows = edges.map(e=>`<tr><td>${e.from} ${e.arrows === "to" ? "→" : "↔"} ${e.to}</td><td>${e.label||""}</td></tr>`).join("");
         const nodeRows = nodes.map(n=>`<span class="mini-node">${n.label||n.id}</span>`).join("");
         this.el.innerHTML = `<div class="mini-topology">${nodeRows}</div>
           <table class="mini-edge-table"><tbody>${edgeRows||"<tr><td>링크 없음</td><td></td></tr>"}</tbody></table>`;
@@ -143,6 +143,20 @@
   .mini-topology { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:12px; }
   .mini-node { white-space:pre-line; background:#1f6feb; border:1px solid #58a6ff; border-radius:8px; padding:8px 10px; font-size:12px; }
   .mini-edge-table { font-size:12px; }
+  .route-panel { margin:14px 16px 0; border:1px solid #31506c; border-radius:10px; background:var(--panel); padding:16px; }
+  .route-heading { display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px; align-items:center; }
+  .route-heading h2 { margin:0; font-size:17px; }
+  .route-badge { border-radius:20px; padding:5px 12px; background:#263442; font-size:13px; }
+  .route-badge.complete { color:#79dfac; background:#173929; }
+  .route-badge.stale,.route-badge.loop { color:#ffb0aa; background:#482723; }
+  .route-row { padding:14px 0 8px; border-bottom:1px solid var(--line); }
+  .route-label,.route-note { color:var(--dim); font-size:12px; line-height:1.6; }
+  .route-chain { display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px 0; }
+  .route-node { padding:8px 14px; border:1px solid #58a6ff; border-radius:8px; background:#132b44; font-weight:650; }
+  .route-node.pending { border-color:#6e7681; background:#262c36; color:#adbac7; }
+  .route-arrow { color:#58a6ff; font-size:20px; }
+  .route-history { list-style:none; margin:8px 0 0; padding:0; max-height:170px; overflow:auto; font-size:12px; color:#adbac7; }
+  .route-history li { padding:5px 0; border-bottom:1px solid var(--line); }
   @media (max-width: 1100px) {
     .status-cards { grid-template-columns:repeat(2,minmax(140px,1fr)); }
     .grid { grid-template-columns:1fr; }
@@ -192,15 +206,39 @@
   </div>
 </section>
 
+<section class="route-panel" aria-label="영상 방향의 선택 경로">
+  <div class="route-heading">
+    <h2 id="routeTitle">영상 방향의 선택 경로</h2>
+    <span id="routeBadge" class="route-badge">수집 대기</span>
+  </div>
+  <div class="route-row">
+    <div class="route-label">영상 방향 · Head → Base · 이후 PC 연결은 기존 유선 구성</div>
+    <div id="forwardChain" class="route-chain" aria-live="polite"></div>
+    <div id="forwardDetail" class="route-note">각 Pi의 라우팅 정보 대기 중</div>
+  </div>
+  <div class="route-row">
+    <div class="route-label">반대 방향 · Base → Head</div>
+    <div id="reverseChain" class="route-chain"></div>
+    <div id="reverseDetail" class="route-note"></div>
+  </div>
+  <p class="route-note">라우팅 표 기반 추정 · 개별 영상 패킷의 실측 경로가 아닙니다.
+    경로 확인과 영상 수신 성공은 별도입니다. TQ는 Mbps가 아닙니다.</p>
+  <details>
+    <summary>경로 변경 이력 · 영상 FPS와 함께 확인</summary>
+    <ul id="routeHistory" class="route-history"></ul>
+  </details>
+</section>
+
 <div class="grid">
   <div class="panel">
-    <h2>메시 토폴로지 (선 색 = RSSI, 라벨 = RSSI / TQ)</h2>
+    <h2>메시 토폴로지 · 파란 화살표 = 영상 방향의 선택 경로</h2>
     <div id="graph"></div>
     <div class="legend">
       <span><i style="background:#3fb950"></i> 강함 ≥ -60 dBm</span>
       <span><i style="background:#d29922"></i> 보통 -60 ~ -72</span>
       <span><i style="background:#f85149"></i> 약함 &lt; -72</span>
       <span><i style="background:#6e7681"></i> 데이터 없음</span>
+      <span><i style="background:#58a6ff"></i> 영상 방향 선택 경로 · 추정</span>
     </div>
   </div>
 
@@ -247,6 +285,76 @@
 const COLORS = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf","#ff7b72"];
 function rssiColor(r){ if(r==null) return "#6e7681"; if(r>=-60) return "#3fb950"; if(r>=-72) return "#d29922"; return "#f85149"; }
 
+const NODE_LABELS = {head:"Head", base:"Base", node1:"Node 1", node2:"Node 2", node3:"Node 3"};
+const ROUTE_STATUS = {complete:"경로 확인", partial:"일부 확인", stale:"정보 오래됨", loop:"경로 불일치", unavailable:"수집 대기"};
+let activeRouteEdges = new Map();
+function nodeLabel(id){ return NODE_LABELS[id] || id; }
+function routeReason(reason){
+  const [kind, ...rest] = (reason || "").split(":");
+  const labels = {missing_report:"노드 보고 없음", stale_report:"노드 보고 만료",
+    missing_route:"목적지 경로 없음", ambiguous_route:"목적지 경로 중복",
+    unknown_route_age:"경로 시각 확인 불가", stale_route:"경로 정보 만료",
+    unknown_nexthop:"중계 MAC 식별 불가", route_loop:"경로 순환", hop_limit:"홉 제한"};
+  return (labels[kind] || kind || "정보 대기") + (rest.length ? " · " + nodeLabel(rest.join(":")) : "");
+}
+function renderRoute(route, chainId, detailId){
+  const chain = document.getElementById(chainId);
+  chain.replaceChildren();
+  const complete = route.status === "complete";
+  (route.path || []).forEach((id, i)=>{
+    if(i){ const arrow = document.createElement("span"); arrow.className="route-arrow"; arrow.textContent="→"; chain.append(arrow); }
+    const node = document.createElement("span");
+    node.className="route-node" + (complete ? "" : " pending");
+    node.textContent=nodeLabel(id); chain.append(node);
+  });
+  if(!complete){
+    const pending = document.createElement("span"); pending.className="route-node pending";
+    pending.textContent="이후 경로 확인 불가"; chain.append(pending);
+  }
+  const tq = (route.steps || []).map(s=>nodeLabel(s.from) + "의 목적지 TQ " + (s.destination_tq ?? "—")).join(" · ");
+  document.getElementById(detailId).textContent = complete
+    ? route.hops + "홉 · " + (route.mode === "direct" ? "직접 연결" : "중계 연결") +
+      " · 정보 나이 최대 " + (route.age_s ?? "—") + "초" + (tq ? " · " + tq : "")
+    : (ROUTE_STATUS[route.status] || "확인 불가") + " · " + routeReason(route.reason);
+}
+function updateRoutes(state){
+  document.getElementById("routeTitle").textContent = "영상 방향의 선택 경로" +
+    (state.demo ? " · 데모 데이터" : "");
+  const routes = state.video_routes || {};
+  const forward = routes.forward || {status:"unavailable", path:["head"]};
+  const reverse = routes.reverse || {status:"unavailable", path:["base"]};
+  const badge = document.getElementById("routeBadge");
+  badge.className="route-badge " + forward.status;
+  badge.textContent=forward.status === "complete"
+    ? (forward.mode === "direct" ? "직결" : "중계") + " · " + forward.hops + "홉"
+    : (ROUTE_STATUS[forward.status] || "확인 불가");
+  renderRoute(forward, "forwardChain", "forwardDetail");
+  renderRoute(reverse, "reverseChain", "reverseDetail");
+  activeRouteEdges = new Map();
+  if(forward.status === "complete"){
+    (forward.steps || []).forEach(s=>activeRouteEdges.set([s.from,s.to].sort().join("|"), s));
+  }
+  const changes = [];
+  let previous = null;
+  (state.history || []).forEach(record=>{
+    const route = record.video_routes && record.video_routes.forward;
+    if(!route) return;
+    const signature = JSON.stringify([route.status, route.path]);
+    if(signature !== previous){ changes.push({record, route}); previous = signature; }
+  });
+  const history = document.getElementById("routeHistory");
+  history.replaceChildren();
+  changes.slice(-10).reverse().forEach(({record, route})=>{
+    const li = document.createElement("li");
+    const stamp = new Date(record.ts*1000).toLocaleTimeString("ko-KR", {hour12:false});
+    li.textContent=stamp + " · " + (route.path || []).map(nodeLabel).join(" → ") +
+      " · " + (ROUTE_STATUS[route.status] || "확인 불가") +
+      " · FPS " + (record.vid_fps ?? "—");
+    history.append(li);
+  });
+  if(!changes.length){ const li=document.createElement("li"); li.textContent="경로 기록 대기 중"; history.append(li); }
+}
+
 // ---- topology graph ----
 const gNodes = new vis.DataSet();
 const gEdges = new vis.DataSet();
@@ -274,8 +382,19 @@ function updateGraph(state){
     const id = [e.from,e.to].sort().join("|");
     ekeys.add(id);
     const label = (e.rssi!=null?`${e.rssi}dBm`:"?") + (e.tq!=null?` · TQ ${e.tq}`:"");
-    const item = {id, from:e.from, to:e.to, label, color:{color:rssiColor(e.rssi)},
-                  width: e.rssi==null?2:(e.rssi>=-60?5:e.rssi>=-72?3.5:2.5)};
+    const active = activeRouteEdges.get(id);
+    const item = {id, from:active ? active.from : e.from, to:active ? active.to : e.to,
+                  label, color:{color:active ? "#58a6ff" : rssiColor(e.rssi)},
+                  arrows:active ? "to" : "", dashes:false,
+                  width: active ? 6 : (e.rssi==null?2:(e.rssi>=-60?5:e.rssi>=-72?3.5:2.5))};
+    if(gEdges.get(id)) gEdges.update(item); else gEdges.add(item);
+  });
+  // A selected hop can be known before its station/neighbor report arrives.
+  activeRouteEdges.forEach((step, id)=>{
+    if(ekeys.has(id)) return;
+    ekeys.add(id);
+    const item={id, from:step.from, to:step.to, label:"선택 경로 · 링크 수치 없음",
+      color:{color:"#58a6ff"}, arrows:"to", width:4, dashes:true};
     if(gEdges.get(id)) gEdges.update(item); else gEdges.add(item);
   });
   gEdges.getIds().forEach(id=>{ if(!ekeys.has(id)) gEdges.remove(id); });
@@ -483,8 +602,10 @@ function updateReconnect(s){
 async function poll(){
   try{
     const r = await fetch("/api/state");
+    if(!r.ok) throw new Error("collector HTTP " + r.status);
     const s = await r.json();
     updateReconnect(s);
+    updateRoutes(s);
     updateGraph(s);
     updateTable(s.edges);
     refreshChart(rttChart, s.history, "rtt");
@@ -508,6 +629,8 @@ async function poll(){
       `노드 ${online}/${s.nodes.length} 온라인 · 링크 ${s.edges.length}개 · ${new Date(s.updated*1000).toLocaleTimeString("ko-KR",{hour12:false})}`;
     document.querySelector("#status .dot").style.background = online? "#3fb950":"#f85149";
   }catch(e){
+    updateRoutes({});
+    gEdges.getIds().forEach(id=>gEdges.update({id, arrows:"", color:{color:"#6e7681"}, width:2}));
     document.getElementById("status-text").textContent = "수집기 연결 끊김";
     document.querySelector("#status .dot").style.background = "#f85149";
   }
